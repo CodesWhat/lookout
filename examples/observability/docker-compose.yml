@@ -7,7 +7,7 @@
 name: portwing-observability
 
 x-portwing-runtime: &portwing-runtime
-  image: ghcr.io/codeswhat/portwing:0.9.13
+  image: ghcr.io/codeswhat/portwing:0.9.14
   restart: unless-stopped
   read_only: true
   cap_drop: [ALL]

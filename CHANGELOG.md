@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v0.9.14] - 2026-09-06
+
 ### Fixed
 
 - **A failed host-metrics collection now goes on the wire instead of being
