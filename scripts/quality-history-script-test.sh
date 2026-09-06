@@ -278,6 +278,252 @@ set -e
 grep -Fq "has not recorded" "${test_root}/bench.log" ||
 	fail "querying an unrecorded lane must say so (output: $(cat "${test_root}/bench.log"))"
 
+# --- QUALITY_HISTORY_RETAIN and QUALITY_HISTORY_RETAIN_BYTES (PW-2.5) -------
+#
+# A separate bare remote, so the count assertions below are exact rather than
+# relative to whatever the soak/mutation lanes above left behind.
+
+bare2="${test_root}/qh-retain.git"
+git init --quiet --bare "${bare2}"
+
+branch_file2() {
+	git -C "${bare2}" cat-file blob "quality-history:$1" 2>/dev/null || true
+}
+
+run_append2() {
+	local lane="$1" numbers="$2" run_id="$3"
+	shift 3
+	env \
+		QUALITY_HISTORY_REMOTE="${bare2}" \
+		QUALITY_HISTORY_EVENT="schedule" \
+		QUALITY_HISTORY_AUTHOR_NAME="test" \
+		QUALITY_HISTORY_AUTHOR_EMAIL="test@example.invalid" \
+		GITHUB_RUN_ID="${run_id}" \
+		GITHUB_RUN_ATTEMPT="1" \
+		GITHUB_RUN_NUMBER="${run_id}" \
+		GITHUB_WORKFLOW="Quality: Test" \
+		GITHUB_SHA="0000000000000000000000000000000000000000" \
+		GITHUB_REF_NAME="dev/v0.9" \
+		"$@" \
+		bash "${append}" "${lane}" "${numbers}" 2>&1
+}
+
+# QUALITY_HISTORY_RETAIN=3 over five appends: the newest 3 lines, in order.
+for marker in 1 2 3 4 5; do
+	run_append2 mutation-survivors "{\"run_marker\":${marker}}" "1${marker}0" \
+		QUALITY_HISTORY_RETAIN=3 >/dev/null || true
+done
+retained="$(branch_file2 mutation-survivors.jsonl)"
+[ "$(grep -c . <<<"${retained}" || true)" = "3" ] ||
+	fail "QUALITY_HISTORY_RETAIN=3 over five appends must leave exactly 3 lines"
+markers="$(jq -r '.run_marker' <<<"${retained}" | paste -sd, -)"
+[ "${markers}" = "3,4,5" ] ||
+	fail "QUALITY_HISTORY_RETAIN must keep the newest records in order, got '${markers}'"
+
+# RETAIN=0 is refused: a warning, and the append still happens unpruned.
+output="$(run_append2 mutation-survivors '{"run_marker":6}' 160 QUALITY_HISTORY_RETAIN=0)"
+grep -Fq "QUALITY_HISTORY_RETAIN must be at least 1" <<<"${output}" ||
+	fail "RETAIN=0 must be refused with a warning (output: ${output})"
+[ "$(grep -c . <<<"$(branch_file2 mutation-survivors.jsonl)" || true)" = "4" ] ||
+	fail "a refused RETAIN must not block the append, only the pruning"
+
+# RETAIN_BYTES=0 is refused the same way RETAIN=0 is: a warning, no byte
+# ceiling enforced, and the append (and any RETAIN pruning) still happens.
+output="$(run_append2 mutation-survivors '{"run_marker":6.5}' 165 \
+	QUALITY_HISTORY_RETAIN=3 QUALITY_HISTORY_RETAIN_BYTES=0)"
+grep -Fq "QUALITY_HISTORY_RETAIN_BYTES must be at least 1" <<<"${output}" ||
+	fail "RETAIN_BYTES=0 must be refused with a warning (output: ${output})"
+[ "$(grep -c . <<<"$(branch_file2 mutation-survivors.jsonl)" || true)" = "3" ] ||
+	fail "a refused RETAIN_BYTES must still let RETAIN prune normally"
+
+# Unset leaves the file unpruned: one more append grows it by exactly one.
+before_unset="$(grep -c . <<<"$(branch_file2 mutation-survivors.jsonl)" || true)"
+run_append2 mutation-survivors '{"run_marker":7}' 170 >/dev/null || true
+after_unset="$(grep -c . <<<"$(branch_file2 mutation-survivors.jsonl)" || true)"
+[ "${after_unset}" = "$((before_unset + 1))" ] ||
+	fail "an unset RETAIN must not prune (${before_unset} -> ${after_unset})"
+
+# A duplicate record under a cap is still a no-op: the duplicate guard runs
+# before the append and the prune, so a repeat changes nothing.
+dup_numbers='{"run_marker":8}'
+run_append2 mutation-survivors "${dup_numbers}" 180 \
+	QUALITY_HISTORY_RETAIN=3 QUALITY_HISTORY_TIMESTAMP="2026-09-04T00:00:00Z" >/dev/null || true
+count_after_first="$(grep -c . <<<"$(branch_file2 mutation-survivors.jsonl)" || true)"
+output="$(run_append2 mutation-survivors "${dup_numbers}" 180 \
+	QUALITY_HISTORY_RETAIN=3 QUALITY_HISTORY_TIMESTAMP="2026-09-04T00:00:00Z")"
+count_after_second="$(grep -c . <<<"$(branch_file2 mutation-survivors.jsonl)" || true)"
+grep -Fq "already on" <<<"${output}" ||
+	fail "a duplicate record under a cap must still be recognised (output: ${output})"
+[ "${count_after_first}" = "${count_after_second}" ] ||
+	fail "a duplicate record under a cap must not grow the file (${count_after_first} -> ${count_after_second})"
+
+# --- QUALITY_HISTORY_RETAIN_BYTES: oldest-first, never the newest -----------
+
+bare3="${test_root}/qh-bytes.git"
+git init --quiet --bare "${bare3}"
+
+branch_file3() {
+	git -C "${bare3}" cat-file blob "quality-history:$1" 2>/dev/null || true
+}
+
+run_append3() {
+	local lane="$1" numbers="$2" run_id="$3"
+	shift 3
+	env \
+		QUALITY_HISTORY_REMOTE="${bare3}" \
+		QUALITY_HISTORY_EVENT="schedule" \
+		QUALITY_HISTORY_AUTHOR_NAME="test" \
+		QUALITY_HISTORY_AUTHOR_EMAIL="test@example.invalid" \
+		GITHUB_RUN_ID="${run_id}" \
+		GITHUB_RUN_ATTEMPT="1" \
+		GITHUB_RUN_NUMBER="${run_id}" \
+		GITHUB_WORKFLOW="Quality: Test" \
+		GITHUB_SHA="0000000000000000000000000000000000000000" \
+		GITHUB_REF_NAME="dev/v0.9" \
+		"$@" \
+		bash "${append}" "${lane}" "${numbers}" 2>&1
+}
+
+pad="$(printf '%*s' 60 '')"
+pad="${pad// /x}"
+
+for marker in 1 2 3 4 5; do
+	run_append3 mutation-survivors "{\"pad\":\"${pad}\",\"run_marker\":${marker}}" "2${marker}0" \
+		QUALITY_HISTORY_RETAIN=1000 QUALITY_HISTORY_RETAIN_BYTES=500 >/dev/null || true
+done
+retained="$(branch_file3 mutation-survivors.jsonl)"
+grep -Fq '"run_marker":5' <<<"${retained}" ||
+	fail "the byte ceiling must never drop the newest record"
+if grep -Fq '"run_marker":1' <<<"${retained}"; then
+	fail "the byte ceiling must drop the oldest record first"
+fi
+markers="$(jq -r '.run_marker' <<<"${retained}" | paste -sd, -)"
+case "${markers}" in
+5 | 4,5 | 3,4,5 | 2,3,4,5 | 1,2,3,4,5) ;;
+*) fail "the byte ceiling must keep a contiguous run of the newest records, got '${markers}'" ;;
+esac
+lines="$(grep -c . <<<"${retained}" || true)"
+if [ "${lines}" -gt 1 ]; then
+	size="$(printf '%s' "${retained}" | wc -c | tr -d ' ')"
+	[ "${size}" -le 500 ] ||
+		fail "once more than the newest record remains, the file must fit the byte ceiling"
+fi
+
+# A record that alone exceeds the ceiling is still kept, with a warning.
+bigpad="$(printf '%*s' 2000 '')"
+bigpad="${bigpad// /x}"
+output="$(run_append3 mutation-survivors "{\"pad\":\"${bigpad}\",\"run_marker\":99}" 299 \
+	QUALITY_HISTORY_RETAIN=1000 QUALITY_HISTORY_RETAIN_BYTES=500)"
+grep -Fq "::warning::" <<<"${output}" ||
+	fail "a newest record that alone exceeds the ceiling must still warn (output: ${output})"
+grep -Fq "exceeds the 500-byte ceiling" <<<"${output}" ||
+	fail "the ceiling-exceeded warning must name the byte ceiling (output: ${output})"
+retained2="$(branch_file3 mutation-survivors.jsonl)"
+[ "$(grep -c . <<<"${retained2}" || true)" = "1" ] ||
+	fail "an oversized newest record must still drop everything older"
+grep -Fq '"run_marker":99' <<<"${retained2}" ||
+	fail "an oversized newest record must still be kept, not dropped"
+
+# --- QUALITY_HISTORY_RECORD_FILE: a record too large for a single argv ------
+#
+# Linux caps a single argv/environ string (MAX_ARG_STRLEN) at 128 KiB; the
+# spec allows a mutation-survivors record up to 1 MiB. This fixture is well
+# past the 128 KiB line, so passing it as $2 the old way would fail before
+# the script even started, at the shell's own execve() of the child.
+
+bare4="${test_root}/qh-file.git"
+git init --quiet --bare "${bare4}"
+
+branch_file4() {
+	git -C "${bare4}" cat-file blob "quality-history:$1" 2>/dev/null || true
+}
+
+# `head -c | tr` rather than bash's `${var// /x}`: replacing 300,000
+# characters one at a time in a bash parameter expansion is quadratic and
+# takes minutes; this is one read and one translate. The 300,000-byte pad
+# is written straight to a file and read into jq with `--rawfile`, never
+# passed as a `--arg` value: a single argv string is capped at 128 KiB on
+# Linux (MAX_ARG_STRLEN), so building this fixture via `--arg` would fail
+# to even construct the fixture on the platform this test exists to cover.
+pad_file="${test_root}/big-pad.txt"
+head -c 300000 /dev/zero | tr '\0' 'x' >"${pad_file}"
+big_value="$(cat "${pad_file}")"
+record_file="${test_root}/big-record.json"
+jq -cn --rawfile pad "${pad_file}" '{pad: $pad, outcome:"success"}' >"${record_file}"
+[ "$(wc -c <"${record_file}")" -gt 131072 ] ||
+	fail "the big-record fixture must itself exceed 128 KiB to be a meaningful test"
+
+output="$(
+	env \
+		QUALITY_HISTORY_REMOTE="${bare4}" \
+		QUALITY_HISTORY_EVENT="schedule" \
+		QUALITY_HISTORY_AUTHOR_NAME="test" \
+		QUALITY_HISTORY_AUTHOR_EMAIL="test@example.invalid" \
+		GITHUB_RUN_ID="400" \
+		GITHUB_RUN_ATTEMPT="1" \
+		GITHUB_RUN_NUMBER="400" \
+		GITHUB_WORKFLOW="Quality: Test" \
+		GITHUB_SHA="0000000000000000000000000000000000000000" \
+		GITHUB_REF_NAME="dev/v0.9" \
+		QUALITY_HISTORY_RECORD_FILE="${record_file}" \
+		bash "${append}" mutation-survivors 2>&1
+)"
+grep -Fq "recorded mutation-survivors" <<<"${output}" ||
+	fail "a record read via QUALITY_HISTORY_RECORD_FILE must still append (output: ${output})"
+big_recorded="$(branch_file4 mutation-survivors.jsonl)"
+[ "$(grep -c . <<<"${big_recorded}" || true)" = "1" ] ||
+	fail "a large record via QUALITY_HISTORY_RECORD_FILE must land as exactly one line"
+[ "$(jq -r '.pad' <<<"${big_recorded}")" = "${big_value}" ] ||
+	fail "a large record via QUALITY_HISTORY_RECORD_FILE must round-trip its content exactly"
+
+# Passing both the inline argument and the env var is refused, not silently
+# preferring one over the other.
+output="$(
+	env \
+		QUALITY_HISTORY_REMOTE="${bare4}" \
+		QUALITY_HISTORY_EVENT="schedule" \
+		QUALITY_HISTORY_RECORD_FILE="${record_file}" \
+		bash "${append}" mutation-survivors '{"x":1}' 2>&1
+)"
+grep -Fq "not both" <<<"${output}" ||
+	fail "passing both an inline argument and QUALITY_HISTORY_RECORD_FILE must be refused (output: ${output})"
+
+# --- QUALITY_HISTORY_RECORD_FILE: exactly one JSON document, no more, no less
+#
+# `jq -e 'type == "object"'` only reflects the LAST top-level value read, so
+# a file holding two concatenated objects passed the old check even though
+# `--slurpfile ... $numbers_arr[0]` would then silently drop the second
+# document. Both a two-document file and an empty file must be refused
+# loudly instead.
+
+two_docs_file="${test_root}/two-docs-record.json"
+printf '{"outcome":"success"}\n{"outcome":"success"}\n' >"${two_docs_file}"
+output="$(
+	env \
+		QUALITY_HISTORY_REMOTE="${bare4}" \
+		QUALITY_HISTORY_EVENT="schedule" \
+		QUALITY_HISTORY_RECORD_FILE="${two_docs_file}" \
+		bash "${append}" mutation-survivors 2>&1
+)" || true
+grep -Fq "exactly one JSON object" <<<"${output}" ||
+	fail "a record file holding two JSON documents must be refused, not silently truncated (output: ${output})"
+[ "$(grep -c . <<<"$(branch_file4 mutation-survivors.jsonl)" || true)" = "1" ] ||
+	fail "a rejected two-document record file must not append a second line"
+
+empty_docs_file="${test_root}/empty-record.json"
+: >"${empty_docs_file}"
+output="$(
+	env \
+		QUALITY_HISTORY_REMOTE="${bare4}" \
+		QUALITY_HISTORY_EVENT="schedule" \
+		QUALITY_HISTORY_RECORD_FILE="${empty_docs_file}" \
+		bash "${append}" mutation-survivors 2>&1
+)" || true
+grep -Fq "exactly one JSON object" <<<"${output}" ||
+	fail "an empty record file must be refused (output: ${output})"
+[ "$(grep -c . <<<"$(branch_file4 mutation-survivors.jsonl)" || true)" = "1" ] ||
+	fail "a rejected empty record file must not append a line"
+
 if [ "${failures}" -ne 0 ]; then
 	echo "${failures} quality-history script check(s) failed" >&2
 	exit 1

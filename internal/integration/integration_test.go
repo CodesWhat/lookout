@@ -15,7 +15,6 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -473,6 +472,55 @@ func TestSSEEventsFirstEventIsAck(t *testing.T) {
 	}
 }
 
+// writeAuthorizedKeysFile writes pub to a fresh temp authorized_keys file
+// (mode 0600 so the world-readable check in parseAuthorizedKeys passes) and
+// returns its path. Format matches parseKeyLine: "ed25519 <base64-std-pubkey>
+// <comment>".
+func writeAuthorizedKeysFile(t *testing.T, pub ed25519.PublicKey, comment string) string {
+	t.Helper()
+
+	keysDir, err := os.MkdirTemp("", "lk-keys")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(keysDir) })
+
+	b64 := base64.StdEncoding.EncodeToString(pub)
+	keysPath := filepath.Join(keysDir, "authorized_keys")
+	if err := os.WriteFile(keysPath, []byte("ed25519 "+b64+" "+comment+"\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile authorized_keys: %v", err)
+	}
+	return keysPath
+}
+
+// signEd25519Request signs req with the given Ed25519 keypair and sets the
+// version 2 signature headers (X-Portwing-Key-ID, X-Portwing-Timestamp,
+// X-Portwing-Nonce, X-Portwing-Signature, X-Portwing-Signature-Version). body
+// must be the exact bytes that will be sent as the request body (nil/empty
+// for none); the caller is responsible for attaching it to req separately,
+// since req.Body has already been consumed for hashing here.
+func signEd25519Request(t *testing.T, req *http.Request, body []byte, pub ed25519.PublicKey, priv ed25519.PrivateKey) {
+	t.Helper()
+
+	tsUnix := time.Now().Unix()
+	nonceBytes := make([]byte, 16)
+	if _, err := rand.Read(nonceBytes); err != nil {
+		t.Fatalf("rand.Read: %v", err)
+	}
+	nonce := hex.EncodeToString(nonceBytes) // 32 hex characters
+
+	// Version 2 canonical message covers the complete origin-form target.
+	bodyHash := auth.BodyHashHex(body)
+	msg := auth.CanonicalMessage(req.Method, auth.CanonicalRequestTarget(req.URL), bodyHash, tsUnix, nonce)
+	sig := ed25519.Sign(priv, msg)
+
+	req.Header.Set(auth.HeaderKeyID, auth.KeyIDForPublicKey(pub))
+	req.Header.Set(auth.HeaderTimestamp, strconv.FormatInt(tsUnix, 10))
+	req.Header.Set(auth.HeaderNonce, nonce)
+	req.Header.Set(auth.HeaderSignature, base64.RawURLEncoding.EncodeToString(sig))
+	req.Header.Set(auth.HeaderSignatureVersion, auth.SignatureVersion2)
+}
+
 // TestEd25519Auth verifies that portwing enforces Ed25519 signature auth on a
 // protected endpoint when started with AUTHORIZED_KEYS and no TOKEN: an
 // unsigned request is rejected with 401, and a properly signed request is
@@ -486,20 +534,7 @@ func TestEd25519Auth(t *testing.T) {
 		t.Fatalf("ed25519.GenerateKey: %v", err)
 	}
 
-	// Write the public key to a temp authorized_keys file (mode 0600 so the
-	// world-readable check in parseAuthorizedKeys passes). Format matches
-	// parseKeyLine: "ed25519 <base64-std-pubkey> <comment>".
-	keysDir, err := os.MkdirTemp("", "lk-keys")
-	if err != nil {
-		t.Fatalf("MkdirTemp: %v", err)
-	}
-	defer os.RemoveAll(keysDir)
-
-	b64 := base64.StdEncoding.EncodeToString(pub)
-	keysPath := filepath.Join(keysDir, "authorized_keys")
-	if err := os.WriteFile(keysPath, []byte("ed25519 "+b64+" integ-test\n"), 0o600); err != nil {
-		t.Fatalf("WriteFile authorized_keys: %v", err)
-	}
+	keysPath := writeAuthorizedKeysFile(t, pub, "integ-test")
 
 	// Start portwing with AUTHORIZED_KEYS set and no TOKEN (Ed25519-only auth).
 	base, cleanup := startServerWithEnv(t,
@@ -530,29 +565,7 @@ func TestEd25519Auth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRequest (signed): %v", err)
 	}
-
-	tsUnix := time.Now().Unix()
-	nonceBytes := make([]byte, 16)
-	if _, err := rand.Read(nonceBytes); err != nil {
-		t.Fatalf("rand.Read: %v", err)
-	}
-	nonce := hex.EncodeToString(nonceBytes) // 32 hex characters
-
-	// Version 2 canonical message covers the complete origin-form target.
-	emptyBodyHash := "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-	msg := []byte(fmt.Sprintf("%s\n%s\n%s\n%d\n%s",
-		req.Method, auth.CanonicalRequestTarget(req.URL), emptyBodyHash, tsUnix, nonce))
-	sig := ed25519.Sign(priv, msg)
-
-	// Key ID: hex(SHA-256(pubkey)[:8]), matching auth.KeyIDForPublicKey.
-	h := sha256.Sum256(pub)
-	keyID := hex.EncodeToString(h[:8])
-
-	req.Header.Set("X-Portwing-Key-ID", keyID)
-	req.Header.Set("X-Portwing-Timestamp", strconv.FormatInt(tsUnix, 10))
-	req.Header.Set("X-Portwing-Nonce", nonce)
-	req.Header.Set("X-Portwing-Signature", base64.RawURLEncoding.EncodeToString(sig))
-	req.Header.Set("X-Portwing-Signature-Version", auth.SignatureVersion2)
+	signEd25519Request(t, req, nil, pub, priv)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -564,5 +577,167 @@ func TestEd25519Auth(t *testing.T) {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("Ed25519 auth: got %d, want 200\nreason: %s\nbody: %s",
 			resp.StatusCode, resp.Header.Get("X-Portwing-Reason"), body)
+	}
+}
+
+// TestMCPUnderEd25519Auth verifies that /_portwing/mcp, the same endpoint
+// TestMCPInitializeAndToolsList exercises under plain TOKEN auth, is also
+// correctly gated by Ed25519 key auth: a request with a bad signature is
+// rejected with 401 and an X-Portwing-Reason header (never reaching the MCP
+// handler), and a correctly signed request drives a full initialize +
+// tools/list exchange to completion, mirroring what
+// TestMCPInitializeAndToolsList sends.
+func TestMCPUnderEd25519Auth(t *testing.T) {
+	// Generate a fresh Ed25519 keypair for this test.
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("ed25519.GenerateKey: %v", err)
+	}
+
+	keysPath := writeAuthorizedKeysFile(t, pub, "integ-test-mcp")
+
+	// Start portwing with AUTHORIZED_KEYS set and no TOKEN (Ed25519-only auth).
+	base, cleanup := startServerWithEnv(t,
+		[]string{"AUTHORIZED_KEYS=" + keysPath},
+		"", // no bearer token
+	)
+	defer cleanup()
+
+	const target = "/_portwing/mcp"
+	initBody := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"0.0.1"}}}`
+
+	// Negative control: a request signed with a corrupted signature must be
+	// rejected with 401 and the auth reason header, and must never reach the
+	// MCP handler (the body must not be a JSON-RPC response).
+	badReq, err := http.NewRequest(http.MethodPost, base+target, strings.NewReader(initBody))
+	if err != nil {
+		t.Fatalf("NewRequest (bad signature): %v", err)
+	}
+	badReq.Header.Set("Content-Type", "application/json")
+	signEd25519Request(t, badReq, []byte(initBody), pub, priv)
+
+	// Corrupt the signature after signing: flip a bit but keep it valid
+	// base64url, so verification fails on the Ed25519 check itself (reason
+	// "invalid-signature") rather than on header parsing.
+	sigBytes, err := base64.RawURLEncoding.DecodeString(badReq.Header.Get(auth.HeaderSignature))
+	if err != nil {
+		t.Fatalf("decode signature for corruption: %v", err)
+	}
+	sigBytes[0] ^= 0xFF
+	badReq.Header.Set(auth.HeaderSignature, base64.RawURLEncoding.EncodeToString(sigBytes))
+
+	badResp, err := http.DefaultClient.Do(badReq)
+	if err != nil {
+		t.Fatalf("POST %s (bad signature): %v", target, err)
+	}
+	badBody, _ := io.ReadAll(badResp.Body)
+	badResp.Body.Close()
+
+	if badResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("MCP with bad signature: got %d, want 401\nbody: %s", badResp.StatusCode, badBody)
+	}
+	wantReason := auth.ReasonFor(auth.ErrBadSignature)
+	if reason := badResp.Header.Get(auth.HeaderReason); reason != wantReason {
+		t.Errorf("MCP with bad signature: X-Portwing-Reason = %q, want %q", reason, wantReason)
+	}
+	// The rejected request must never reach the MCP handler: the body must
+	// not be a JSON-RPC response carrying our request ID.
+	var rejectedRPC map[string]json.RawMessage
+	if err := json.Unmarshal(badBody, &rejectedRPC); err == nil {
+		if _, ok := rejectedRPC["result"]; ok {
+			t.Errorf("MCP with bad signature: got a JSON-RPC result, want the request rejected before the MCP handler\nbody: %s", badBody)
+		}
+	}
+
+	// Positive: a correctly signed initialize request must be accepted with 200.
+	initReq, err := http.NewRequest(http.MethodPost, base+target, strings.NewReader(initBody))
+	if err != nil {
+		t.Fatalf("NewRequest MCP initialize: %v", err)
+	}
+	initReq.Header.Set("Content-Type", "application/json")
+	signEd25519Request(t, initReq, []byte(initBody), pub, priv)
+
+	initResp, err := http.DefaultClient.Do(initReq)
+	if err != nil {
+		t.Fatalf("POST %s initialize: %v", target, err)
+	}
+	defer initResp.Body.Close()
+
+	if initResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(initResp.Body)
+		t.Fatalf("MCP initialize under Ed25519 auth: got %d, want 200\nreason: %s\nbody: %s",
+			initResp.StatusCode, initResp.Header.Get(auth.HeaderReason), body)
+	}
+
+	var initRPC map[string]json.RawMessage
+	if err := json.NewDecoder(initResp.Body).Decode(&initRPC); err != nil {
+		t.Fatalf("decoding MCP initialize response: %v", err)
+	}
+	if string(initRPC["jsonrpc"]) != `"2.0"` {
+		t.Errorf("MCP initialize: jsonrpc = %s, want \"2.0\"", initRPC["jsonrpc"])
+	}
+	if string(initRPC["id"]) != "1" {
+		t.Errorf("MCP initialize: id = %s, want 1", initRPC["id"])
+	}
+	if _, ok := initRPC["result"]; !ok {
+		t.Errorf("MCP initialize: response has no result key, want one\nbody: %v", initRPC)
+	}
+	if raw, ok := initRPC["error"]; ok {
+		t.Errorf("MCP initialize: response has an error key, want none\nerror: %s", raw)
+	}
+
+	// tools/list request, same connection pattern as TestMCPInitializeAndToolsList.
+	listBody := `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`
+	listReq, err := http.NewRequest(http.MethodPost, base+target, strings.NewReader(listBody))
+	if err != nil {
+		t.Fatalf("NewRequest MCP tools/list: %v", err)
+	}
+	listReq.Header.Set("Content-Type", "application/json")
+	signEd25519Request(t, listReq, []byte(listBody), pub, priv)
+
+	listResp, err := http.DefaultClient.Do(listReq)
+	if err != nil {
+		t.Fatalf("POST %s tools/list: %v", target, err)
+	}
+	defer listResp.Body.Close()
+
+	if listResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(listResp.Body)
+		t.Fatalf("MCP tools/list under Ed25519 auth: got %d, want 200\nreason: %s\nbody: %s",
+			listResp.StatusCode, listResp.Header.Get(auth.HeaderReason), body)
+	}
+
+	listRespBody, err := io.ReadAll(listResp.Body)
+	if err != nil {
+		t.Fatalf("reading MCP tools/list response: %v", err)
+	}
+
+	var listFields map[string]json.RawMessage
+	if err := json.Unmarshal(listRespBody, &listFields); err != nil {
+		t.Fatalf("decoding MCP tools/list response: %v", err)
+	}
+	if string(listFields["jsonrpc"]) != `"2.0"` {
+		t.Errorf("tools/list: jsonrpc = %s, want \"2.0\"", listFields["jsonrpc"])
+	}
+	if string(listFields["id"]) != "2" {
+		t.Errorf("tools/list: id = %s, want 2", listFields["id"])
+	}
+	if _, ok := listFields["result"]; !ok {
+		t.Errorf("tools/list: response has no result key, want one\nbody: %v", listFields)
+	}
+	if raw, ok := listFields["error"]; ok {
+		t.Errorf("tools/list: response has an error key, want none\nerror: %s", raw)
+	}
+
+	var listRPC struct {
+		Result struct {
+			Tools []map[string]any `json:"tools"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(listRespBody, &listRPC); err != nil {
+		t.Fatalf("decoding MCP tools/list result: %v", err)
+	}
+	if len(listRPC.Result.Tools) == 0 {
+		t.Error("tools/list: expected at least one tool, got 0")
 	}
 }

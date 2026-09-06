@@ -108,6 +108,96 @@ func newErrorDockerClient(
 	return client, shutdown
 }
 
+// newSelectiveInspectFailureDockerClient builds a stub docker client whose
+// /containers/json returns the given listed containers, and whose
+// /containers/<id>/json returns 500 for failID but a minimal valid inspect
+// body for every other ID. Used to distinguish "skip this one and keep
+// processing the rest of the list" (continue) from "stop processing the list
+// entirely" (break).
+func newSelectiveInspectFailureDockerClient(
+	t *testing.T,
+	listed []docker.ContainerJSON,
+	failID string,
+) (*docker.Client, func()) {
+	t.Helper()
+
+	socketPath := shortSocketPath(t)
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("listen on unix socket: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(docker.VersionResponse{
+			Version:    "26.0.0",
+			APIVersion: "1.44",
+		})
+	})
+
+	mux.HandleFunc("/v1.44/containers/json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(listed)
+	})
+
+	mux.HandleFunc("/v1.44/containers/", func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/json") {
+			http.NotFound(w, r)
+			return
+		}
+
+		id := strings.TrimPrefix(r.URL.Path, "/v1.44/containers/")
+		id = strings.TrimSuffix(id, "/json")
+
+		if id == failID {
+			http.Error(w, "inspect error", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(docker.ContainerInspect{
+			ID:      id,
+			Name:    "/" + id,
+			Created: time.Now().UTC().Format(time.RFC3339),
+			State: docker.ContainerState{
+				Status:    "running",
+				Running:   true,
+				StartedAt: time.Now().UTC().Format(time.RFC3339),
+			},
+			Config: docker.ContainerConfig{
+				Image:  "nginx:latest",
+				Labels: map[string]string{"test.id": id},
+			},
+			NetworkSettings: &docker.NetworkSettings{
+				Networks: map[string]docker.NetworkEndpoint{},
+			},
+		})
+	})
+
+	server := &http.Server{Handler: mux}
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		_ = server.Serve(listener)
+	}()
+
+	client, err := docker.NewClient(socketPath, 2)
+	if err != nil {
+		t.Fatalf("new docker client: %v", err)
+	}
+
+	shutdown := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = server.Shutdown(ctx)
+		_ = listener.Close()
+		<-serverDone
+	}
+
+	return client, shutdown
+}
+
 // ---------------------------------------------------------------------------
 // BuildInventory error paths
 // ---------------------------------------------------------------------------
@@ -155,6 +245,35 @@ func TestBuildInventoryInspectError(t *testing.T) {
 	}
 	if len(containers) != 0 {
 		t.Fatalf("expected 0 containers (skipped on inspect error), got %d", len(containers))
+	}
+}
+
+// TestBuildInventorySkipsFailedInspectAndContinuesToNextContainer covers
+// containers.go:64 — the loop must skip a container whose inspect fails and
+// continue to the next entry, not abort the whole list (continue vs break).
+// A single-container list can't distinguish the two, so this uses two: the
+// first fails inspect, the second must still make it into the result.
+func TestBuildInventorySkipsFailedInspectAndContinuesToNextContainer(t *testing.T) {
+	t.Parallel()
+
+	listed := []docker.ContainerJSON{
+		{ID: "bad-container", Image: "nginx:latest", ImageID: "sha256:bad", Labels: map[string]string{}},
+		{ID: "good-container", Image: "redis:7", ImageID: "sha256:good", Labels: map[string]string{}},
+	}
+
+	client, shutdown := newSelectiveInspectFailureDockerClient(t, listed, "bad-container")
+	defer shutdown()
+
+	manager := NewContainerManager(client, "test-agent", nil)
+	containers, err := manager.BuildInventory(context.Background())
+	if err != nil {
+		t.Fatalf("expected no error from BuildInventory when one inspect fails, got: %v", err)
+	}
+	if len(containers) != 1 {
+		t.Fatalf("expected 1 container after skipping the failed one, got %d", len(containers))
+	}
+	if containers[0].ID != "good-container" {
+		t.Fatalf("expected surviving container to be good-container, got %q", containers[0].ID)
 	}
 }
 
@@ -224,6 +343,37 @@ func TestRefreshInspectError(t *testing.T) {
 	if len(added) != 0 || len(updated) != 0 || len(removed) != 0 {
 		t.Fatalf("expected empty diff when inspect fails, got added=%d updated=%d removed=%d",
 			len(added), len(updated), len(removed))
+	}
+}
+
+// TestRefreshSkipsFailedInspectAndContinuesToNextContainer covers
+// containers.go:125 — the same continue-vs-break distinction as
+// TestBuildInventorySkipsFailedInspectAndContinuesToNextContainer, but for
+// the Refresh loop's cache-miss branch.
+func TestRefreshSkipsFailedInspectAndContinuesToNextContainer(t *testing.T) {
+	t.Parallel()
+
+	listed := []docker.ContainerJSON{
+		{ID: "bad-c", Image: "nginx:latest", ImageID: "sha256:bad", Labels: map[string]string{}},
+		{ID: "good-c", Image: "redis:7", ImageID: "sha256:good", Labels: map[string]string{}},
+	}
+
+	client, shutdown := newSelectiveInspectFailureDockerClient(t, listed, "bad-c")
+	defer shutdown()
+
+	manager := NewContainerManager(client, "test-agent", nil)
+	added, updated, removed, err := manager.Refresh(context.Background())
+	if err != nil {
+		t.Fatalf("expected no error when one inspect fails during Refresh, got: %v", err)
+	}
+	if len(updated) != 0 || len(removed) != 0 {
+		t.Fatalf("expected updated=0 removed=0, got updated=%d removed=%d", len(updated), len(removed))
+	}
+	if len(added) != 1 {
+		t.Fatalf("expected 1 added container after skipping the failed one, got %d", len(added))
+	}
+	if added[0].ID != "good-c" {
+		t.Fatalf("expected surviving container to be good-c, got %q", added[0].ID)
 	}
 }
 

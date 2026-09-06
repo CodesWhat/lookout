@@ -152,10 +152,18 @@ assert_rejected \
 	"contract must reject a changed code-change budget"
 
 reset_fixtures
-sed -i.bak 's|fuzz-seconds: 3600|fuzz-seconds: 300|' "${batch_fixture}"
+sed -i.bak 's|fuzz-seconds: 600|fuzz-seconds: 300|' "${batch_fixture}"
 assert_rejected \
-	"must set fuzz-seconds: 3600" \
-	"contract must reject a batch budget that is no longer an hour"
+	"must set fuzz-seconds: 600" \
+	"contract must reject a batch budget that is no longer 600s"
+
+# The old hour-long budget is not merely "some other value"; it is the exact
+# value that was measured to exceed the runner's CPU ceiling and kill the job.
+reset_fixtures
+sed -i.bak 's|fuzz-seconds: 600|fuzz-seconds: 3600|' "${batch_fixture}"
+assert_rejected \
+	"exceeds the measured runner ceiling" \
+	"contract must reject a batch budget reverted to the old 3600s"
 
 # Swapping the two scheduled modes reads plausible and silently stops the corpus
 # ever growing: prune only minimizes what batch found.

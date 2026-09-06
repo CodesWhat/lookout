@@ -9,6 +9,24 @@ run-name: >-
 # fuzzer a 60-second budget on every PR/push. This workflow gives each fuzzer
 # 5 minutes (lighter than sockguard's 15m — Portwing's corpus is young).
 # Matrix-parallelized so wall time stays near 5 minutes regardless of count.
+#
+# Two of the ten targets — FuzzParseImageRef and FuzzParseLabels — are a
+# third, seed-replay-only tier (PW-7.37): both logged 5.5M/6.8M executions
+# with zero new interesting inputs, and their path derivation was verified
+# correct, so this is real saturation rather than a bug. Fuzzing them further
+# spends nightly minutes finding nothing while targets that still produce
+# (FuzzMCPHandler, FuzzEnvelope, FuzzComposeRequestValidate) get the same
+# budget. They still run every night, but as a replay of the seed corpus plus
+# the cached (GOCACHE) corpus through `go test -run`
+# (scripts/ci/fuzz-replay.sh) instead of `-fuzz` (scripts/ci/fuzz-run.sh), so
+# a regression in the committed corpus is still caught and their
+# quality-history row still appears (kind=replay, distinct from kind=pass) —
+# just with no -fuzz minutes spent generating new input. The pinned
+# membership list is scripts/fuzz-tier-config-test.sh's `replay_tier_fuzzers`;
+# they also get no leg in quality-fuzz-monthly.yml's matrix, for the same
+# reason. `targets_expected`/`strategy.job-total` below is unaffected — the
+# matrix itself still carries all ten, so the quality-history union's
+# targets_total stays 10 exactly as it did before this tier existed.
 
 on:
   workflow_dispatch:
@@ -32,6 +50,9 @@ jobs:
     name: "Fuzz ${{ matrix.fuzzer.name }}"
     runs-on: ubuntu-24.04
     timeout-minutes: 75
+
+    outputs:
+      targets_expected: ${{ strategy.job-total }}
 
     # Shared with quality-fuzz-monthly.yml's corpus-touching job, keyed on
     # the same fuzzer name the cache key itself uses (runner.os isn't in
@@ -131,6 +152,21 @@ jobs:
           rel="${PKG#./}"
           rel="${rel%/}"
           module="$(awk '$1 == "module" { print $2; exit }' go.mod)"
+          # A wrong derivation here would still look fine: mkdir -p below
+          # creates whatever path was computed, actions/cache saves and
+          # restores it without complaint, and the corpus would silently
+          # persist against a path go itself never reads from — indefinitely,
+          # since nothing downstream ever notices. `go list` reports the
+          # toolchain's own import path for PKG, so a derivation that drifted
+          # from it (a module rename, a package moved between directories) is
+          # caught here instead of costing another investigation.
+          listed="$(go list -f '{{.ImportPath}}' "${PKG}" 2>/dev/null || true)"
+          if [ -z "${listed}" ]; then
+            echo "::warning::corpus path cross-check skipped: go list produced no import path for '${PKG}'"
+          elif [ "${listed}" != "${module}/${rel}" ]; then
+            echo "::error::corpus path derivation is wrong: go list says '${listed}', derived '${module}/${rel}'"
+            exit 1
+          fi
           generated="$(go env GOCACHE)/fuzz/${module}/${rel}/${FUZZER}"
           seed="${rel}/testdata/fuzz/${FUZZER}"
           # Both have to exist before the save step runs: actions/cache treats
@@ -163,8 +199,14 @@ jobs:
           restore-keys: |
             fuzz-corpus-v1-${{ runner.os }}-${{ matrix.fuzzer.name }}-
 
+      # Skipped for the replay tier (FuzzParseImageRef, FuzzParseLabels): they
+      # spend no -fuzz minutes, so a budget for that mode is meaningless — the
+      # Summarize step below reports "seed-replay only" whenever this step's
+      # own fuzztime output comes back empty rather than printing a budget
+      # that was never used.
       - name: Resolve fuzz budget
         id: budget
+        if: ${{ !contains(fromJSON('["FuzzParseImageRef","FuzzParseLabels"]'), matrix.fuzzer.name) }}
         env:
           INPUT_FUZZTIME: ${{ github.event.inputs.fuzztime }}
         run: |
@@ -185,25 +227,79 @@ jobs:
       # scripts/ci/fuzz-run.sh (PW-5.10), shared with quality-fuzz-monthly.yml,
       # lefthook.yml and scripts/ci/go-fuzz.sh. It writes this step's
       # `kind`/`reason` outputs straight to $GITHUB_OUTPUT, which the
-      # Summarize step below still reads exactly as before.
+      # Summarize step below still reads exactly as before. Skipped for the
+      # replay tier — see the "Replay" step just below, which covers those
+      # two targets instead and never runs alongside this one.
       - name: Fuzz ${{ matrix.fuzzer.name }}
         id: fuzz
+        if: ${{ !contains(fromJSON('["FuzzParseImageRef","FuzzParseLabels"]'), matrix.fuzzer.name) }}
         env:
           FUZZER: ${{ matrix.fuzzer.name }}
           PKG: ${{ matrix.fuzzer.pkg }}
           FUZZTIME: ${{ steps.budget.outputs.fuzztime }}
           FUZZ_TIMEOUT: ${{ steps.budget.outputs.test_timeout }}
         run: |
-          FUZZ_RETRIES=2 FUZZ_OUTPUT_FILE="$GITHUB_OUTPUT" bash scripts/ci/fuzz-run.sh "${PKG}" "${FUZZER}" "${FUZZTIME}"
+          # FUZZ_LOG_FILE captures every attempt's raw `go test -fuzz` output
+          # for the Score corpus coverage step below, which reads its last
+          # `fuzz: elapsed:` line for the engine's own new-interesting/execs
+          # counters — signals `go test -run` (the score step's replay) never
+          # produces on its own.
+          FUZZ_RETRIES=2 FUZZ_OUTPUT_FILE="$GITHUB_OUTPUT" FUZZ_LOG_FILE="fuzz-run-${FUZZER}.log" bash scripts/ci/fuzz-run.sh "${PKG}" "${FUZZER}" "${FUZZTIME}"
+
+      # Seed-replay tier (PW-7.37): the mirror image of the "Fuzz" step above,
+      # for exactly the two targets that step's if: excludes. Runs the
+      # committed seed corpus plus the cached (GOCACHE) corpus restored by
+      # "Restore fuzz corpus" above through `go test -run` instead of
+      # `-fuzz` — scripts/ci/fuzz-replay.sh owns the cached-<basename> copy
+      # (reusing scripts/ci/fuzz-score.sh's own mechanism) and the pass/
+      # regression classification, and writes `kind`/`reason`/`status`
+      # outputs in the same shape scripts/ci/fuzz-run.sh's Fuzz step does, so
+      # the Score/Summarize steps below read whichever of the two ran without
+      # caring which.
+      - name: Replay ${{ matrix.fuzzer.name }}
+        id: replay
+        if: ${{ contains(fromJSON('["FuzzParseImageRef","FuzzParseLabels"]'), matrix.fuzzer.name) }}
+        env:
+          FUZZER: ${{ matrix.fuzzer.name }}
+          PKG: ${{ matrix.fuzzer.pkg }}
+          GENERATED: ${{ steps.corpus.outputs.generated }}
+          SEED: ${{ steps.corpus.outputs.seed }}
+        run: |
+          FUZZ_OUTPUT_FILE="$GITHUB_OUTPUT" bash scripts/ci/fuzz-replay.sh "${PKG}" "${FUZZER}" "${GENERATED}" "${SEED}"
 
       - name: Upload fuzz corpus on failure or cancel
-        if: failure() || cancelled()
+        # Gated on kind/reason, not just failure()/cancelled(): a repro is
+        # only ever expected for a real crash (kind=crash) or a stale-cache
+        # replay (reason=stale-cache, scripts/ci/fuzz-replay.sh's own repro
+        # copy) — a build or corpus-copy error never produces new corpus
+        # content, so running this step for those would just be a guaranteed
+        # empty upload. `if-no-files-found: warn` below only means something
+        # once the step is scoped to runs that were expected to produce
+        # files.
+        if: |
+          (failure() || cancelled()) &&
+          ((steps.fuzz.outputs.kind || steps.replay.outputs.kind) == 'crash' ||
+           (steps.fuzz.outputs.reason || steps.replay.outputs.reason) == 'stale-cache')
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: fuzz-corpus-${{ matrix.fuzzer.name }}-${{ github.run_id }}
-          path: "**/testdata/fuzz/${{ matrix.fuzzer.name }}/"
+          # testdata/fuzz/<Target>/ is the committed seed corpus (any crasher
+          # a -fuzz run wrote lands here). fuzz-replay-failure/<Target>/ is
+          # scripts/ci/fuzz-replay.sh's own reproduction copy of this run's
+          # cached-<basename> corpus, saved there before its EXIT trap
+          # removes cached-* from testdata/fuzz/ — without this second path,
+          # a replay-tier regression triggered only by the GOCACHE corpus
+          # (never committed) would leave nothing downloadable behind.
+          path: |
+            **/testdata/fuzz/${{ matrix.fuzzer.name }}/
+            fuzz-replay-failure/${{ matrix.fuzzer.name }}/
           retention-days: 90
-          if-no-files-found: ignore
+          # warn, not ignore: this step now only runs when a repro was
+          # expected (see the if: above), so an empty result here means
+          # scripts/ci/fuzz-replay.sh's own repro-save step failed
+          # (repro_saved=false in the Summarize step below) and deserves a
+          # visible signal, not silence.
+          if-no-files-found: warn
 
       - name: Save fuzz corpus
         # always(), because the run that matters most for persistence is the
@@ -222,6 +318,101 @@ jobs:
             ${{ steps.corpus.outputs.generated }}
           key: fuzz-corpus-v1-${{ runner.os }}-${{ matrix.fuzzer.name }}-${{ github.run_id }}-${{ github.run_attempt }}
 
+      # Spec 2 — Fuzz score. Placed after Save fuzz corpus so a cached-*
+      # copy can never enter the actions/cache entry that step just wrote,
+      # and after the failure-corpus upload above so a copy can never enter
+      # that crash artifact either. `-fuzz` and `-coverprofile` are mutually
+      # exclusive at the cmd/go level and the fuzz engine exports no
+      # coverage counters, so this measures statement coverage the only way
+      # available: replaying the seed corpus plus the GOCACHE-cached corpus
+      # through `go test -run` with -coverprofile. Never fails the job —
+      # scripts/ci/fuzz-score.sh always exits 0 and records why in
+      # coverage_status when it cannot score.
+      - name: Score corpus coverage
+        id: fuzz-score
+        if: always()
+        env:
+          PKG: ${{ matrix.fuzzer.pkg }}
+          FUZZER: ${{ matrix.fuzzer.name }}
+          GENERATED: ${{ steps.corpus.outputs.generated }}
+          SEED: ${{ steps.corpus.outputs.seed }}
+          # steps.fuzz and steps.replay are mutually exclusive (see their if:
+          # conditions above) — exactly one of the two ever runs for a given
+          # matrix entry, so its outputs win and the skipped step's empty
+          # string falls through. A replay-tier pass reaches here with
+          # kind=replay, not kind=pass, and is scored exactly like any other
+          # non-crash kind: the elif below only special-cases "crash".
+          FUZZ_SCORE_KIND: ${{ steps.fuzz.outputs.kind || steps.replay.outputs.kind }}
+          FUZZ_SCORE_FUZZTIME: ${{ steps.budget.outputs.fuzztime }}
+          FUZZ_SCORE_RESTORED_FROM: ${{ steps.corpus-restore.outputs.cache-matched-key }}
+        run: |
+          bash scripts/ci/fuzz-score.sh \
+            "${PKG}" "${FUZZER}" "${GENERATED}" "${SEED}" \
+            "fuzz-run-${FUZZER}.log" "fuzz-score-${FUZZER}.json"
+
+      # Paired with the step above: fuzz-score.sh already cleans up its own
+      # cached-<basename> copies internally, from a manifest of exactly the
+      # paths it copied — never a glob. This step is the loud, independent
+      # check that none survived that cleanup, not a second attempt at the
+      # cleanup itself. It must never delete anything: fuzz-score.sh
+      # deliberately leaves some cached-* files untouched (a pre-existing
+      # untracked one, or every copy when a tracked cached-* file made it
+      # refuse to copy at all), and a blanket `rm -f "${SEED}/cached-"*`
+      # here would delete those too, silently lowering the seed count
+      # instead of catching the bug this step exists to catch. There is no
+      # manifest file left on disk to read — fuzz-score.sh's own EXIT trap
+      # removes it along with the copies — so the check re-derives the same
+      # set of paths from ${GENERATED}'s file list using fuzz-score.sh's own
+      # `cached-$(basename "${src}")` naming convention, and fails loudly if
+      # any of them still exist under ${SEED}: the seed corpus is
+      # git-tracked, and a leftover cached-* file there would show up as an
+      # untracked file in every future `git status` and, worse, get
+      # committed the next time someone runs `git add -A` on a crasher.
+      - name: Verify cached corpus copies were cleaned up
+        if: always()
+        env:
+          GENERATED: ${{ steps.corpus.outputs.generated }}
+          SEED: ${{ steps.corpus.outputs.seed }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SEED}" ]; then
+            echo "::error::SEED is empty; refusing to verify an unqualified path."
+            exit 1
+          fi
+          # fuzz-score.sh's own manifest of copied paths never reaches this
+          # step — its EXIT trap deletes both the copies and the manifest
+          # file itself before this step starts — so re-derive the same set
+          # from ${GENERATED}'s file list instead of reading it back.
+          leftover=""
+          if [ -n "${GENERATED}" ] && [ -d "${GENERATED}" ]; then
+            while IFS= read -r -d '' src; do
+              candidate="${SEED}/cached-$(basename "${src}")"
+              if [ -e "${candidate}" ]; then
+                leftover="${leftover}
+          ${candidate}"
+              fi
+            done < <(find "${GENERATED}" -maxdepth 1 -type f -print0 2>/dev/null)
+          fi
+          if [ -n "${leftover}" ]; then
+            echo "::error::cached-* corpus copies survived fuzz-score.sh's own cleanup in ${SEED}:"
+            printf '%s\n' "${leftover}"
+            exit 1
+          fi
+
+      # Retention: 1 day. Read once by the history job below in this same
+      # run and never again — the quality-history record it feeds is the
+      # thing meant to last.
+      - name: Upload the fuzz history record
+        if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: fuzz-history-${{ matrix.fuzzer.name }}-${{ github.run_id }}
+          path: |
+            fuzz-score-${{ matrix.fuzzer.name }}.json
+            fuzz-cover-${{ matrix.fuzzer.name }}.out
+          if-no-files-found: warn
+          retention-days: 1
+
       - name: Summarize
         if: always()
         env:
@@ -229,8 +420,13 @@ jobs:
           PKG: ${{ matrix.fuzzer.pkg }}
           FUZZTIME: ${{ steps.budget.outputs.fuzztime }}
           STATUS: ${{ job.status }}
-          KIND: ${{ steps.fuzz.outputs.kind }}
-          REASON: ${{ steps.fuzz.outputs.reason }}
+          # steps.fuzz and steps.replay are mutually exclusive — see their
+          # if: conditions above — so exactly one contributes here.
+          KIND: ${{ steps.fuzz.outputs.kind || steps.replay.outputs.kind }}
+          REASON: ${{ steps.fuzz.outputs.reason || steps.replay.outputs.reason }}
+          # Only ever set by scripts/ci/fuzz-replay.sh's save_repro; empty
+          # for anything the "Fuzz" step (steps.fuzz) produced.
+          REPRO_SAVED: ${{ steps.fuzz.outputs.repro_saved || steps.replay.outputs.repro_saved }}
           RUN_ID: ${{ github.run_id }}
           MATCHED_KEY: ${{ steps.corpus-restore.outputs.cache-matched-key }}
           GENERATED: ${{ steps.corpus.outputs.generated }}
@@ -244,7 +440,15 @@ jobs:
             echo "### ${FUZZER}"
             echo ""
             echo "- Package: \`${PKG}\`"
-            echo "- Budget:  ${FUZZTIME}"
+            # FUZZTIME is only ever set by "Resolve fuzz budget", which is
+            # itself skipped for the replay tier (see its if: above) — so an
+            # empty value here means this target spent no -fuzz minutes this
+            # run, not that the budget failed to resolve.
+            if [ -z "${FUZZTIME}" ]; then
+              echo "- Budget:  seed-replay only (no -fuzz minutes; see scripts/ci/fuzz-replay.sh)"
+            else
+              echo "- Budget:  ${FUZZTIME}"
+            fi
             echo "- Result:  ${STATUS}"
             # These two counts are the acceptance signal for corpus
             # persistence: they have to climb across successive runs, and a
@@ -255,12 +459,144 @@ jobs:
             if [ "${KIND}" = "crash" ]; then
               echo ""
               if [ "${REASON}" = "seed-regression" ]; then
-                echo "The committed seed corpus is failing (matched \`failure while testing seed corpus entry\`):"
-                echo "a previously-fixed crash has regressed."
+                if [ -z "${FUZZTIME}" ]; then
+                  echo "The committed seed corpus (replayed via \`go test -run\`, not \`-fuzz\`) is failing:"
+                  echo "a previously-fixed crash has regressed. scripts/ci/fuzz-replay.sh also saved"
+                  echo "its cached-corpus copies to \`fuzz-replay-failure/${FUZZER}/\` before cleanup,"
+                  echo "in case the regression is only in a cached (not yet committed) input."
+                else
+                  echo "The committed seed corpus is failing (matched \`failure while testing seed corpus entry\`):"
+                  echo "a previously-fixed crash has regressed."
+                fi
               else
                 echo "A crashing input was saved to \`testdata/fuzz/${FUZZER}/\` (matched \`Failing input written to testdata\`)."
               fi
               echo "Download artifact \`fuzz-corpus-${FUZZER}-${RUN_ID}\`, commit the"
               echo "minimized input to the seed corpus, fix the bug, and push."
+              if [ "${REPRO_SAVED}" = "false" ]; then
+                echo ""
+                echo "scripts/ci/fuzz-replay.sh could not save its own reproduction copy to"
+                echo "\`fuzz-replay-failure/${FUZZER}/\` (see this step's own log for the"
+                echo "\`::warning::\`) — the artifact above may be missing the cached-corpus input"
+                echo "alongside the committed one."
+              fi
+            elif [ "${KIND}" = "error" ]; then
+              echo ""
+              case "${REASON}" in
+              build)
+                echo "\`${PKG}\` failed to compile (scripts/ci/fuzz-replay.sh's pre-replay build check)."
+                echo "Not a corpus regression — fix the package and push."
+                ;;
+              stale-cache)
+                echo "A cached corpus entry no longer matches \`${FUZZER}\`'s current signature"
+                echo "(matched one of Go's own corpus-decode errors, on a \`cached-\` copy — not a"
+                echo "committed seed). Not a regression in the committed seed corpus."
+                if [ "${REPRO_SAVED}" = "false" ]; then
+                  echo ""
+                  echo "scripts/ci/fuzz-replay.sh could not save its own reproduction copy (see this"
+                  echo "step's own log for the \`::warning::\`), so it left the stale entries in the"
+                  echo "generated (GOCACHE) corpus instead of deleting them — the cache was NOT"
+                  echo "cleaned this run, and \"Save fuzz corpus\" below will re-save the same stale"
+                  echo "entries under today's key. Investigate why the reproducer save failed and"
+                  echo "re-run so the cache can actually be cleaned."
+                else
+                  echo "scripts/ci/fuzz-replay.sh already deleted the stale entries from the generated"
+                  echo "(GOCACHE) corpus and saved a copy to \`fuzz-replay-failure/${FUZZER}/\` first;"
+                  echo "\"Save fuzz corpus\" below then writes that emptied corpus under today's cache"
+                  echo "key, so tomorrow's run starts clean instead of re-failing on the same entry."
+                fi
+                ;;
+              seed-decode)
+                echo "A committed seed under \`testdata/fuzz/${FUZZER}/\` no longer matches its"
+                echo "current signature (matched one of Go's own corpus-decode errors, on a"
+                echo "git-tracked file — not a \`cached-\` copy). Clearing the GOCACHE corpus can't"
+                echo "fix this: the seed itself is wrong for the target's current \`f.Add\`/\`Fuzz\`"
+                echo "signature. Fix or remove the offending seed and push."
+                ;;
+              log-write)
+                echo "scripts/ci/fuzz-replay.sh could not write its own replay log (\`tee\` failed)"
+                echo "before it could classify this run's output. An infrastructure problem, not a"
+                echo "code or corpus regression — see this step's own log for detail."
+                ;;
+              corpus-copy)
+                echo "Copying the cached (GOCACHE) corpus into \`testdata/fuzz/${FUZZER}/\` failed"
+                echo "before the replay could even run — an infrastructure problem, not a code"
+                echo "or corpus regression. See this step's own log for the underlying error."
+                ;;
+              *)
+                echo "scripts/ci/fuzz-replay.sh reported kind=error (reason: \`${REASON:-none}\`)."
+                echo "See this step's own log for detail."
+                ;;
+              esac
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # Spec 2 — Fuzz score. Mirrors quality-mutation-monthly.yml's `history` job
+  # in shape: the one job in this workflow that can write to the repository,
+  # and the only one that runs no Go and nothing from the workspace beyond
+  # the append script and awk itself. Keeping the push inside the fuzzing
+  # matrix would mean ten jobs holding a write-scoped credential while
+  # running `go test` against a corpus that includes whatever the nightly
+  # cache last restored; splitting it out removes that, the same way it was
+  # removed for mutation.
+  history:
+    name: "Record the fuzz run in the quality history"
+    needs: deep-fuzz
+    if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c  # v2.21.0
+        with:
+          egress-policy: block
+          # Same set quality-mutation-monthly.yml's history job uses: github.com
+          # carries the checkout and the git push, the rest is the Actions
+          # artifact-download path. No go.dev/proxy.golang.org/dl.google.com —
+          # this job runs no Go.
+          allowed-endpoints: >
+            api.github.com:443
+            github.com:443
+            results-receiver.actions.githubusercontent.com:443
+            *.actions.githubusercontent.com:443
+            *.blob.core.windows.net:443
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download the per-target records
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: fuzz-history-*-${{ github.run_id }}
+          path: records
+
+      # One append per target record (scope: target), plus one more (scope:
+      # union) for the whole run's merged statement coverage. The union
+      # merges only the profiles from targets that actually scored "ok" —
+      # awk, not `go tool covdata`, so this job never needs Go on its PATH.
+      #
+      # The merge itself, and the arithmetic on each record's untrusted
+      # fields, live in scripts/ci/fuzz-history-compute.sh, not inline here,
+      # so scripts/fuzz-history-merge-script-test.sh can run the real thing
+      # against fixture records (including a malformed one) instead of this
+      # only ever executing for real once a night. That script only prints —
+      # this loop is what actually calls quality-history-append.sh, so that
+      # script stays the one and only thing in this repository that pushes to
+      # the quality-history branch.
+      - name: Merge target profiles and append the quality history
+        env:
+          QUALITY_HISTORY_CREDENTIAL: ${{ secrets.GITHUB_TOKEN }}
+          QUALITY_HISTORY_EVENT: ${{ github.event_name }}
+          TARGETS_EXPECTED: ${{ needs.deep-fuzz.outputs.targets_expected }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r numbers; do
+            scripts/ci/quality-history-append.sh fuzz-nightly "${numbers}"
+          done < <(bash scripts/ci/fuzz-history-compute.sh records)

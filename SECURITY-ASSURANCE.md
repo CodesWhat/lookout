@@ -105,9 +105,12 @@ and the public [security model](https://portwing.codeswhat.com/docs/security-mod
 
 CI applies formatting, vetting, static security analysis, dependency and image
 vulnerability scans, race-enabled tests, integration tests, fuzzing, and a 97%
-coverage floor. The release workflow creates signed images and archives,
-CycloneDX SBOMs, and provenance, then verifies the published artifacts against
-the expected workflow identity.
+coverage floor. A separate weekly lane rescans the currently published GHCR
+release image (the latest non-prerelease tag, both `linux/amd64` and
+`linux/arm64`) for CVEs disclosed since that release was cut, independent of
+the scans PR and release-cut runs perform. The release workflow creates signed
+images and archives, CycloneDX SBOMs, and provenance, then verifies the
+published artifacts against the expected workflow identity.
 
 Fuzzing runs in five tiers over the same ten targets, so a finding is reachable
 from a laptop and from a scheduled lane alike. Four of them run Go's native
@@ -127,6 +130,7 @@ without a hit. On a codebase this close to pure Go, AddressSanitizer's reach is
 limited to the runtime boundary.
 
 Evidence: [`.github/workflows/ci-verify.yml`](.github/workflows/ci-verify.yml),
+[`.github/workflows/security-grype.yml`](.github/workflows/security-grype.yml),
 [`.github/workflows/quality-fuzz-cflite-pr.yml`](.github/workflows/quality-fuzz-cflite-pr.yml),
 [`.github/workflows/quality-fuzz-cflite-batch.yml`](.github/workflows/quality-fuzz-cflite-batch.yml),
 [`.github/workflows/quality-fuzz-cflite-prune.yml`](.github/workflows/quality-fuzz-cflite-prune.yml),

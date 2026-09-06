@@ -101,6 +101,95 @@ func TestContainerManagerRefreshDiffsAddedUpdatedRemoved(t *testing.T) {
 	}
 }
 
+// containerSignalSnapshot builds a one-container inventory snapshot with the
+// *listed* entry's State/Status/ImageID set explicitly — these three fields
+// are what Refresh hashes into the inspect-cache signal (containers.go:116),
+// distinct from the nested inspect State used by buildInventorySnapshot's
+// fixtureContainer helper. Varying them across two fixture.Set calls is what
+// lets a test force a signal change between two Refresh calls.
+func containerSignalSnapshot(id, listState, listStatus, imageID, inspectStatus string, running bool) dockerInventorySnapshot {
+	return dockerInventorySnapshot{
+		listed: []docker.ContainerJSON{
+			{
+				ID:      id,
+				Image:   "nginx:1.0",
+				ImageID: imageID,
+				State:   listState,
+				Status:  listStatus,
+				Labels:  map[string]string{"test.id": id},
+			},
+		},
+		inspected: map[string]docker.ContainerInspect{
+			id: {
+				ID:      id,
+				Name:    "/" + id,
+				Created: "2026-01-01T00:00:00Z",
+				State: docker.ContainerState{
+					Status:    inspectStatus,
+					Running:   running,
+					StartedAt: "2026-01-01T00:00:00Z",
+				},
+				Config: docker.ContainerConfig{
+					Image:  "nginx:1.0",
+					Labels: map[string]string{"test.id": id},
+				},
+				NetworkSettings: &docker.NetworkSettings{
+					Networks: map[string]docker.NetworkEndpoint{},
+				},
+			},
+		},
+	}
+}
+
+// TestRefreshBypassesStaleCacheWhenContainerSignalChanges covers
+// containers.go:118 — the inspect-cache hit is only used when the cached
+// entry's signal (state|status|imageID) still matches the freshly listed
+// entry. A cache hit whose signal has drifted must fall through to a fresh
+// InspectContainer call, not serve the stale cached container.
+func TestRefreshBypassesStaleCacheWhenContainerSignalChanges(t *testing.T) {
+	t.Parallel()
+
+	client, fixture, shutdown := newDynamicDockerClient(t)
+	defer shutdown()
+
+	fixture.Set(containerSignalSnapshot("c1", "running", "Up 5 minutes", "sha256:v1", "running", true))
+
+	manager := NewContainerManager(client, "test-agent", nil)
+	if _, err := manager.BuildInventory(context.Background()); err != nil {
+		t.Fatalf("build inventory: %v", err)
+	}
+
+	// First refresh populates the inspect cache with the "running" signal.
+	if _, _, _, err := manager.Refresh(context.Background()); err != nil {
+		t.Fatalf("first refresh: %v", err)
+	}
+	c1, ok := manager.GetContainer("c1")
+	if !ok || c1.Status != "running" {
+		t.Fatalf("expected c1 running after first refresh, got %+v ok=%v", c1, ok)
+	}
+
+	// The listed entry's State/Status/ImageID change, which changes its
+	// cache signal. A second refresh must detect the mismatch and
+	// re-inspect rather than reuse the stale cached entry.
+	fixture.Set(containerSignalSnapshot("c1", "exited", "Exited (0) 1 second ago", "sha256:v2", "exited", false))
+
+	_, updated, _, err := manager.Refresh(context.Background())
+	if err != nil {
+		t.Fatalf("second refresh: %v", err)
+	}
+	if len(updated) != 1 {
+		t.Fatalf("expected c1 to be reported updated after its signal changed, got %d updated", len(updated))
+	}
+	if updated[0].Status != "stopped" {
+		t.Fatalf("expected updated status to be stopped, got %q", updated[0].Status)
+	}
+
+	c1, ok = manager.GetContainer("c1")
+	if !ok || c1.Status != "stopped" {
+		t.Fatalf("expected c1 status stopped after signal change, got %+v ok=%v", c1, ok)
+	}
+}
+
 func TestContainerManagerRefreshNoChanges(t *testing.T) {
 	t.Parallel()
 

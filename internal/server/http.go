@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -136,6 +137,12 @@ type Server struct {
 	auditor      *audit.Logger
 	httpServer   *http.Server
 	startTime    time.Time
+
+	// listenAddr holds the net.Addr ListenAndServe bound, set once the
+	// listener is up and before Serve/ServeTLS starts blocking. It lets
+	// callers — chiefly tests using an OS-assigned port ("0") — discover
+	// the real bound address instead of guessing or racing a separate bind.
+	listenAddr atomic.Value
 
 	// streamSem bounds concurrent streaming proxy responses; execSem bounds
 	// concurrent hijacked exec/attach sessions. Both are nil when unbounded.
@@ -294,6 +301,13 @@ func NewServer(cfg *config.Config, dockerClient *docker.Client, a adapter.Server
 		// idle keep-alive connections.
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
+		// BaseContext runs once, right after the listener binds, which is
+		// the only hook stdlib gives us to learn the bound address without
+		// owning the listener ourselves (see ListenAndServe below).
+		BaseContext: func(ln net.Listener) context.Context {
+			s.listenAddr.Store(ln.Addr())
+			return context.Background()
+		},
 	}
 
 	// Configure TLS if certs provided.
@@ -881,6 +895,15 @@ func (s *Server) ListenAndServe() error {
 		return s.httpServer.ListenAndServeTLS(s.cfg.TLSCert, s.cfg.TLSKey)
 	}
 	return s.httpServer.ListenAndServe()
+}
+
+// Addr returns the address ListenAndServe bound, or nil if it hasn't bound
+// one yet. It exists so callers — tests, chiefly, using an OS-assigned port
+// ("0") — can discover the real listening address instead of guessing it or
+// racing a separate bind/close/rebind.
+func (s *Server) Addr() net.Addr {
+	addr, _ := s.listenAddr.Load().(net.Addr)
+	return addr
 }
 
 // Shutdown gracefully shuts down the HTTP server and stops background goroutines.

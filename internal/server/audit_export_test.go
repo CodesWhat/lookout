@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -348,5 +349,70 @@ func TestAuditRecordsCarryMonotonicCursors(t *testing.T) {
 	}
 	if records[0].Cursor != 2 || records[1].Cursor != 1 {
 		t.Fatalf("cursors = %d,%d, want 2,1", records[0].Cursor, records[1].Cursor)
+	}
+}
+
+// failingWriteResponseWriter is an http.ResponseWriter whose Write always
+// fails, forcing json.Encoder.Encode to return an error. Used to exercise
+// handleAudit's encode-failure path.
+type failingWriteResponseWriter struct {
+	hdr http.Header
+}
+
+func (w *failingWriteResponseWriter) Header() http.Header { return w.hdr }
+func (w *failingWriteResponseWriter) Write([]byte) (int, error) {
+	return 0, errors.New("write failed")
+}
+func (w *failingWriteResponseWriter) WriteHeader(int) {}
+
+// TestHandleAuditEncodeFailureRecordsFailureMetric verifies both sides of the
+// `err != nil` check in handleAudit's json.Encode: an encode failure records
+// a failure metric and does not record a success, while a normal (encode
+// succeeds) request records success and no failure. This kills the
+// CONDITIONALS_NEGATION mutant at audit_export.go:42:49.
+func TestHandleAuditEncodeFailureRecordsFailureMetric(t *testing.T) {
+	t.Parallel()
+
+	s := makeAuditTestServer(t, 8)
+	s.metrics = metrics.NewRegistry()
+	s.auditor.AuthFailure("a", "GET", "/1")
+
+	req := httptest.NewRequest(http.MethodGet, "/_portwing/audit", nil)
+	w := &failingWriteResponseWriter{hdr: make(http.Header)}
+	s.handleAudit(w, req)
+
+	var b strings.Builder
+	s.metrics.WritePrometheus(&b, func(value string) string { return value })
+	body := b.String()
+	if !strings.Contains(body, `portwing_audit_exports_total{outcome="error"} 1`) {
+		t.Fatalf("missing failed audit export metric after encode failure:\n%s", body)
+	}
+	if strings.Contains(body, `portwing_audit_exports_total{outcome="success"} 1`) {
+		t.Fatalf("unexpected success metric recorded after encode failure:\n%s", body)
+	}
+}
+
+// TestHandleAuditEncodeSuccessRecordsSuccessMetric is the complementary case
+// to TestHandleAuditEncodeFailureRecordsFailureMetric: a normal request that
+// encodes successfully must record a success and no failure.
+func TestHandleAuditEncodeSuccessRecordsSuccessMetric(t *testing.T) {
+	t.Parallel()
+
+	s := makeAuditTestServer(t, 8)
+	s.metrics = metrics.NewRegistry()
+	s.auditor.AuthFailure("a", "GET", "/1")
+
+	req := httptest.NewRequest(http.MethodGet, "/_portwing/audit", nil)
+	rr := httptest.NewRecorder()
+	s.handleAudit(rr, req)
+
+	var b strings.Builder
+	s.metrics.WritePrometheus(&b, func(value string) string { return value })
+	body := b.String()
+	if !strings.Contains(body, `portwing_audit_exports_total{outcome="success"} 1`) {
+		t.Fatalf("missing successful audit export metric:\n%s", body)
+	}
+	if strings.Contains(body, `portwing_audit_exports_total{outcome="error"} 1`) {
+		t.Fatalf("unexpected failure metric recorded on successful encode:\n%s", body)
 	}
 }

@@ -54,7 +54,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 ```json
 {
-  "agentVersion": "0.9.13",
+  "agentVersion": "0.9.14",
   "protocolName": "portwing",
   "protocolVersion": "1.0",
   "adapter": "generic"
@@ -155,7 +155,7 @@ curl -sf http://localhost:3000/_portwing/health
   "live": true,
   "ready": true,
   "mode": "standard",
-  "version": "0.9.13",
+  "version": "0.9.14",
   "uptimeSeconds": 3842.7,
   "docker": "connected",
   "controller": "not_applicable"
@@ -207,7 +207,7 @@ All `/api/v1/*` endpoints and the Docker proxy require a valid credential. Suppl
 |--------|-------|
 | `Authorization: Bearer TOKEN` | Standard bearer token (checked first) |
 | `X-Portwing-Token: TOKEN` | Alternate header |
-| `X-Portwing-Signature` + three companion headers | Ed25519 per-request signature |
+| `X-Portwing-Signature` + four companion headers | Ed25519 per-request signature |
 
 Ten failed attempts per IP per rolling minute result in HTTP 429 until the window expires.
 

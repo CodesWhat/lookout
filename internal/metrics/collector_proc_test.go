@@ -166,6 +166,32 @@ func TestCollectCPUFixturePartialUsage(t *testing.T) {
 	}
 }
 
+// TestCollectCPUFixtureSkipsDecoyLineBeforeAggregate verifies a non-matching
+// line preceding the "cpu " aggregate line is skipped rather than ending the
+// scan, killing the INVERT_LOOPCTRL mutant at collector.go:187:4 (`continue`
+// -> `break`). collectCPU always returns 0 on the first call (no previous
+// sample), so this primes prevCPU on the first call and asserts a real,
+// nonzero delta on the second. Real code skips the decoy line via `continue`
+// and finds the aggregate line both times. The mutant's `break` exits the
+// loop at the decoy line before ever reaching "cpu ", so prevCPU is never
+// set and collectCPU() returns 0 on every call, including the second.
+func TestCollectCPUFixtureSkipsDecoyLineBeforeAggregate(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	const decoy = "intr 12345 0 0 0\n"
+	mkProcFixture(t, dir, "stat", decoy+"cpu  1000 200 300 8000 100 50 25 10\n")
+	c := collectorWithProc(dir)
+	c.collectCPU() // primes prevCPU; always 0 on the first call
+
+	mkProcFixture(t, dir, "stat", decoy+"cpu  1500 200 300 8000 100 50 25 10\n")
+	got := c.collectCPU()
+	// deltaTotal=500, deltaIdle=0 → (1-0)*100 = 100.0
+	if got != 100.0 {
+		t.Errorf("collectCPU() with decoy line = %f, want 100.0", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // collectMemory tests
 // ---------------------------------------------------------------------------
@@ -285,6 +311,85 @@ MemAvailable:    1024000 kB
 	// MemTotal was unparseable, so remains 0; MemFree = MemAvailable = 1024000*1024.
 	if m.MemoryTotal != 0 {
 		t.Errorf("MemoryTotal = %d, want 0 (bad value skipped)", m.MemoryTotal)
+	}
+}
+
+// TestReadMemInfoSkipsColonlessLineBeforeMemTotal verifies a line with no
+// ":" preceding MemTotal is skipped rather than ending the scan, killing the
+// INVERT_LOOPCTRL mutant at collector.go:260:4 (`continue` -> `break`). The
+// existing TestCollectMemoryFixtureMalformedLine puts its colon-less line
+// AFTER MemTotal, so it does not exercise this mutant; this test puts it
+// first. Real code skips the bad line via `continue` and reaches MemTotal.
+// The mutant's `break` stops at the very first line, before MemTotal is ever
+// parsed, leaving mi.total at 0.
+func TestReadMemInfoSkipsColonlessLineBeforeMemTotal(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	mkProcFixture(t, dir, "meminfo", `this line has no colon
+MemTotal:       2048000 kB
+MemFree:         1024000 kB
+`)
+	mi, err := readMemInfo(dir)
+	if err != nil {
+		t.Fatalf("readMemInfo: %v", err)
+	}
+	wantTotal := uint64(2048000 * 1024)
+	if mi.total != wantTotal {
+		t.Errorf("mi.total = %d, want %d", mi.total, wantTotal)
+	}
+	if mi.free == 0 {
+		t.Error("mi.free = 0, want nonzero (MemFree line should have been reached)")
+	}
+}
+
+// TestReadMemInfoSkipsUnparseableValueBeforeMemTotal verifies a line with an
+// unparseable value preceding MemTotal is skipped rather than ending the
+// scan, killing the INVERT_LOOPCTRL mutant at collector.go:270:4 (`continue`
+// -> `break`). The existing TestCollectMemoryFixtureBadValue puts its
+// bad-value line at MemTotal itself and only asserts MemoryTotal == 0 (true
+// either way), so it does not exercise this mutant; this test puts the
+// bad-value key before MemTotal and asserts MemTotal parses. Real code skips
+// the unparseable line via `continue` and reaches MemTotal. The mutant's
+// `break` exits before ever reaching MemTotal, leaving mi.total at 0.
+func TestReadMemInfoSkipsUnparseableValueBeforeMemTotal(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	mkProcFixture(t, dir, "meminfo", `Weird:          NOTANUMBER kB
+MemTotal:       2048000 kB
+`)
+	mi, err := readMemInfo(dir)
+	if err != nil {
+		t.Fatalf("readMemInfo: %v", err)
+	}
+	wantTotal := uint64(2048000 * 1024)
+	if mi.total != wantTotal {
+		t.Errorf("mi.total = %d, want %d", mi.total, wantTotal)
+	}
+}
+
+// TestWriteHostPrometheusReportsUnsupportedOnStatFailure verifies
+// WriteHostPrometheus reports "supported 0" when Collect() fails, even though
+// Collect() also returns a non-nil HostMetrics alongside that error, killing
+// the INVERT_LOGICAL mutant at runtime_prom.go:34:16 (`err != nil || host ==
+// nil` turned into `&&`). Collect() always constructs a non-nil *HostMetrics
+// before checking os.Stat(c.proc()), and returns it (non-nil) alongside a
+// non-nil error on stat failure — so err != nil and host != nil are both true
+// here, which is exactly the case that discriminates AND from OR. Real code:
+// `true || false` = true -> emits "0", returns early. Mutant: `true && false`
+// = false -> falls through and emits "1" instead.
+func TestWriteHostPrometheusReportsUnsupportedOnStatFailure(t *testing.T) {
+	t.Parallel()
+
+	c := collectorWithProc(filepath.Join(t.TempDir(), "does-not-exist"))
+	var b strings.Builder
+	WriteHostPrometheus(&b, c)
+	body := b.String()
+
+	if !strings.Contains(body, "portwing_host_metrics_supported 0") {
+		t.Errorf("missing portwing_host_metrics_supported 0:\n%s", body)
+	}
+	if strings.Contains(body, "portwing_host_metrics_supported 1") {
+		t.Errorf("unexpected portwing_host_metrics_supported 1 on a stat failure:\n%s", body)
 	}
 }
 

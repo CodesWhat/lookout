@@ -143,6 +143,34 @@ func TestHandleContainerLogsAcceptsPositiveTail(t *testing.T) {
 	}
 }
 
+// TestHandleContainerLogsTimestampsAcceptsNumericForm covers the
+// "== \"1\" || == \"true\"" pair for the timestamps query parameter:
+// "timestamps=1" satisfies only the first disjunct, so an accidental
+// invert-to-&& would evaluate the whole expression false and drop the
+// timestamps flag sent to the docker daemon.
+func TestHandleContainerLogsTimestampsAcceptsNumericForm(t *testing.T) {
+	t.Parallel()
+
+	client, calls, shutdown := newRouteTestDockerClient(t)
+	defer shutdown()
+
+	a := NewAdapter(client, "test-agent", AgentInfo{})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/containers/container-1/logs?timestamps=1", nil)
+	req.SetPathValue("id", "container-1")
+	rec := httptest.NewRecorder()
+
+	a.handleContainerLogs(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: got %d want %d", rec.Code, http.StatusOK)
+	}
+	rawQuery, _ := calls.lastLogsRawQuery.Load().(string)
+	if !strings.Contains(rawQuery, "timestamps=1") {
+		t.Fatalf("expected daemon query to include timestamps=1 for ?timestamps=1, got %q", rawQuery)
+	}
+}
+
 type routeLogFlushRecorder struct {
 	*httptest.ResponseRecorder
 	flushes int
@@ -285,6 +313,30 @@ func TestHandleWatcherGetReturns404ForUnknown(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/api/watchers/unknown/missing", nil)
 	req.SetPathValue("type", "unknown")
 	req.SetPathValue("name", "missing")
+	rec := httptest.NewRecorder()
+
+	a.handleWatcherGet(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unexpected status: got %d want %d", rec.Code, http.StatusNotFound)
+	}
+}
+
+// TestHandleWatcherGetReturns404ForPartialMatch covers the
+// "EqualFold(Type) && EqualFold(Name)" match: type matches but name does
+// not, so an accidental invert-to-|| would treat this as a match on type
+// alone and return the docker watcher instead of 404.
+func TestHandleWatcherGetReturns404ForPartialMatch(t *testing.T) {
+	t.Parallel()
+
+	client, _, shutdown := newRouteTestDockerClient(t)
+	defer shutdown()
+
+	a := NewAdapter(client, "test-agent", AgentInfo{})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/watchers/docker/not-docker", nil)
+	req.SetPathValue("type", "docker")
+	req.SetPathValue("name", "not-docker")
 	rec := httptest.NewRecorder()
 
 	a.handleWatcherGet(rec, req)

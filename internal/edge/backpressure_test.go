@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"strconv"
 	"strings"
 	"testing"
@@ -16,23 +17,6 @@ import (
 )
 
 const outboundQueuedByteLimitForTest = 128 << 20
-
-// runSendPump creates the per-connection send queue and starts the sendPump
-// against the test client, returning the channel so a test can observe/fill it.
-// The pump is torn down via context cancellation registered as a test cleanup.
-func runSendPump(t *testing.T, c *Client) chan protocol.Envelope {
-	t.Helper()
-	ch := make(chan protocol.Envelope, sendQueueSize)
-	c.connMu.Lock()
-	c.sendCh = ch
-	conn := c.conn
-	c.connMu.Unlock()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	go c.sendPump(ctx, conn, ch)
-	t.Cleanup(cancel)
-	return ch
-}
 
 func newEdgeMetricsForBackpressureTest() *metrics.Registry {
 	registry := metrics.NewRegistry()
@@ -59,7 +43,6 @@ func TestSendPumpDeliversQueuedFrame(t *testing.T) {
 	t.Parallel()
 
 	c, ctrl := newTestClient(t)
-	runSendPump(t, c)
 
 	const ts = int64(42)
 	if err := c.sendTypedMessage(protocol.TypePong, protocol.PongMessage{Timestamp: ts}); err != nil {
@@ -81,7 +64,7 @@ func TestSendPumpDeliversQueuedFrame(t *testing.T) {
 func TestSendMessageEvictsConnectionWhenQueueFull(t *testing.T) {
 	t.Parallel()
 
-	c, ctrl := newTestClient(t)
+	c, ctrl := newHandshakeTestClient(t)
 	c.metrics = newEdgeMetricsForBackpressureTest()
 
 	// Install a capacity-1 queue (no pump running — nobody drains it).
@@ -113,7 +96,7 @@ func TestSendMessageEvictsConnectionWhenQueueFull(t *testing.T) {
 func TestSendMessageEvictsConnectionWhenQueuedBytesExceedLimit(t *testing.T) {
 	t.Parallel()
 
-	c, _ := newTestClient(t)
+	c, _ := newHandshakeTestClient(t)
 	c.metrics = newEdgeMetricsForBackpressureTest()
 	c.connMu.Lock()
 	c.sendCh = make(chan protocol.Envelope, sendQueueSize)
@@ -175,7 +158,7 @@ func TestOutboundByteReservationIncludesDequeuedFrameUntilRelease(t *testing.T) 
 func TestSendMessageCannotResurrectClosedQueueGeneration(t *testing.T) {
 	t.Parallel()
 
-	c, ctrl := newTestClient(t)
+	c, ctrl := newHandshakeTestClient(t)
 	ch := make(chan protocol.Envelope, sendQueueSize)
 	state := &outboundQueueState{}
 	c.connMu.Lock()
@@ -235,7 +218,7 @@ func TestStaleSendPumpLeavesReplacementQueueStateOpen(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	c.sendPump(ctx, nil, staleCh)
+	c.sendPump(ctx, context.Background(), nil, staleCh)
 
 	activeState.mu.Lock()
 	closed := activeState.closed
@@ -251,7 +234,7 @@ func TestStaleSendPumpLeavesReplacementQueueStateOpen(t *testing.T) {
 func TestSendPumpReleasesReservationWhenConnectionAlreadyClosed(t *testing.T) {
 	t.Parallel()
 
-	c, _ := newTestClient(t)
+	c, _ := newHandshakeTestClient(t)
 	c.connMu.Lock()
 	agentConn := c.conn
 	c.connMu.Unlock()
@@ -269,7 +252,7 @@ func TestSendPumpReleasesReservationWhenConnectionAlreadyClosed(t *testing.T) {
 		t.Fatalf("enqueue = %d, want outboundEnqueued", got)
 	}
 
-	c.sendPump(context.Background(), agentConn, ch)
+	c.sendPump(context.Background(), context.Background(), agentConn, ch)
 
 	state.mu.Lock()
 	closed, queuedBytes := state.closed, state.bytes
@@ -279,10 +262,66 @@ func TestSendPumpReleasesReservationWhenConnectionAlreadyClosed(t *testing.T) {
 	}
 }
 
+// TestSendPumpStaysQuietWhenShutdownClosedTheConn covers the shutdown branch
+// of the write-failure path. connect closes the conn from a context.AfterFunc
+// the moment Run's context is cancelled, and that callback runs on its own
+// goroutine, so a queued frame can lose its write to a conn that shutdown has
+// already taken away. Reporting that as a fault put two warnings on a clean
+// SIGTERM and evicted a generation that was on its way out anyway.
+//
+// The closed conn plus a cancelled shutdown context is that situation with
+// the timing taken out of it. Both the warning and the eviction log are
+// asserted absent, because failConn is what emits the second one and the
+// branch has to skip the call, not just the log.
+func TestSendPumpStaysQuietWhenShutdownClosedTheConn(t *testing.T) {
+	// Deliberately NOT t.Parallel(): captures the process-global slog default.
+
+	c, _ := newHandshakeTestClient(t)
+	c.connMu.Lock()
+	agentConn := c.conn
+	c.connMu.Unlock()
+	// Stands in for the AfterFunc close, so the write below fails the same way.
+	if err := agentConn.Close(); err != nil {
+		t.Fatalf("close agent connection: %v", err)
+	}
+
+	ch := make(chan protocol.Envelope, 1)
+	state := &outboundQueueState{}
+	c.connMu.Lock()
+	c.sendCh = ch
+	c.sendState = state
+	c.connMu.Unlock()
+	if got := state.enqueue(ch, protocol.Envelope{Type: protocol.TypePong}); got != outboundEnqueued {
+		t.Fatalf("enqueue = %d, want outboundEnqueued", got)
+	}
+
+	shutdown, cancelShutdown := context.WithCancel(context.Background())
+	cancelShutdown()
+
+	logBuf := &bytes.Buffer{}
+	oldLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(oldLogger)
+
+	// A live pump context: the pump has to reach the write, not leave through
+	// its own ctx.Done case, or the branch under test never runs.
+	c.sendPump(context.Background(), shutdown, agentConn, ch)
+
+	logged := logBuf.String()
+	for _, unwanted := range []string{"websocket write failed", "evicting controller connection"} {
+		if strings.Contains(logged, unwanted) {
+			t.Errorf("shutdown write failure logged %q as a fault:\n%s", unwanted, logged)
+		}
+	}
+	if !strings.Contains(logged, "websocket write abandoned, shutting down") {
+		t.Errorf("log = %q, want the shutting-down debug line", logged)
+	}
+}
+
 func TestFailConnCannotEvictReplacementGeneration(t *testing.T) {
 	t.Parallel()
 
-	c, oldController := newTestClient(t)
+	c, oldController := newHandshakeTestClient(t)
 	c.connMu.Lock()
 	oldAgent := c.conn
 	c.connMu.Unlock()
@@ -324,7 +363,6 @@ func TestSendPumpEvictsOnWriteFailure(t *testing.T) {
 	t.Parallel()
 
 	c, ctrl := newTestClient(t)
-	runSendPump(t, c)
 
 	// Capture the agent conn before eviction so we can probe it afterwards.
 	c.connMu.Lock()
@@ -354,15 +392,15 @@ func TestSendPumpEvictsOnWriteFailure(t *testing.T) {
 }
 
 // TestSendMessageDirectWriteWhenNoQueue documents that the handshake (nil
-// sendCh) code path remains intact: with sendCh left nil (as newTestClient
-// always leaves it), sendTypedMessage writes directly to the WebSocket and the
-// controller receives the frame. Every existing dispatch test relies on this
-// behaviour implicitly; this test makes it an explicit contract.
+// sendCh) code path remains intact: with sendCh left nil, sendTypedMessage
+// writes directly to the WebSocket and the controller receives the frame. That
+// is the branch sendHello takes before connect publishes the queue, and this
+// test is the only thing pinning it now that newTestClient starts a send pump.
 func TestSendMessageDirectWriteWhenNoQueue(t *testing.T) {
 	t.Parallel()
 
-	c, ctrl := newTestClient(t)
-	// sendCh is nil — newTestClient does not set it.
+	c, ctrl := newHandshakeTestClient(t)
+	// sendCh is nil — this constructor stops short of publishing the queue.
 
 	const ts = int64(7)
 	if err := c.sendTypedMessage(protocol.TypePong, protocol.PongMessage{Timestamp: ts}); err != nil {

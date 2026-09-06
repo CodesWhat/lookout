@@ -261,12 +261,77 @@ func TestExecute_MergesStdoutAndStderr(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute: unexpected error %v", err)
 	}
-	// Success should be false (exit 1), and output should contain both streams.
+	// Success should be false (exit 1), and output should be stdout, a
+	// newline separator, then stderr — exact content, not just non-empty, so
+	// the separator logic (output != "" before appending stderr) is pinned.
 	if resp.Success {
 		t.Fatal("Execute: expected Success=false")
 	}
-	if resp.Output == "" {
-		t.Fatalf("Execute: expected merged output, got empty (Success=%v, Error=%q)", resp.Success, resp.Error)
+	want := "stdout output\nstderr output"
+	if resp.Output != want {
+		t.Fatalf("Execute: Output = %q, want %q", resp.Output, want)
+	}
+}
+
+// TestExecute_StdoutOnly_NoSeparatorNewline exercises the boundary of the
+// "stderr.buf.Len() > 0" check: when stderr produced nothing, Output must be
+// exactly the stdout content with no trailing separator appended.
+//
+// Note: not parallel, same ETXTBSY reasoning as TestExecute_MergesStdoutAndStderr.
+func TestExecute_StdoutOnly_NoSeparatorNewline(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "app"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	scriptPath := filepath.Join(dir, "compose-stdout-only.sh")
+	script := "#!/usr/bin/env sh\nprintf 'stdout only'\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cm := &ComposeManager{stacksDir: dir, composeBin: scriptPath, isV2: false}
+
+	resp, err := cm.Execute(t.Context(), ComposeRequest{StackName: "app", Operation: "up"})
+	if err != nil {
+		t.Fatalf("Execute: unexpected error %v", err)
+	}
+	if !resp.Success {
+		t.Fatalf("Execute: expected Success=true, got Error=%q", resp.Error)
+	}
+	if resp.Output != "stdout only" {
+		t.Fatalf("Execute: Output = %q, want %q (no stderr means no separator)", resp.Output, "stdout only")
+	}
+}
+
+// TestExecute_StderrOnly_NoLeadingSeparator exercises the boundary of the
+// "output != \"\"" check from the other side: when stdout produced nothing,
+// Output must be exactly the stderr content with no leading separator.
+//
+// Note: not parallel, same ETXTBSY reasoning as TestExecute_MergesStdoutAndStderr.
+func TestExecute_StderrOnly_NoLeadingSeparator(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "app"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	scriptPath := filepath.Join(dir, "compose-stderr-only.sh")
+	script := "#!/usr/bin/env sh\nprintf 'stderr only' >&2\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cm := &ComposeManager{stacksDir: dir, composeBin: scriptPath, isV2: false}
+
+	resp, err := cm.Execute(t.Context(), ComposeRequest{StackName: "app", Operation: "up"})
+	if err != nil {
+		t.Fatalf("Execute: unexpected error %v", err)
+	}
+	if !resp.Success {
+		t.Fatalf("Execute: expected Success=true, got Error=%q", resp.Error)
+	}
+	if resp.Output != "stderr only" {
+		t.Fatalf("Execute: Output = %q, want %q (empty stdout means no leading separator)", resp.Output, "stderr only")
 	}
 }
 
@@ -315,6 +380,24 @@ func TestExecute_TruncatesOversizedOutput(t *testing.T) {
 	}
 	if !strings.Contains(resp.Output, "truncated") {
 		t.Fatalf("Execute: expected a truncation marker in output, got %d bytes with no marker", len(resp.Output))
+	}
+	// The marker names the exact limit in MB (maxComposeOutputBytes/(1024*1024)
+	// == 10), not just any number, so an arithmetic change to that
+	// computation is caught rather than just the presence of "truncated".
+	wantMarker := "exceeded 10 MB combined output limit]"
+	if !strings.Contains(resp.Output, wantMarker) {
+		t.Fatalf("Execute: expected marker %q in output, got %q (last 200 bytes)", wantMarker, resp.Output[len(resp.Output)-200:])
+	}
+}
+
+// TestMaxComposeOutputBytesEqualsTenMiB pins maxComposeOutputBytes's value,
+// same reasoning as the defaultDialTimeout/maxDockerErrorBodyBytes const
+// checks in client_unix_test.go.
+func TestMaxComposeOutputBytesEqualsTenMiB(t *testing.T) {
+	t.Parallel()
+
+	if maxComposeOutputBytes != 10*1024*1024 {
+		t.Fatalf("maxComposeOutputBytes = %d, want %d", maxComposeOutputBytes, 10*1024*1024)
 	}
 }
 

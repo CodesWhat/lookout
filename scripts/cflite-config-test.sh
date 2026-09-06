@@ -260,12 +260,20 @@ assert_permissions "${batch_workflow}" batch-fuzz \
 assert_permissions "${prune_workflow}" prune-corpus \
 	$'      contents: write\n      actions: read'
 
-assert_with "${batch_workflow}" batch-fuzz run "fuzz-seconds: 3600"
+assert_with "${batch_workflow}" batch-fuzz run "fuzz-seconds: 600"
 assert_with "${batch_workflow}" batch-fuzz run "mode: batch"
 assert_with "${batch_workflow}" batch-fuzz run "sanitizer: address"
 assert_with "${prune_workflow}" prune-corpus run "fuzz-seconds: 600"
 assert_with "${prune_workflow}" prune-corpus run "mode: prune"
 assert_with "${prune_workflow}" prune-corpus run "sanitizer: address"
+
+# The old hour-long budget sustained near-100% CPU past the runner's measured
+# 14-19 minute shutdown ceiling and killed the job twice. A regression back to
+# it must fail loudly rather than pass because the new value merely coexists
+# with the old one somewhere in the file.
+if grep -Fq "fuzz-seconds: 3600" "${batch_workflow}"; then
+	fail "${batch_workflow}: fuzz-seconds: 3600 exceeds the measured runner ceiling; batch must fuzz 600s total"
+fi
 
 # --- batch and prune must never run together --------------------------------
 #

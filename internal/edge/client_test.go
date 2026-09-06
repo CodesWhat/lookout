@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -19,6 +22,7 @@ import (
 	"github.com/codeswhat/portwing/internal/audit"
 	"github.com/codeswhat/portwing/internal/config"
 	"github.com/codeswhat/portwing/internal/docker"
+	"github.com/codeswhat/portwing/internal/metrics"
 	"github.com/codeswhat/portwing/internal/protocol"
 )
 
@@ -611,21 +615,135 @@ func TestRunReconnectsAfterNonFatalError(t *testing.T) {
 // Run — ctx cancel while holding a live connection (lines 154-167)
 // ---------------------------------------------------------------------------
 
-// TestRunCtxCancelWithActiveConn verifies that when Run's context is cancelled
-// while a connection is active, it sends a close frame and returns ctx.Err().
+// runReturnBackstop bounds the waits in the three cancel tests below. Every
+// step in them is synchronised on a channel, so this only decides how long a
+// genuine hang takes to report — it is not what makes the tests pass. Generous
+// on purpose: the old 3s value was in a dead heat with the controller's own
+// 3s read deadline, and lost it under load.
+const runReturnBackstop = 10 * time.Second
+
+// TestRunCtxCancelWithActiveConn proves that cancelling Run's context while a
+// connection is genuinely live makes Run return ctx.Err() from its
+// post-connect check, without scheduling a reconnect.
+//
+// Two things make that a proof rather than a hope. The controller pings the
+// agent and waits for the pong before the test cancels. readPump is the only
+// thing that answers a ping, so the pong means readPump is running and
+// dispatching, and the cancel is therefore observed from a live pump instead
+// of from one that does not exist yet. It deliberately does not claim where
+// in its loop readPump is: the pong is handed to sendPump through a buffered
+// channel, so readPump may still be short of its next ctx check or its next
+// ReadMessage when the cancel lands. That costs nothing, because the
+// controller closes the socket after the cancel and either position unblocks
+// from it, one by finding ctx already cancelled, the other by the read
+// failing.
+//
+// The controller, not a timer, is what closes that socket, and it has to be.
+// readPump only checks ctx at the top of its loop, so once it is inside
+// ReadMessage the cancel is invisible to it and Run cannot return until the
+// socket closes or the 60s read deadline fires.
+//
+// The reconnect counter is what separates the two ways Run can return
+// ctx.Err() here, which asserting on the error alone cannot do. The
+// post-connect check returns before IncReconnect; the reconnect wait's
+// ctx.Done case returns after it. Asserting the counter is still zero pins
+// the branch under test.
 func TestRunCtxCancelWithActiveConn(t *testing.T) {
 	t.Parallel()
 
-	// Channel the test receives once the agent has connected.
-	connected := make(chan struct{})
+	// Closed once the controller has had a ping answered, so readPump is
+	// provably running and dispatching rather than merely about to exist.
+	pumpLive := make(chan struct{})
+	// Closed by the test after it cancels, to release the controller handler
+	// and with it the socket.
+	ctrlHold := make(chan struct{})
+	// Carries the controller conn out to the test so cleanup can drop it. A
+	// failing test cancels ctx, but a readPump already inside ReadMessage
+	// cannot see that, so without closing the socket here the agent would
+	// outlive the test until the controller's read deadline expired.
+	ctrlConn := make(chan *websocket.Conn, 1)
+	// Carries the first controller-side failure out to the test, so a broken
+	// handler reports its cause instead of spending the backstop and blaming
+	// readPump for a write that never went out.
+	ctrlErr := make(chan error, 1)
+
+	// OnceFunc because a controller handler that returned early would let the
+	// agent reconnect and run this closure a second time, and a bare close
+	// would then panic inside net/http instead of failing the test.
+	pumpIsLive := sync.OnceFunc(func() { close(pumpLive) })
+
+	reportCtrl := func(err error) {
+		select {
+		case ctrlErr <- err:
+		default: // keep the first failure; later ones are consequences of it
+		}
+	}
+
+	const pingStamp = 4242
 
 	srv := newControllerServer(t, func(ctrl *websocket.Conn) {
+		select {
+		case ctrlConn <- ctrl:
+		default: // a second connection; the first one is the one cleanup drops
+		}
+
 		readAndAckHello(t, ctrl)
 		sendWelcomeMsg(t, ctrl, protocol.WelcomeMessage{})
-		close(connected)
-		// Drain until the agent closes the connection.
-		_ = ctrl.SetReadDeadline(time.Now().Add(3 * time.Second))
-		_, _, _ = ctrl.ReadMessage()
+
+		// Ping the agent. Only readPump answers a ping, so the pong below is
+		// the liveness proof the cancel depends on.
+		if err := ctrl.SetWriteDeadline(time.Now().Add(runReturnBackstop)); err != nil {
+			reportCtrl(fmt.Errorf("set controller write deadline: %w", err))
+			return
+		}
+		pingData, err := json.Marshal(protocol.PingMessage{Timestamp: pingStamp})
+		if err != nil {
+			reportCtrl(fmt.Errorf("marshal ping: %w", err))
+			return
+		}
+		if err := ctrl.WriteJSON(protocol.Envelope{Type: protocol.TypePing, Data: pingData}); err != nil {
+			reportCtrl(fmt.Errorf("write ping to agent: %w", err))
+			return
+		}
+
+		// Read past the metrics frame connect sends before the pumps start,
+		// until the pong arrives. The deadline is only here so a broken agent
+		// fails the test instead of wedging srv.Close in cleanup; the test
+		// synchronises on pumpLive, never on this timer.
+		if err := ctrl.SetReadDeadline(time.Now().Add(runReturnBackstop)); err != nil {
+			reportCtrl(fmt.Errorf("set controller read deadline: %w", err))
+			return
+		}
+		for {
+			_, raw, err := ctrl.ReadMessage()
+			if err != nil {
+				reportCtrl(fmt.Errorf("read from agent while waiting for the pong: %w", err))
+				return
+			}
+			var env protocol.Envelope
+			if err := json.Unmarshal(raw, &env); err != nil || env.Type != protocol.TypePong {
+				continue
+			}
+			var pong protocol.PongMessage
+			if err := json.Unmarshal(env.Data, &pong); err != nil || pong.Timestamp != pingStamp {
+				continue
+			}
+			break
+		}
+		pumpIsLive()
+
+		// Hold the socket open, reading nothing, until the test has cancelled.
+		// Returning closes the conn (newControllerServer defers it), which is
+		// what unblocks the agent's readPump.
+		<-ctrlHold
+	})
+	releaseCtrl := sync.OnceFunc(func() { close(ctrlHold) })
+	dropCtrl := sync.OnceFunc(func() {
+		select {
+		case conn := <-ctrlConn:
+			_ = conn.Close()
+		default: // never connected, nothing to drop
+		}
 	})
 
 	addr := freeAddr(t)
@@ -643,27 +761,392 @@ func TestRunCtxCancelWithActiveConn(t *testing.T) {
 	c := newWireClient(t, cfg)
 
 	ctx, cancel := context.WithCancel(context.Background())
+	// Every exit path, not just the happy one. Cancel alone does not stop a
+	// readPump that is already inside ReadMessage, so this releases the
+	// handler and drops the socket too. Registered after newControllerServer,
+	// so cleanup LIFO runs it before srv.Close rather than deadlocking on it.
+	t.Cleanup(func() {
+		cancel()
+		releaseCtrl()
+		dropCtrl()
+	})
 
 	runDone := make(chan error, 1)
 	go func() { runDone <- c.Run(ctx) }()
 
-	// Wait for the agent to fully connect.
+	// Wait until readPump has answered the controller's ping.
 	select {
-	case <-connected:
-	case <-time.After(3 * time.Second):
-		t.Fatal("agent never connected")
+	case <-pumpLive:
+	case err := <-ctrlErr:
+		t.Fatalf("controller side failed before the agent answered the ping: %v", err)
+	case <-time.After(runReturnBackstop):
+		t.Fatal("readPump never answered the controller ping")
 	}
 
-	// Cancel — should trigger the ctx-cancel-with-conn branch.
+	// Cancel first, then drop the socket, so ctx.Err() is already set by the
+	// time connect returns.
 	cancel()
+	releaseCtrl()
 
 	select {
 	case err := <-runDone:
 		if !errors.Is(err, context.Canceled) {
 			t.Errorf("Run returned %v, want context.Canceled", err)
 		}
-	case <-time.After(3 * time.Second):
+	case <-time.After(runReturnBackstop):
 		t.Fatal("Run did not return after context cancel")
+	}
+
+	// Zero reconnects means Run left through its post-connect ctx.Err() check.
+	// The reconnect wait reaches its own ctx.Done case only after incrementing
+	// this, so a count of 1 would mean the cancel was observed a branch later.
+	var rendered strings.Builder
+	c.metrics.WritePrometheus(&rendered, func(value string) string { return value })
+	if !strings.Contains(rendered.String(), "portwing_edge_reconnects_total 0\n") {
+		t.Errorf("Run scheduled a reconnect on a cancelled context, want the post-connect ctx exit:\n%s", rendered.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Run — ctx cancel against a quiet controller (PW-8.4)
+// ---------------------------------------------------------------------------
+
+// idleCancelBudget is the assertion PW-8.4 exists to make: Run must unwind
+// within this of a cancel, even when the controller is healthy, silent, and
+// never closes the socket. It is deliberately far below the 60-second floor
+// readDeadline imposes, because that floor was the defect — a readPump parked
+// in conn.ReadMessage could not see the cancel until the deadline fired, and
+// SIGTERM therefore outlived Docker's and Kubernetes' default SIGKILL grace.
+const idleCancelBudget = time.Second
+
+// readPumpSettle bounds the scheduler across the handful of instructions
+// between readPump handing its pong to sendPump and blocking in
+// conn.ReadMessage. Nothing observable from outside the agent separates those
+// two points — every synchronisation point a controller has sits before the
+// loop's ctx check, not after it — so this is not what makes the assertion
+// correct. Run has to return inside idleCancelBudget from either position.
+// It is what makes a regression fail every run instead of most of them: with
+// the cancel landing inside the read, an agent without the AfterFunc seam
+// hangs for the full 60-second read deadline. Should the loop-top ctx check
+// catch a cancel first, this test still passes on a build with no seam at
+// all, so the evidence that the seam carries the behaviour is the mutation
+// run — deleting the AfterFunc and watching this fail — not the assertion on
+// its own.
+const readPumpSettle = 100 * time.Millisecond
+
+// pingUntilPong drives the controller side of the liveness handshake the
+// cancel tests depend on: it pings the agent, then reads until the matching
+// pong comes back, skipping the metrics frame connect emits before the pumps
+// start. Only readPump answers a ping, so a nil return means the agent's read
+// pump is running and has completed a full iteration of its loop.
+//
+// It returns its errors rather than calling t.Fatalf because it runs on the
+// controller handler's goroutine, where a Fatalf would not stop the test.
+func pingUntilPong(ctrl *websocket.Conn, stamp int64, budget time.Duration) error {
+	if err := ctrl.SetWriteDeadline(time.Now().Add(budget)); err != nil {
+		return fmt.Errorf("set controller write deadline: %w", err)
+	}
+	pingData, err := json.Marshal(protocol.PingMessage{Timestamp: stamp})
+	if err != nil {
+		return fmt.Errorf("marshal ping: %w", err)
+	}
+	if err := ctrl.WriteJSON(protocol.Envelope{Type: protocol.TypePing, Data: pingData}); err != nil {
+		return fmt.Errorf("write ping to agent: %w", err)
+	}
+	if err := ctrl.SetReadDeadline(time.Now().Add(budget)); err != nil {
+		return fmt.Errorf("set controller read deadline: %w", err)
+	}
+	for {
+		_, raw, err := ctrl.ReadMessage()
+		if err != nil {
+			return fmt.Errorf("read from agent while waiting for the pong: %w", err)
+		}
+		var env protocol.Envelope
+		if err := json.Unmarshal(raw, &env); err != nil || env.Type != protocol.TypePong {
+			continue
+		}
+		var pong protocol.PongMessage
+		if err := json.Unmarshal(env.Data, &pong); err != nil || pong.Timestamp != stamp {
+			continue
+		}
+		return nil
+	}
+}
+
+// TestRunCtxCancelAgainstIdleController is the regression test for PW-8.4.
+// TestRunCtxCancelWithActiveConn above proves Run takes the post-connect
+// ctx.Err() branch, but it lets the controller close the socket immediately
+// after the cancel, so it never measures how long an agent whose peer stays
+// open takes to notice. This one does: the controller answers the handshake,
+// pings once to prove readPump is live, and then holds the socket open on its
+// own channel, sending nothing and closing nothing until cleanup.
+//
+// That is the shape a quiet-but-healthy controller has, and before the
+// AfterFunc seam in connect it was unbounded in practice — readPump only
+// tests ctx at the top of its loop, so a cancel that lands while it is inside
+// conn.ReadMessage is invisible until readDeadline expires, and readDeadline
+// floors at 60 seconds. Closing the conn on cancel is what turns that into a
+// failed read.
+//
+// The reconnect counter separates a prompt return through the ctx branch from
+// a prompt return that scheduled a retry first: the close the seam performs
+// surfaces to readPump as an ordinary read error, so an agent that classified
+// it before checking ctx would come back inside the budget with the counter
+// at 1. Zero is what pins the ctx branch.
+func TestRunCtxCancelAgainstIdleController(t *testing.T) {
+	t.Parallel()
+
+	// Closed once the controller has had a ping answered, so readPump is
+	// provably running rather than merely about to exist.
+	pumpLive := make(chan struct{})
+	pumpIsLive := sync.OnceFunc(func() { close(pumpLive) })
+	// Released only by cleanup. The point of the test is that nothing on the
+	// controller side helps the agent unwind, so this must not be closed
+	// before the assertion the way TestRunCtxCancelWithActiveConn closes its
+	// own hold.
+	ctrlHold := make(chan struct{})
+	// Carries the controller conn out so cleanup can drop it after a failing
+	// run, where the agent has not closed its own side.
+	ctrlConn := make(chan *websocket.Conn, 1)
+	// Carries the first controller-side failure out, so a broken handler
+	// reports its cause instead of spending the backstop and blaming readPump.
+	ctrlErr := make(chan error, 1)
+
+	reportCtrl := func(err error) {
+		select {
+		case ctrlErr <- err:
+		default: // keep the first failure; later ones are consequences of it
+		}
+	}
+
+	const pingStamp = 8484
+
+	srv := newControllerServer(t, func(ctrl *websocket.Conn) {
+		select {
+		case ctrlConn <- ctrl:
+		default: // a second connection; the first one is the one cleanup drops
+		}
+
+		readAndAckHello(t, ctrl)
+		sendWelcomeMsg(t, ctrl, protocol.WelcomeMessage{})
+
+		if err := pingUntilPong(ctrl, pingStamp, runReturnBackstop); err != nil {
+			reportCtrl(err)
+			return
+		}
+		pumpIsLive()
+
+		// Silent from here: no frames, no close, no read. Returning would
+		// close the conn (newControllerServer defers it), which is exactly the
+		// help this test withholds.
+		<-ctrlHold
+	})
+	releaseCtrl := sync.OnceFunc(func() { close(ctrlHold) })
+	dropCtrl := sync.OnceFunc(func() {
+		select {
+		case conn := <-ctrlConn:
+			_ = conn.Close()
+		default: // never connected, nothing to drop
+		}
+	})
+
+	cfg := &config.Config{
+		DrydockURL:        srv,
+		HeartbeatInterval: 30,
+		WelcomeTimeout:    5,
+		ReconnectDelay:    1,
+		MaxReconnectDelay: 60,
+		DDPollInterval:    300,
+		BindAddress:       "127.0.0.1",
+		// Port 0, not a freeAddr reservation: nothing here talks to the health
+		// server, and freeAddr hands back a port it has already released, so
+		// every test that uses one is racing the others for it. Two more
+		// entrants was enough to make TestStartHealthServerTwiceDoesNotPanic's
+		// rebind lose that race under -count=20.
+		Port:             "0",
+		SkipDFCollection: true,
+	}
+	c := newWireClient(t, cfg)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// Every exit path, not just the happy one. A failing run leaves readPump
+	// parked in ReadMessage against a peer that is still holding, so cleanup
+	// has to release the handler and drop the socket or the agent outlives the
+	// test by a minute. Registered after newControllerServer so cleanup's LIFO
+	// order runs it before srv.Close rather than deadlocking on it.
+	t.Cleanup(func() {
+		cancel()
+		releaseCtrl()
+		dropCtrl()
+	})
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- c.Run(ctx) }()
+
+	select {
+	case <-pumpLive:
+	case err := <-ctrlErr:
+		t.Fatalf("controller side failed before the agent answered the ping: %v", err)
+	case <-time.After(runReturnBackstop):
+		t.Fatal("readPump never answered the controller ping")
+	}
+
+	// Let readPump get back into the read the cancel has to interrupt.
+	time.Sleep(readPumpSettle)
+
+	start := time.Now()
+	cancel()
+
+	select {
+	case err := <-runDone:
+		if elapsed := time.Since(start); elapsed > idleCancelBudget {
+			t.Errorf("Run took %v to return after cancel against a silent controller, want under %v", elapsed, idleCancelBudget)
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("Run returned %v, want context.Canceled", err)
+		}
+	case <-time.After(idleCancelBudget):
+		t.Fatalf("Run did not return within %v of the cancel: the read is still waiting on a controller that never speaks", idleCancelBudget)
+	}
+
+	// Zero reconnects means the read error the cancel-close produced was
+	// classified as the ctx exit, not as a dropped tunnel worth retrying.
+	var rendered strings.Builder
+	c.metrics.WritePrometheus(&rendered, func(value string) string { return value })
+	if !strings.Contains(rendered.String(), "portwing_edge_reconnects_total 0\n") {
+		t.Errorf("Run scheduled a reconnect on a cancelled context, want the post-connect ctx exit:\n%s", rendered.String())
+	}
+}
+
+// TestRunReconnectsAfterControllerCloseWithCancelSeamArmed is the other half
+// of the seam's contract: closing the conn on cancel must not turn an ordinary
+// tunnel drop into a shutdown, and the AfterFunc registered for a connection
+// that has already ended must not touch the one that replaced it.
+//
+// The controller drops its first connection right after the welcome, with the
+// agent's context still live, so Run has to reconnect and count it. It then
+// serves a second connection and proves that one is live by answering a ping
+// on it — which it could not do if the first connection's callback had
+// followed the agent across the reconnect. Only after that does the test
+// cancel.
+//
+// The final count of exactly 1 is what carries both claims. A seam that
+// swallowed the real drop would leave it at 0; a seam whose cancel-close were
+// classified as a reconnectable error before Run checked ctx would push it
+// to 2.
+func TestRunReconnectsAfterControllerCloseWithCancelSeamArmed(t *testing.T) {
+	t.Parallel()
+
+	var dialMu sync.Mutex
+	dials := 0
+
+	secondLive := make(chan struct{})
+	secondIsLive := sync.OnceFunc(func() { close(secondLive) })
+	ctrlHold := make(chan struct{})
+	releaseCtrl := sync.OnceFunc(func() { close(ctrlHold) })
+	ctrlConn := make(chan *websocket.Conn, 1)
+	ctrlErr := make(chan error, 1)
+
+	reportCtrl := func(err error) {
+		select {
+		case ctrlErr <- err:
+		default: // keep the first failure
+		}
+	}
+
+	const pingStamp = 8485
+
+	srv := newControllerServer(t, func(ctrl *websocket.Conn) {
+		dialMu.Lock()
+		dials++
+		n := dials
+		dialMu.Unlock()
+
+		readAndAckHello(t, ctrl)
+		sendWelcomeMsg(t, ctrl, protocol.WelcomeMessage{})
+
+		if n == 1 {
+			// Returning closes the controller side. That is a plain drop on a
+			// live context, so Run must retry it rather than treat it as the
+			// cancel exit.
+			return
+		}
+
+		select {
+		case ctrlConn <- ctrl:
+		default: // only the first replacement connection is tracked
+		}
+
+		if err := pingUntilPong(ctrl, pingStamp, runReturnBackstop); err != nil {
+			reportCtrl(err)
+			return
+		}
+		secondIsLive()
+
+		// Hold this one open the same way, so the cancel below has to be what
+		// ends it.
+		<-ctrlHold
+	})
+	dropCtrl := sync.OnceFunc(func() {
+		select {
+		case conn := <-ctrlConn:
+			_ = conn.Close()
+		default: // never reached a second connection
+		}
+	})
+
+	cfg := &config.Config{
+		DrydockURL:        srv,
+		HeartbeatInterval: 30,
+		WelcomeTimeout:    5,
+		ReconnectDelay:    0, // reconnect immediately; the drop is the point, not the backoff
+		MaxReconnectDelay: 0,
+		DDPollInterval:    300,
+		BindAddress:       "127.0.0.1",
+		Port:              "0", // ephemeral, for the reason above
+		SkipDFCollection:  true,
+	}
+	c := newWireClient(t, cfg)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		cancel()
+		releaseCtrl()
+		dropCtrl()
+	})
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- c.Run(ctx) }()
+
+	select {
+	case <-secondLive:
+	case err := <-ctrlErr:
+		t.Fatalf("controller side failed on the second connection: %v", err)
+	case <-time.After(runReturnBackstop):
+		t.Fatal("the agent never reconnected and answered a ping on a second connection")
+	}
+
+	time.Sleep(readPumpSettle)
+
+	start := time.Now()
+	cancel()
+
+	select {
+	case err := <-runDone:
+		if elapsed := time.Since(start); elapsed > idleCancelBudget {
+			t.Errorf("Run took %v to return after cancel on the reconnected tunnel, want under %v", elapsed, idleCancelBudget)
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("Run returned %v, want context.Canceled", err)
+		}
+	case <-time.After(idleCancelBudget):
+		t.Fatalf("Run did not return within %v of the cancel on the second connection", idleCancelBudget)
+	}
+
+	var rendered strings.Builder
+	c.metrics.WritePrometheus(&rendered, func(value string) string { return value })
+	if !strings.Contains(rendered.String(), "portwing_edge_reconnects_total 1\n") {
+		t.Errorf("reconnects after one controller drop and one cancel, want exactly 1:\n%s", rendered.String())
 	}
 }
 
@@ -693,8 +1176,6 @@ func TestWritePumpHeartbeatTick(t *testing.T) {
 	c.cfg.HeartbeatInterval = 1 // 1s heartbeat ticker — fires before 2s deadline
 	c.adapter = &fakeAdapter{pollInterval: 999}
 	c.cfg.DDPollInterval = 999 // large: poll must not fire during test
-
-	runSendPump(t, c)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	pumpDone := make(chan struct{})
@@ -759,8 +1240,6 @@ func TestWritePumpPollRefreshError(t *testing.T) {
 	c.welcomePollInterval = 1     // 1s poll tick fires within readTimeout (2s)
 	c.adapter = &errRefreshAdapter{fakeAdapter: fakeAdapter{pollInterval: 999}}
 
-	runSendPump(t, c)
-
 	ctx, cancel := context.WithCancel(context.Background())
 	go c.writePump(ctx)
 	t.Cleanup(cancel)
@@ -815,8 +1294,6 @@ func TestWritePumpPollOnContainerRefreshError(t *testing.T) {
 	c.welcomePollInterval = 1  // 1s poll tick fires within readTimeout (2s)
 	c.adapter = &errOnRefreshAdapter{fakeAdapter: fakeAdapter{pollInterval: 999}}
 
-	runSendPump(t, c)
-
 	ctx, cancel := context.WithCancel(context.Background())
 	go c.writePump(ctx)
 	t.Cleanup(cancel)
@@ -854,8 +1331,6 @@ func TestWritePumpWelcomePollIntervalOverride(t *testing.T) {
 	c.adapter = &fakeAdapter{pollInterval: -1} // <= 0 → falls back to DDPollInterval
 	c.welcomePollInterval = 999                // large override: poll must not fire during test
 
-	runSendPump(t, c)
-
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
@@ -864,53 +1339,279 @@ func TestWritePumpWelcomePollIntervalOverride(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// sendMetrics — collector error path (line 722-725)
+// sendMetrics — failed collection reaches the wire
 // ---------------------------------------------------------------------------
 
-// errCollector is a stand-in that satisfies the minimal surface sendMetrics
-// calls by making collector.Collect() fail. Since metrics.Collector is a
-// concrete type with no interface, we exercise sendMetrics indirectly by
-// giving the client a nil collector (which panics) or by setting
-// c.collector = nil. The recover in the goroutine is separate.
-//
-// Actually the easiest approach: sendMetrics() calls c.collector.Collect().
-// If collector is nil the call panics (uncovered). But we can't make
-// Collect() return an error without a fake. Looking at the actual function:
-//
-//   func (c *Client) sendMetrics() {
-//     m, err := c.collector.Collect()
-//     if err != nil {  <-- line 722-725: uncovered
-//
-// To cover this we need a collector that fails. metrics.NewCollector with a
-// bad path in non-skip mode won't help in unit tests. Instead, we arrange
-// SkipDFCollection=false and a non-existent root — Collect() tries to stat
-// the path and returns an error on most systems.
+// stubCollector is a hostCollector whose Collect returns whatever the test
+// scripts. It exists because the real collector cannot be made to fail on a
+// Linux host: Collect's only error is a missing /proc.
+type stubCollector struct {
+	snapshot *metrics.HostMetrics
+	err      error
+}
 
-// TestSendMetricsCollectorError covers the error branch in sendMetrics by
-// pointing the collector at a non-existent directory without SkipDFCollection,
-// which causes Collect() to fail.
-func TestSendMetricsCollectorError(t *testing.T) {
+func (s stubCollector) Collect() (*metrics.HostMetrics, error) { return s.snapshot, s.err }
+
+// TestSendMetricsReportsFailedCollection pins the contract for a collection
+// that fails: an explicit error frame carrying host-metrics-unavailable, never
+// silence and never the zero-filled snapshot Collect returns alongside its
+// error. Silence is what shipped, and it left a controller unable to tell an
+// unsupported host from an agent that had stopped talking.
+func TestSendMetricsReportsFailedCollection(t *testing.T) {
 	t.Parallel()
 
-	c, _ := newTestClient(t)
-	// Use a collector pointed at a non-existent path with disk collection
-	// enabled; Collect() should fail because df/statvfs can't stat the path.
-	// We import metrics.NewCollector via newWireClient and override.
-	wc := newWireClient(t, &config.Config{
-		SkipDFCollection: false, // enable disk stat
-	})
-	// Override the collector root to a path that definitely doesn't exist.
-	// We can't call an unexported method, but NewCollector takes the root path
-	// directly. Use the wc collector which was built with the default root;
-	// on CI the /var/lib/docker path may not exist, causing failures.
-	// Instead, just call sendMetrics with a collector that will fail.
-	// metrics package is internal; we can call NewCollector with a missing root.
-	c.collector = wc.collector
+	unsupported := fmt.Errorf("%w: /proc: no such file or directory", metrics.ErrHostMetricsUnsupported)
 
-	// sendMetrics is synchronous and returns nothing; just ensure no panic.
-	// The error branch logs at Debug and returns.
+	tests := []struct {
+		name      string
+		collector stubCollector
+		wantType  string
+		// wantMessage is the exact ErrorMessage.Message for a failure case.
+		wantMessage string
+		wantCPUCore int
+	}{
+		{
+			name:        "unsupported host still answers",
+			collector:   stubCollector{snapshot: &metrics.HostMetrics{CPUCores: 8}, err: unsupported},
+			wantType:    protocol.TypeError,
+			wantMessage: unsupported.Error(),
+		},
+		{
+			name:        "nil snapshot alongside the error",
+			collector:   stubCollector{snapshot: nil, err: unsupported},
+			wantType:    protocol.TypeError,
+			wantMessage: unsupported.Error(),
+		},
+		{
+			name:        "collection error that is not the sentinel",
+			collector:   stubCollector{snapshot: &metrics.HostMetrics{}, err: errors.New("collector wedged")},
+			wantType:    protocol.TypeError,
+			wantMessage: "collector wedged",
+		},
+		{
+			name:        "successful collection is unchanged",
+			collector:   stubCollector{snapshot: &metrics.HostMetrics{CPUCores: 4, MemoryTotal: 1 << 30}},
+			wantType:    protocol.TypeMetrics,
+			wantCPUCore: 4,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			c, ctrl := newTestClient(t)
+			c.collector = tc.collector
+
+			c.sendMetrics()
+
+			data := expectType(t, ctrl, tc.wantType)
+			if tc.wantType == protocol.TypeMetrics {
+				var msg protocol.MetricsMessage
+				decodeData(t, data, &msg)
+				if msg.CPUCores != tc.wantCPUCore {
+					t.Errorf("CPUCores = %d, want %d", msg.CPUCores, tc.wantCPUCore)
+				}
+				return
+			}
+
+			var em protocol.ErrorMessage
+			decodeData(t, data, &em)
+			if em.Code != metricsUnavailableCode {
+				t.Errorf("error Code = %q, want %q", em.Code, metricsUnavailableCode)
+			}
+			if em.Message != tc.wantMessage {
+				t.Errorf("error Message = %q, want %q", em.Message, tc.wantMessage)
+			}
+			if em.RequestID != "" {
+				t.Errorf("error RequestID = %q, want empty: the metrics tick answers no request", em.RequestID)
+			}
+		})
+	}
+}
+
+// TestSendMetricsFailureCarriesNoZeroedSnapshot is the half the frame type
+// alone does not prove: a failed collection must not also put the partially
+// populated snapshot on the wire, because a zero-filled metrics frame reads as
+// a real measurement of a completely idle host.
+func TestSendMetricsFailureCarriesNoZeroedSnapshot(t *testing.T) {
+	t.Parallel()
+
+	c, ctrl := newTestClient(t)
+	c.collector = stubCollector{
+		snapshot: &metrics.HostMetrics{CPUCores: 8},
+		err:      metrics.ErrHostMetricsUnsupported,
+	}
+
 	c.sendMetrics()
-	// No assertion — just confirms the function doesn't panic on error.
+
+	// The error frame is the only frame. A metrics frame arriving either
+	// before or after it would be the zero-filled snapshot.
+	if env := expectEnvelope(t, ctrl); env.Type != protocol.TypeError {
+		t.Fatalf("first frame = %q (data=%s), want %q", env.Type, env.Data, protocol.TypeError)
+	}
+	if err := ctrl.SetReadDeadline(time.Now().Add(200 * time.Millisecond)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	if _, raw, err := ctrl.ReadMessage(); err == nil {
+		t.Fatalf("a second frame followed the error frame: %s", raw)
+	}
+}
+
+// levelRecordingHandler captures the level and message of every log record,
+// for the transition assertions below. Concurrency-safe because it is
+// installed as the process-wide default logger and other goroutines may still
+// be logging into it.
+type levelRecordingHandler struct {
+	mu      sync.Mutex
+	records []loggedRecord
+}
+
+type loggedRecord struct {
+	level   slog.Level
+	message string
+}
+
+func (h *levelRecordingHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *levelRecordingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.records = append(h.records, loggedRecord{level: r.Level, message: r.Message})
+	return nil
+}
+
+func (h *levelRecordingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *levelRecordingHandler) WithGroup(string) slog.Handler      { return h }
+
+// take returns the records whose message is one of want, and clears the
+// buffer. Filtering by message keeps an unrelated log line from another
+// goroutine out of the assertion.
+func (h *levelRecordingHandler) take(want ...string) []loggedRecord {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var out []loggedRecord
+	for _, r := range h.records {
+		for _, w := range want {
+			if r.message == w {
+				out = append(out, r)
+				break
+			}
+		}
+	}
+	h.records = nil
+	return out
+}
+
+// TestSendMetricsLogsCollectionTransitionsOnly pins the log-level policy for a
+// failure that persists. The error frame is per-tick, but the log is not: a
+// host with no procfs fails every heartbeat forever, so warning each time
+// would bury the tick that actually changed something. Only the transitions
+// are loud.
+//
+// The sequence is failure, failure, success, failure. The fourth call is the
+// first failure after a recovery, so it warns again — a second break after a
+// recovery is a real event an operator has to see, not a repeat.
+func TestSendMetricsLogsCollectionTransitionsOnly(t *testing.T) {
+	// Not t.Parallel(): swaps the process-wide default slog logger.
+
+	const (
+		failedMsg    = "metrics collection failed"
+		recoveredMsg = "metrics collection recovered"
+	)
+
+	handler := &levelRecordingHandler{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(handler))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	failing := stubCollector{
+		snapshot: &metrics.HostMetrics{CPUCores: 8},
+		err:      fmt.Errorf("%w: /proc: no such file or directory", metrics.ErrHostMetricsUnsupported),
+	}
+	healthy := stubCollector{snapshot: &metrics.HostMetrics{CPUCores: 8, MemoryTotal: 1 << 30}}
+
+	steps := []struct {
+		name        string
+		collector   stubCollector
+		wantLevel   slog.Level
+		wantMessage string
+		wantFrame   string
+	}{
+		{
+			name:        "first failure warns",
+			collector:   failing,
+			wantLevel:   slog.LevelWarn,
+			wantMessage: failedMsg,
+			wantFrame:   protocol.TypeError,
+		},
+		{
+			name:        "repeat failure drops to debug",
+			collector:   failing,
+			wantLevel:   slog.LevelDebug,
+			wantMessage: failedMsg,
+			wantFrame:   protocol.TypeError,
+		},
+		{
+			name:        "recovery says so once at info",
+			collector:   healthy,
+			wantLevel:   slog.LevelInfo,
+			wantMessage: recoveredMsg,
+			wantFrame:   protocol.TypeMetrics,
+		},
+		{
+			name:        "failure after a recovery warns again",
+			collector:   failing,
+			wantLevel:   slog.LevelWarn,
+			wantMessage: failedMsg,
+			wantFrame:   protocol.TypeError,
+		},
+	}
+
+	c, ctrl := newTestClient(t)
+	byLevel := map[slog.Level]int{}
+
+	for _, tc := range steps {
+		t.Run(tc.name, func(t *testing.T) {
+			c.collector = tc.collector
+
+			c.sendMetrics()
+
+			// Reading the frame first is the ordering barrier: sendMetrics
+			// logs before it sends, so a frame in hand means the record is
+			// already in the handler.
+			if env := expectEnvelope(t, ctrl); env.Type != tc.wantFrame {
+				t.Fatalf("frame = %q (data=%s), want %q", env.Type, env.Data, tc.wantFrame)
+			}
+
+			got := handler.take(failedMsg, recoveredMsg)
+			if len(got) != 1 {
+				t.Fatalf("collection log records = %+v, want exactly one", got)
+			}
+			if got[0].level != tc.wantLevel {
+				t.Errorf("log level = %v, want %v", got[0].level, tc.wantLevel)
+			}
+			if got[0].message != tc.wantMessage {
+				t.Errorf("log message = %q, want %q", got[0].message, tc.wantMessage)
+			}
+			byLevel[got[0].level]++
+		})
+	}
+
+	// The aggregate over the whole sequence, which is what the policy is for.
+	wantByLevel := map[slog.Level]int{
+		slog.LevelWarn:  2, // the two transitions into failure
+		slog.LevelDebug: 1, // the repeat while already failed
+		slog.LevelInfo:  1, // the single recovery
+	}
+	for level, want := range wantByLevel {
+		if byLevel[level] != want {
+			t.Errorf("%v records = %d, want %d (levels seen: %v)", level, byLevel[level], want, byLevel)
+		}
+	}
+	if len(byLevel) != len(wantByLevel) {
+		t.Errorf("levels seen = %v, want exactly %v", byLevel, wantByLevel)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1029,6 +1730,141 @@ func TestStartHealthServerPortConflict(t *testing.T) {
 	// No panic means success — the error was swallowed by the log line.
 	if c.healthServer == nil {
 		t.Error("healthServer was not set even when ListenAndServe fails")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// startHealthServer — a second start on the same Client must get its own
+// healthServerDone channel, closed by its own goroutine (client.go:1699)
+// ---------------------------------------------------------------------------
+
+// TestStartHealthServerTwiceDoesNotPanic calls startHealthServer twice on one
+// Client, shutting the health server down and joining its goroutine between
+// the two starts. Each start must create its own healthServerDone channel
+// and hand it to its own goroutine: if a shared field were instead guarded
+// by a client-lifetime sync.Once, the second start's goroutine would find
+// the guard already spent and never close its channel, hanging any caller
+// that waits on it. The test proves the second close actually happens by
+// waiting on the channel captured right after the second start, with a
+// timeout that fails the test instead of hanging forever.
+func TestStartHealthServerTwiceDoesNotPanic(t *testing.T) {
+	t.Parallel()
+
+	// Port "0" asks the kernel for a free port at bind time instead of
+	// pre-allocating one with freeAddr and closing it: that allocate/close
+	// window is exactly what let a parallel test's bind race in and take the
+	// address before this test's (re)start got to it.
+	c := &Client{
+		cfg: &config.Config{
+			BindAddress: "127.0.0.1",
+			Port:        "0",
+		},
+	}
+
+	c.startHealthServer()
+	waitForHealthServer(t, c, "/health")
+
+	shutdownCtx1, cancel1 := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel1()
+	if err := c.healthServer.Shutdown(shutdownCtx1); err != nil {
+		t.Fatalf("first shutdown: %v", err)
+	}
+	select {
+	case <-c.healthServerDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first ListenAndServe goroutine did not finish in time")
+	}
+
+	// Start again on the same Client. Port "0" again — another OS-assigned
+	// port, read back the same way, rather than reusing the first server's
+	// now-closed address.
+	c.startHealthServer()
+	secondDone := c.healthServerDone
+	t.Cleanup(func() {
+		if c.healthServer != nil {
+			_ = c.healthServer.Close()
+		}
+	})
+
+	waitForHealthServer(t, c, "/health")
+
+	shutdownCtx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel2()
+	if err := c.healthServer.Shutdown(shutdownCtx2); err != nil {
+		t.Fatalf("second shutdown: %v", err)
+	}
+	select {
+	case <-secondDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second ListenAndServe goroutine did not finish in time")
+	}
+}
+
+// TestStartHealthServerFailedRebindClearsHealthAddr pins HealthAddr's
+// nil-until-bound contract across a restart that cannot bind. BaseContext is
+// the only hook that records the address and it runs on a successful listen,
+// so a second start that fails leaves nothing behind to overwrite the first
+// server's address with. Without the reset in startHealthServer the accessor
+// keeps handing out an address whose listener belongs to a server the Client
+// no longer holds, which reads as a healthy agent to anything polling it.
+//
+// The occupied port is what makes the failure deterministic: the test holds
+// the listener for the rest of the run, so the rebind cannot win a retry.
+func TestStartHealthServerFailedRebindClearsHealthAddr(t *testing.T) {
+	t.Parallel()
+
+	c := &Client{
+		cfg: &config.Config{
+			BindAddress: "127.0.0.1",
+			Port:        "0",
+		},
+	}
+
+	c.startHealthServer()
+	first := c.healthServer
+	firstDone := c.healthServerDone
+	t.Cleanup(func() {
+		_ = first.Close()
+		select {
+		case <-firstDone:
+		case <-time.After(healthServerLivenessTimeout):
+			t.Error("the first ListenAndServe goroutine did not finish")
+		}
+	})
+
+	waitForHealthServer(t, c, "/health")
+	bound := c.HealthAddr()
+	if bound == nil {
+		t.Fatal("HealthAddr() = nil after a successful bind")
+	}
+
+	// Take a port and keep it, so the restart below has nowhere to land.
+	blocker, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen to occupy a port: %v", err)
+	}
+	t.Cleanup(func() { _ = blocker.Close() })
+	_, blockedPort, err := net.SplitHostPort(blocker.Addr().String())
+	if err != nil {
+		t.Fatalf("split the occupied address: %v", err)
+	}
+
+	c.cfg.Port = blockedPort
+	c.startHealthServer()
+	second := c.healthServer
+	t.Cleanup(func() { _ = second.Close() })
+
+	// ListenAndServe returns the bind error before it ever reaches Serve, so
+	// BaseContext does not run and the goroutine closes this straight away.
+	// Waiting on it is the happens-before point for the assertion.
+	select {
+	case <-c.healthServerDone:
+	case <-time.After(healthServerLivenessTimeout):
+		t.Fatal("the failed ListenAndServe goroutine did not finish")
+	}
+
+	if addr := c.HealthAddr(); addr != nil {
+		t.Errorf("HealthAddr() = %v after a failed rebind, want nil (the first server's was %v)", addr, bound)
 	}
 }
 
@@ -1163,8 +1999,6 @@ func TestWritePumpPollIntervalFallback(t *testing.T) {
 	c.cfg.HeartbeatInterval = 999
 	c.cfg.DDPollInterval = 999                 // prevent poll from firing
 	c.adapter = &fakeAdapter{pollInterval: -1} // <= 0 → use DDPollInterval
-
-	runSendPump(t, c)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -1521,7 +2355,7 @@ func TestSendMetricsWithFailingCollector(t *testing.T) {
 func TestSendPumpWriteJSONError(t *testing.T) {
 	t.Parallel()
 
-	c, _ := newTestClient(t)
+	c, _ := newHandshakeTestClient(t)
 	sendCh := make(chan protocol.Envelope, sendQueueSize)
 	c.connMu.Lock()
 	c.sendCh = sendCh
@@ -1539,7 +2373,7 @@ func TestSendPumpWriteJSONError(t *testing.T) {
 	defer cancel()
 	go func() {
 		defer close(pumpDone)
-		c.sendPump(ctx, agentConn, sendCh)
+		c.sendPump(ctx, context.Background(), agentConn, sendCh)
 	}()
 
 	// Enqueue a message; sendPump picks it up and tries to write to the

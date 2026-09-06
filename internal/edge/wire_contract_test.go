@@ -88,7 +88,13 @@ func (a *fakeAdapter) messageTypes() []string {
 // ---------------------------------------------------------------------------
 // newWireClient builds a minimal Client suitable for wire-contract tests that
 // call sendHello or connect. The client is NOT wired to a pre-existing WS conn
-// (connect dials its own); it only carries the non-Docker collaborators.
+// (connect dials its own); it only carries the non-Docker collaborators. conn
+// and sendCh both stay nil until connect/Run sets them and reset to nil again
+// on return, so driving the returned Client through those methods alone never
+// hits sendMessageTo's unserialized direct-write branch with more than one
+// sender. A test that wires its own conn onto this Client afterward (e.g. to
+// model a reconnect) must bring its own send pump up too — see startSendPump
+// in harness_test.go and its use in TestConnectDropFreesStreamedRequestIDForTheRetry.
 // ---------------------------------------------------------------------------
 
 func newWireClient(t *testing.T, cfg *config.Config) *Client {

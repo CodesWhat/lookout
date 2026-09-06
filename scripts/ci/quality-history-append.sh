@@ -3,15 +3,20 @@
 # Append one scheduled quality lane's headline numbers to the repository's
 # `quality-history` orphan branch.
 #
-# Usage: quality-history-append.sh <lane> <json-object>
+# Usage: quality-history-append.sh <lane> [<json-object>]
 #
-#   <lane>         soak | mutation | fuzz-nightly | bench. Names the JSONL
-#                  file on the orphan branch (`<lane>.jsonl`).
-#   <json-object>  A single JSON object of that lane's numbers. The common
-#                  envelope (run id, attempt, workflow, event, sha, UTC
-#                  timestamp) is added here so every lane records it the same
-#                  way, and it wins on a key collision so a lane can't
-#                  overwrite `run_id` with something of its own.
+#   <lane>         soak | mutation | mutation-survivors | fuzz-nightly | bench.
+#                  Names the JSONL file on the orphan branch (`<lane>.jsonl`).
+#   <json-object>  A single JSON object of that lane's numbers, passed inline.
+#                  The common envelope (run id, attempt, workflow, event, sha,
+#                  UTC timestamp) is added here so every lane records it the
+#                  same way, and it wins on a key collision so a lane can't
+#                  overwrite `run_id` with something of its own. Omit this
+#                  and set QUALITY_HISTORY_RECORD_FILE instead when the
+#                  record might be large (see below): passing it inline goes
+#                  through the OS's own argv, which caps a single argument at
+#                  128 KiB on Linux (MAX_ARG_STRLEN) well under the 1 MiB a
+#                  mutation-survivors record can reach.
 #
 # Why an orphan branch rather than a file on dev/main: the house rule is that
 # committed generated artifacts change at a release cut and nowhere else, so a
@@ -44,11 +49,40 @@
 #                                   duplicate-suppression path below can be
 #                                   tested: it needs two invocations that
 #                                   produce a byte-identical record.
+#   QUALITY_HISTORY_RETAIN          keep only the newest N records in this
+#                                   lane's file, applied after every append.
+#                                   Unset means today's behaviour for every
+#                                   lane: unbounded. A value below 1 is
+#                                   refused (a warning, pruning skipped for
+#                                   that invocation; the append itself still
+#                                   happens).
+#   QUALITY_HISTORY_RETAIN_BYTES    byte ceiling enforced alongside RETAIN,
+#                                   default 1048576 (1 MiB) once RETAIN is
+#                                   set. Whole oldest records are dropped
+#                                   until the file fits or only the newest
+#                                   record remains; the newest record is
+#                                   never dropped, even if it alone exceeds
+#                                   the ceiling (a `::warning::` is emitted
+#                                   instead). A value below 1 is refused the
+#                                   same way RETAIN is: a warning, no byte
+#                                   ceiling enforced for that invocation.
+#   QUALITY_HISTORY_RECORD_FILE     path to a file holding the lane's numbers
+#                                   as a single JSON object, read instead of
+#                                   the <json-object> argument. Never placed
+#                                   on argv anywhere downstream: the record
+#                                   is read with `jq --slurpfile`, and the
+#                                   push-time duplicate check reads it back
+#                                   with `grep -f` rather than passing it as
+#                                   a pattern argument, so a record up to the
+#                                   spec's 1 MiB ceiling never has to fit in
+#                                   a single argv string.
 
 set -euo pipefail
 export LC_ALL=C
 
 work_dir=""
+numbers_tmp=""
+record_tmp=""
 
 warn() {
 	printf '::warning::quality-history: %s\n' "$*" >&2
@@ -68,6 +102,12 @@ soft_exit() {
 	if [ -n "${work_dir}" ] && [ -d "${work_dir}" ]; then
 		rm -rf "${work_dir}" || warn "could not remove the temporary clone at ${work_dir}"
 	fi
+	if [ -n "${numbers_tmp}" ] && [ -f "${numbers_tmp}" ]; then
+		rm -f "${numbers_tmp}" || warn "could not remove the temporary numbers file at ${numbers_tmp}"
+	fi
+	if [ -n "${record_tmp}" ] && [ -f "${record_tmp}" ]; then
+		rm -f "${record_tmp}" || warn "could not remove the temporary record file at ${record_tmp}"
+	fi
 	if [ "${status}" -ne 0 ]; then
 		warn "append did not complete (exit ${status}); the lane's own result is unaffected"
 	fi
@@ -76,17 +116,36 @@ soft_exit() {
 trap soft_exit EXIT
 
 lane="${1:-}"
-numbers="${2:-}"
+numbers_arg="${2:-}"
+numbers_file="${QUALITY_HISTORY_RECORD_FILE:-}"
 
-if [ -z "${lane}" ] || [ -z "${numbers}" ]; then
-	warn "usage: $0 <lane> <json-object>"
+if [ -z "${lane}" ]; then
+	warn "usage: $0 <lane> <json-object> (or set QUALITY_HISTORY_RECORD_FILE)"
+	exit 1
+fi
+
+if [ -n "${numbers_file}" ]; then
+	if [ -n "${numbers_arg}" ]; then
+		warn "pass the record either as an argument or via QUALITY_HISTORY_RECORD_FILE, not both"
+		exit 1
+	fi
+	if [ ! -f "${numbers_file}" ]; then
+		warn "QUALITY_HISTORY_RECORD_FILE not found: ${numbers_file}"
+		exit 1
+	fi
+elif [ -n "${numbers_arg}" ]; then
+	numbers_tmp="$(mktemp "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/quality-history-numbers.XXXXXX")"
+	printf '%s' "${numbers_arg}" >"${numbers_tmp}"
+	numbers_file="${numbers_tmp}"
+else
+	warn "usage: $0 <lane> <json-object> (or set QUALITY_HISTORY_RECORD_FILE)"
 	exit 1
 fi
 
 case "${lane}" in
-soak | mutation | fuzz-nightly | bench) ;;
+soak | mutation | mutation-survivors | fuzz-nightly | bench) ;;
 *)
-	warn "unknown lane '${lane}'; expected one of soak, mutation, fuzz-nightly, bench"
+	warn "unknown lane '${lane}'; expected one of soak, mutation, mutation-survivors, fuzz-nightly, bench"
 	exit 1
 	;;
 esac
@@ -115,8 +174,15 @@ schedule | workflow_dispatch) ;;
 	;;
 esac
 
-if ! printf '%s' "${numbers}" | jq -e 'type == "object"' >/dev/null 2>&1; then
-	warn "the numbers argument is not a JSON object: ${numbers}"
+# `-e 'type == "object"'` only reflects the LAST top-level value jq reads:
+# a file holding two concatenated JSON objects passes this check (both are
+# objects) even though the record file is supposed to hold exactly one, and
+# the `--slurpfile ... $numbers_arr[0]` read below then silently drops the
+# second document instead of erroring. `-es` slurps every top-level value
+# into one array first, so this checks the document count and the shape of
+# the one document that's supposed to be there.
+if ! jq -es 'length == 1 and (.[0] | type == "object")' "${numbers_file}" >/dev/null 2>&1; then
+	warn "the numbers argument must be exactly one JSON object"
 	exit 1
 fi
 
@@ -139,9 +205,49 @@ case "${attempts}" in
 esac
 [ "${attempts}" -ge 1 ] || attempts=1
 
+# QUALITY_HISTORY_RETAIN caps the newest N records this lane keeps; unset
+# means today's unbounded behaviour for every lane. Invalid is refused, not
+# fatal: pruning is skipped for this invocation and the record is still
+# appended, because a bad cap is not a reason to lose the measurement.
+retain="${QUALITY_HISTORY_RETAIN:-}"
+case "${retain}" in
+'') ;;
+*[!0-9]*)
+	warn "QUALITY_HISTORY_RETAIN must be a positive integer, got '${retain}'; not pruning."
+	retain=""
+	;;
+*)
+	if [ "${retain}" -lt 1 ]; then
+		warn "QUALITY_HISTORY_RETAIN must be at least 1, got '${retain}'; not pruning."
+		retain=""
+	fi
+	;;
+esac
+
+retain_bytes="${QUALITY_HISTORY_RETAIN_BYTES:-}"
+if [ -n "${retain}" ] && [ -z "${retain_bytes}" ]; then
+	retain_bytes=1048576
+fi
+case "${retain_bytes}" in
+'') ;;
+*[!0-9]*)
+	warn "QUALITY_HISTORY_RETAIN_BYTES must be a positive integer, got '${retain_bytes}'; not enforcing a byte ceiling."
+	retain_bytes=""
+	;;
+*)
+	if [ "${retain_bytes}" -lt 1 ]; then
+		warn "QUALITY_HISTORY_RETAIN_BYTES must be at least 1, got '${retain_bytes}'; not enforcing a byte ceiling."
+		retain_bytes=""
+	fi
+	;;
+esac
+
+# `--slurpfile` so the record's content is read by jq opening the file
+# itself, never as an argv string: `numbers_file` may hold up to the spec's
+# 1 MiB ceiling, well past Linux's 128 KiB single-argument limit.
 record="$(
 	jq -cn \
-		--argjson numbers "${numbers}" \
+		--slurpfile numbers_arr "${numbers_file}" \
 		--arg lane "${lane}" \
 		--arg timestamp "${QUALITY_HISTORY_TIMESTAMP:-$(date -u '+%Y-%m-%dT%H:%M:%SZ')}" \
 		--arg workflow "${GITHUB_WORKFLOW:-local}" \
@@ -151,7 +257,7 @@ record="$(
 		--arg run_number "${GITHUB_RUN_NUMBER:-}" \
 		--arg sha "${GITHUB_SHA:-}" \
 		--arg ref "${GITHUB_REF_NAME:-}" \
-		'$numbers + {
+		'$numbers_arr[0] + {
             lane: $lane,
             timestamp: $timestamp,
             workflow: $workflow,
@@ -163,6 +269,8 @@ record="$(
             ref: (if $ref == "" then null else $ref end)
         }'
 )"
+record_tmp="$(mktemp "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/quality-history-record.XXXXXX")"
+printf '%s\n' "${record}" >"${record_tmp}"
 
 work_dir="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/quality-history.XXXXXX")"
 repo_dir="${work_dir}/repo"
@@ -179,6 +287,7 @@ append-only JSONL file per lane, one record per lane run:
 |---|---|---|
 | `soak.jsonl` | `quality-soak-weekly.yml` | weekly |
 | `mutation.jsonl` | `quality-mutation-monthly.yml` | monthly, one record per matrix package |
+| `mutation-survivors.jsonl` | `quality-mutation-monthly.yml` | monthly, one record per run, capped to the newest 12 |
 | `fuzz-nightly.jsonl` | `quality-fuzz-nightly.yml` | nightly |
 | `bench.jsonl` | `quality-bench-monthly.yml` | monthly |
 
@@ -247,15 +356,44 @@ attempt_append() {
 	# attempt did land and there is nothing left to do. Checked on every
 	# attempt, which also makes a re-invocation of a run that already
 	# recorded a no-op rather than a duplicate row.
-	if [ -f "${repo_dir}/${file}" ] && grep -Fxq "${record}" "${repo_dir}/${file}"; then
+	#
+	# `grep -f` reads the pattern from record_tmp rather than taking it as
+	# an argv string, for the same 128 KiB reason the record itself is read
+	# with `--slurpfile` above.
+	if [ -f "${repo_dir}/${file}" ] && grep -Fxqf "${record_tmp}" "${repo_dir}/${file}"; then
 		echo "quality-history: this record is already on ${branch}; not appending it twice."
 		return 0
 	fi
 
-	if [ ! -f "${repo_dir}/README.md" ]; then
-		readme_text >"${repo_dir}/README.md" || return 1
-	fi
+	# Unconditional: a `[ ! -f ]` guard means an edit to readme_text() never
+	# reaches an existing branch, so a lane added after the branch already
+	# exists (this one included) would go undocumented forever.
+	readme_text >"${repo_dir}/README.md" || return 1
 	printf '%s\n' "${record}" >>"${repo_dir}/${file}" || return 1
+
+	# QUALITY_HISTORY_RETAIN, applied after the append and before staging:
+	# a CAS retry replays this on top of whoever won, so the pruned result
+	# is always relative to the branch's current tip rather than a stale
+	# fetch. Whole oldest records are dropped, never part of one, so every
+	# retained record stays self-consistent; the newest record (the one
+	# this attempt just wrote) is never dropped.
+	if [ -n "${retain}" ]; then
+		local pruned="${repo_dir}/${file}.pruned"
+		tail -n "${retain}" "${repo_dir}/${file}" >"${pruned}" || return 1
+		mv "${pruned}" "${repo_dir}/${file}" || return 1
+
+		if [ -n "${retain_bytes}" ]; then
+			while [ "$(wc -l <"${repo_dir}/${file}")" -gt 1 ] &&
+				[ "$(wc -c <"${repo_dir}/${file}")" -gt "${retain_bytes}" ]; do
+				tail -n +2 "${repo_dir}/${file}" >"${pruned}" || return 1
+				mv "${pruned}" "${repo_dir}/${file}" || return 1
+			done
+
+			if [ "$(wc -c <"${repo_dir}/${file}")" -gt "${retain_bytes}" ]; then
+				echo "::warning::quality-history: the newest ${lane} record alone exceeds the ${retain_bytes}-byte ceiling; keeping it anyway."
+			fi
+		fi
+	fi
 
 	git -C "${repo_dir}" add README.md "${file}" || return 1
 	git -C "${repo_dir}" commit --quiet \

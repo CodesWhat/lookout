@@ -101,3 +101,45 @@ func TestDetectCompose_V1Fallback(t *testing.T) {
 		t.Fatal("isV2 = true, want false for v1")
 	}
 }
+
+// TestDetectCompose_V2DetectionPrefersV2OverV1Fallback exercises the
+// negation boundary of the `err == nil` check that guards the v2-detection
+// branch: `docker compose version` succeeds AND reports v2, AND a
+// docker-compose v1 binary is also present in PATH. detectCompose must
+// return early on the v2 match rather than falling through to the v1
+// fallback below. TestDetectCompose_V2Detection above doesn't have a
+// docker-compose binary in PATH at all, so it can't tell an early return
+// from an accidental fallthrough that happens to land on the same result.
+// Note: not parallel because it mutates os.Getenv("PATH").
+func TestDetectCompose_V2DetectionPrefersV2OverV1Fallback(t *testing.T) {
+
+	binDir := t.TempDir()
+
+	fakeBin := filepath.Join(binDir, "docker")
+	script := "#!/bin/sh\necho 'Docker Compose version v2.99.0'\n"
+	if err := os.WriteFile(fakeBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("writing fake docker: %v", err)
+	}
+
+	// A docker-compose v1 binary is ALSO present: if detectCompose fails to
+	// return early on the v2 match, it will fall through and pick this up
+	// instead, giving a different (wrong) result.
+	fakeV1 := filepath.Join(binDir, "docker-compose")
+	if err := os.WriteFile(fakeV1, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("writing fake docker-compose: %v", err)
+	}
+
+	origPath := os.Getenv("PATH")
+	t.Cleanup(func() { os.Setenv("PATH", origPath) }) //nolint:errcheck
+	os.Setenv("PATH", binDir)                         //nolint:errcheck
+
+	cm := &ComposeManager{stacksDir: t.TempDir()}
+	cm.detectCompose()
+
+	if cm.composeBin != "docker" {
+		t.Fatalf("composeBin = %q, want %q (must prefer v2 detection over v1 fallback)", cm.composeBin, "docker")
+	}
+	if !cm.isV2 {
+		t.Fatal("isV2 = false, want true (must prefer v2 detection over v1 fallback)")
+	}
+}

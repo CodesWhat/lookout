@@ -164,6 +164,11 @@ Signature version 2 clients must send five headers on every request:
 | `X-Portwing-Signature` | Base64url (no padding) Ed25519 signature over the canonical message |
 | `X-Portwing-Signature-Version` | Must be `2` for the full request-target format |
 
+On a rejected signature, the agent returns `401` with an `X-Portwing-Reason`
+response header set to one of `timestamp-skew`, `replay`, `unknown-key`, or
+`invalid-signature` (the catch-all for a missing header, malformed nonce,
+malformed signature, or a signature that fails verification).
+
 The canonical message is a newline-separated UTF-8 string:
 
 ```text

@@ -826,3 +826,39 @@ func TestContainerLogStreamNormalCompletionCancelsStreamContext(t *testing.T) {
 		)
 	}
 }
+
+// ---- looksLikeDockerLogFrame ----
+
+// TestLooksLikeDockerLogFrame exercises each of the four ANDed conditions in
+// isolation: for every condition, the other three are held true so that
+// only the guard under test can turn the overall result from true to
+// false. This kills each individual invert-&&-to-|| mutation, since an
+// inverted operator would let the surrounding true operands paper over the
+// one false operand this case targets.
+func TestLooksLikeDockerLogFrame(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		header []byte
+		want   bool
+	}{
+		{name: "valid stdout frame header", header: []byte{1, 0, 0, 0, 0, 0, 0, 0}, want: true},
+		{name: "valid stderr frame header", header: []byte{2, 0, 0, 0, 0, 0, 0, 0}, want: true},
+		{name: "too short fails length check", header: []byte{1, 0, 0, 0, 0, 0, 0}, want: false},
+		{name: "stream type out of range fails first byte check", header: []byte{3, 0, 0, 0, 0, 0, 0, 0}, want: false},
+		{name: "byte 1 nonzero fails second byte check", header: []byte{1, 1, 0, 0, 0, 0, 0, 0}, want: false},
+		{name: "byte 2 nonzero fails third byte check", header: []byte{1, 0, 1, 0, 0, 0, 0, 0}, want: false},
+		{name: "byte 3 nonzero fails fourth byte check", header: []byte{1, 0, 0, 1, 0, 0, 0, 0}, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := looksLikeDockerLogFrame(tt.header); got != tt.want {
+				t.Fatalf("looksLikeDockerLogFrame(%v) = %v, want %v", tt.header, got, tt.want)
+			}
+		})
+	}
+}

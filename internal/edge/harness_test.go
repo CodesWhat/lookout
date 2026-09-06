@@ -66,12 +66,39 @@ func newWSPair(t *testing.T) (agent, ctrl *websocket.Conn) {
 	return agent, ctrl
 }
 
-// newTestClient builds a Client wired to an in-memory controller. The returned
+// newTestClient builds a Client wired to an in-memory controller, in the state
+// connect leaves one in once the hello/welcome handshake is done: the outbound
+// queue is up and its sendPump owns the only write to the conn. The returned
 // ctrl conn is the controller side. The dockerClient and adapter are left nil
 // on purpose — every path this harness exercises stops before touching them;
 // the Docker-backed exec paths (CreateExec/StartExec/ResizeExec success) belong
 // to an integration tier against a real daemon, not this unit harness.
+//
+// The send pump is what makes this harness safe, not a detail of it. gorilla
+// panics with "concurrent write to websocket connection" the moment two
+// goroutines write one conn, and every post-handshake path here has more than
+// one sender: readPump answers pings and rejects oversized bodies inline, the
+// `go dispatchStreamedBody` and `go handleRequestTo` goroutines it spawns
+// answer their own requests, exec output pumps write from theirs, and a
+// pendingRequestBody's idle timer fires failPendingBody on a timer goroutine.
+// Production serializes all of them through sendPump. A client left in the
+// handshake state (sendCh nil) writes the raw conn from each of those
+// goroutines instead, which is only single-writer while nothing but connect is
+// sending. Use newHandshakeTestClient for that state deliberately.
 func newTestClient(t *testing.T) (*Client, *websocket.Conn) {
+	t.Helper()
+
+	c, ctrl := newHandshakeTestClient(t)
+	startSendPump(t, c)
+	return c, ctrl
+}
+
+// newHandshakeTestClient builds the same Client with no outbound queue, the
+// state connect is in between dialling and publishing sendCh. Only the tests
+// that own the queue themselves (installing their own sendCh, driving sendPump
+// directly, or asserting the direct-write branch) should use it: the raw
+// conn is written synchronously and unserialized, so a second sender panics.
+func newHandshakeTestClient(t *testing.T) (*Client, *websocket.Conn) {
 	t.Helper()
 
 	agent, ctrl := newWSPair(t)
@@ -90,7 +117,33 @@ func newTestClient(t *testing.T) (*Client, *websocket.Conn) {
 		streamSem: make(chan struct{}, maxStreams),
 		conn:      agent,
 	}
+	// A pendingRequestBody registered and left registered outlives the test by
+	// requestBodyStreamIdleTimeout, and its timer then fires failPendingBody
+	// against a conn whose test finished — during whichever test happens to be
+	// running 30 seconds later. Draining on the way out is connect's own
+	// teardown step, and it keeps every timer inside the test that armed it.
+	t.Cleanup(c.failAllPendingBodies)
 	return c, ctrl
+}
+
+// startSendPump brings up the outbound queue and the single writer that owns
+// it, exactly as connect does before any post-handshake send.
+func startSendPump(t *testing.T, c *Client) {
+	t.Helper()
+
+	ch := make(chan protocol.Envelope, sendQueueSize)
+	state := &outboundQueueState{}
+	c.connMu.Lock()
+	c.sendCh = ch
+	c.sendState = state
+	conn := c.conn
+	c.connMu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// context.Background() as the shutdown context: the harness models a live
+	// agent, so a write failure here takes the ordinary eviction path.
+	go c.sendPump(ctx, context.Background(), conn, ch)
+	t.Cleanup(cancel)
 }
 
 // expectEnvelope reads one envelope from the controller, failing if none
@@ -173,6 +226,45 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 		time.Sleep(2 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", what)
+}
+
+// healthServerLivenessTimeout bounds waitForHealthServer. It is a pure
+// liveness backstop, separate from the generic readTimeout other waitFor
+// callers share: bringing up a health server means an OS-scheduled goroutine
+// has to bind a listener and start Serve, and under CPU load that can take
+// far longer than 2s without indicating any actual bug. A health-server start
+// gets ten times the budget instead of failing spuriously on a loaded box.
+const healthServerLivenessTimeout = 10 * time.Second
+
+// waitForHealthServer polls c.HealthAddr() until the health server's
+// BaseContext hook has recorded its bound address, then GETs urlPath against
+// that address until it answers or healthServerLivenessTimeout elapses,
+// failing the test on timeout. It returns the full URL it finally reached, so
+// callers can reuse it. Binding via an OS-assigned port ("0") and reading the
+// address back this way — rather than pre-allocating one with freeAddr and
+// closing it — closes the window in which a parallel test can grab the same
+// port between allocation and (re)bind.
+func waitForHealthServer(t *testing.T, c *Client, urlPath string) string {
+	t.Helper()
+	// A timed client, not http.DefaultClient: an address that still accepts
+	// connections but never answers would park an untimed Get past the
+	// backstop below instead of failing the iteration and retrying.
+	client := &http.Client{Timeout: 2 * time.Second}
+	deadline := time.Now().Add(healthServerLivenessTimeout)
+	for time.Now().Before(deadline) {
+		if addr := c.HealthAddr(); addr != nil {
+			url := "http://" + addr.String() + urlPath
+			//nolint:noctx,bodyclose
+			resp, err := client.Get(url) //nolint:gosec
+			if err == nil {
+				resp.Body.Close()
+				return url
+			}
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for health server to answer %s", urlPath)
+	return ""
 }
 
 // fakeConn is a scripted net.Conn. Read drains the queued chunks then returns

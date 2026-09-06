@@ -13,6 +13,10 @@ new_fixture() {
 	mkdir -p "${fixture}/scripts/ci" || return
 	cp scripts/ci/go-release-check.sh "${fixture}/scripts/ci/" || return
 	git -C "${fixture}" init -q || return
+	# Auto maintenance forks a detached process that can still be writing under .git when the
+	# EXIT trap removes the fixture ("rm: cannot remove '.git/objects': Directory not empty").
+	git -C "${fixture}" config gc.auto 0 || return
+	git -C "${fixture}" config maintenance.auto false || return
 	git -C "${fixture}" config user.email "contract-test@codeswhat.com" || return
 	git -C "${fixture}" config user.name "Contract Test" || return
 	git -C "${fixture}" add . || return

@@ -5,11 +5,12 @@ run-name: >-
     format('ClusterFuzzLite — batch, manual by {0}', github.actor)
   }}
 
-# The batch half of tier 4: an hour of fuzzing a week against the whole project,
-# writing everything it finds back to the corpus branch. The pull-request half is
-# quality-fuzz-cflite-pr.yml, which carries the full rationale for the tier, for
-# the corpus-persistence design, and for what about ClusterFuzzLite cannot be
-# pinned. Read that file first. Pruning is quality-fuzz-cflite-prune.yml.
+# The batch half of tier 4: 60 seconds per fuzz target a week (600s total)
+# against the whole project, writing everything it finds back to the corpus
+# branch. The pull-request half is quality-fuzz-cflite-pr.yml, which carries
+# the full rationale for the tier, for the corpus-persistence design, and for
+# what about ClusterFuzzLite cannot be pinned. Read that file first. Pruning
+# is quality-fuzz-cflite-prune.yml.
 #
 # --- Why batch and prune are separate files ---------------------------------
 #
@@ -74,9 +75,15 @@ jobs:
   batch-fuzz:
     name: "ClusterFuzzLite (batch)"
     runs-on: ubuntu-24.04
-    # 3600s of fuzzing plus the image pull, the toolchain download, and ten
-    # libFuzzer builds.
-    timeout-minutes: 90
+    # GitHub-hosted runners here kill a job with "The runner has received a
+    # shutdown signal" once it sustains high CPU for roughly 14-19 minutes;
+    # low-CPU jobs survive for hours. Measured repeatedly against this job on
+    # 2026-09-03/04: a 25-minute sustained-CPU probe survived 10/10, but two
+    # runs at the old hour-long budget both died mid-run. 600s total (60s
+    # per fuzzer across the ten targets) keeps the image pull, the toolchain
+    # download, ten libFuzzer builds, the fuzzing itself and the corpus push
+    # comfortably under that ceiling.
+    timeout-minutes: 20
 
     permissions:
       # This job writes exactly one thing: the corpus branch.
@@ -118,8 +125,9 @@ jobs:
         with:
           language: go
           github-token: ${{ github.token }}
-          # One hour total, split across the ten targets by run_fuzzers.py.
-          fuzz-seconds: 3600
+          # 600s total, split across the ten targets by run_fuzzers.py (60s
+          # each). See the job's timeout-minutes comment above for why.
+          fuzz-seconds: 600
           mode: batch
           sanitizer: address
           storage-repo: https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git

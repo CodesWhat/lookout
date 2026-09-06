@@ -27,6 +27,18 @@ func FuzzEnvelope(f *testing.F) {
 	f.Add([]byte(`{"type":"dd:trigger_request","data":{"triggerType":"restart","triggerName":"web","containerId":"c1"}}`))
 	f.Add([]byte(`{"type":"dd:container_log_request","data":{"containerId":"c1","tail":100}}`))
 	f.Add([]byte(`{"type":"dd:container_delete_request","data":{"containerId":"c1"}}`))
+	// Welcome seeds: TypeWelcome is otherwise unreached by any seed above, and
+	// (*WelcomeMessage).UnmarshalJSON is the only statement-bearing function
+	// in this package, so FuzzEnvelope scored 0.00% coverage without these.
+	// Covers every PollInterval shape UnmarshalJSON branches on: a plain
+	// number, a numeric string, a non-numeric string, a non-number/non-string
+	// JSON value, an absent field, and a data payload that isn't an object.
+	f.Add([]byte(`{"type":"welcome","data":{"pollInterval":30,"config":{"k":"v"},"capabilities":["response_body_base64"]}}`))
+	f.Add([]byte(`{"type":"welcome","data":{"pollInterval":"30"}}`))
+	f.Add([]byte(`{"type":"welcome","data":{"pollInterval":"abc"}}`))
+	f.Add([]byte(`{"type":"welcome","data":{"pollInterval":true}}`))
+	f.Add([]byte(`{"type":"welcome","data":{}}`))
+	f.Add([]byte(`{"type":"welcome","data":[1,2]}`))
 	// Hostile / edge-case seeds.
 	f.Add([]byte(``))
 	f.Add([]byte(`{}`))

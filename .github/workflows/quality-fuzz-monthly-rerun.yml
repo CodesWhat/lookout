@@ -279,7 +279,7 @@ jobs:
 
           rerun_status="not attempted"
           if [ "${kind}" = "infra" ]; then
-            if gh run rerun "${RUN_ID}" --failed; then
+            if gh run rerun "${RUN_ID}" --failed --repo "${REPO}"; then
               rerun_status="requested"
             else
               rerun_status="FAILED to request"

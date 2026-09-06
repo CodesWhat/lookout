@@ -5,7 +5,7 @@
 #
 # Usage: scripts/quality-history.sh <lane> [--last N] [--json]
 #
-#   <lane>     soak | mutation | fuzz-nightly | bench
+#   <lane>     soak | mutation | mutation-survivors | fuzz-nightly | bench
 #   --last N   show the N most recent records (default 20, 0 for all)
 #   --json     print the raw JSONL instead of a table
 #
@@ -28,7 +28,7 @@ die() {
 
 usage() {
 	echo "Usage: $0 <lane> [--last N] [--json]" >&2
-	echo "  lane: soak | mutation | fuzz-nightly | bench" >&2
+	echo "  lane: soak | mutation | mutation-survivors | fuzz-nightly | bench" >&2
 }
 
 lane=""
@@ -72,8 +72,8 @@ done
 }
 
 case "${lane}" in
-soak | mutation | fuzz-nightly | bench) ;;
-*) die "unknown lane '${lane}'; expected one of soak, mutation, fuzz-nightly, bench" ;;
+soak | mutation | mutation-survivors | fuzz-nightly | bench) ;;
+*) die "unknown lane '${lane}'; expected one of soak, mutation, mutation-survivors, fuzz-nightly, bench" ;;
 esac
 
 case "${last}" in
@@ -142,6 +142,7 @@ printf '%s\n' "${records}" |
               | (.[$c]
                  | if . == null or . == "" then "-"
                    elif $c == "sha" then tostring[0:8]
+                   elif (type == "array" or type == "object") then ("[" + (length | tostring) + "]")
                    else tostring end)]
            | @tsv)
     ' |

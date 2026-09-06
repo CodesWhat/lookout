@@ -309,3 +309,103 @@ func TestParsePHCRejectsOverflowParams(t *testing.T) {
 		}
 	}
 }
+
+// TestParsePHCAcceptsMemoryAtUint32Max verifies m is accepted at exactly the
+// uint32 maximum (parseParams' "m" overflow check), killing the
+// CONDITIONALS_BOUNDARY mutant that turns `v > uint64(^uint32(0))` into `>=`.
+// argon2.go:101:9
+func TestParsePHCAcceptsMemoryAtUint32Max(t *testing.T) {
+	t.Parallel()
+
+	const good = "$argon2id$v=19$m=4294967295,t=2,p=1$c29tZXNhbHQ$aGFzaA"
+
+	p, err := ParsePHC(good)
+	if err != nil {
+		t.Fatalf("ParsePHC with m at uint32 max: %v", err)
+	}
+	if p.Memory != 4294967295 {
+		t.Fatalf("Memory = %d, want 4294967295", p.Memory)
+	}
+}
+
+// TestParsePHCAcceptsTimeAtUint32Max verifies t is accepted at exactly the
+// uint32 maximum, killing the CONDITIONALS_BOUNDARY mutant on the "t" overflow
+// check. argon2.go:106:9
+func TestParsePHCAcceptsTimeAtUint32Max(t *testing.T) {
+	t.Parallel()
+
+	const good = "$argon2id$v=19$m=19456,t=4294967295,p=1$c29tZXNhbHQ$aGFzaA"
+
+	p, err := ParsePHC(good)
+	if err != nil {
+		t.Fatalf("ParsePHC with t at uint32 max: %v", err)
+	}
+	if p.Time != 4294967295 {
+		t.Fatalf("Time = %d, want 4294967295", p.Time)
+	}
+}
+
+// TestParsePHCAcceptsParallelismAt255 verifies p is accepted at exactly 255,
+// killing the CONDITIONALS_BOUNDARY mutant on the "p" overflow check
+// (`v > 255` -> `v >= 255`). argon2.go:111:9
+func TestParsePHCAcceptsParallelismAt255(t *testing.T) {
+	t.Parallel()
+
+	const good = "$argon2id$v=19$m=19456,t=2,p=255$c29tZXNhbHQ$aGFzaA"
+
+	p, err := ParsePHC(good)
+	if err != nil {
+		t.Fatalf("ParsePHC with p at 255: %v", err)
+	}
+	if p.Parallelism != 255 {
+		t.Fatalf("Parallelism = %d, want 255", p.Parallelism)
+	}
+}
+
+// TestParsePHCAcceptsTimeAtMinimumOne verifies t=1 (the documented minimum) is
+// accepted, killing the CONDITIONALS_BOUNDARY mutant that turns
+// `p.Time < 1` into `p.Time <= 1`. argon2.go:122:12
+func TestParsePHCAcceptsTimeAtMinimumOne(t *testing.T) {
+	t.Parallel()
+
+	const good = "$argon2id$v=19$m=19456,t=1,p=1$c29tZXNhbHQ$aGFzaA"
+
+	p, err := ParsePHC(good)
+	if err != nil {
+		t.Fatalf("ParsePHC with t=1: %v", err)
+	}
+	if p.Time != 1 {
+		t.Fatalf("Time = %d, want 1", p.Time)
+	}
+}
+
+// TestParsePHCMemoryParallelismBoundary exercises the
+// `p.Memory < 8*uint32(p.Parallelism)` check exactly at and just below the
+// threshold. It kills two mutants at argon2.go:128:
+//   - CONDITIONALS_BOUNDARY (`<` -> `<=`): memory==8*parallelism must succeed.
+//   - ARITHMETIC_BASE (`*` -> `/`): memory=10,parallelism=2 must fail against
+//     the real threshold (16) even though 10 >= 8/2 (4) under the mutated
+//     division.
+func TestParsePHCMemoryParallelismBoundary(t *testing.T) {
+	t.Parallel()
+
+	const salt = "c29tZXNhbHQ"
+	const hash = "aGFzaA"
+
+	// Exactly at the threshold (8*2=16): must be accepted.
+	atThreshold := "$argon2id$v=19$m=16,t=1,p=2$" + salt + "$" + hash
+	p, err := ParsePHC(atThreshold)
+	if err != nil {
+		t.Fatalf("ParsePHC at memory==8*parallelism threshold: %v", err)
+	}
+	if p.Memory != 16 || p.Parallelism != 2 {
+		t.Fatalf("parsed params = %+v, want memory=16 parallelism=2", p)
+	}
+
+	// Below the real threshold (16) but above the mutated-division threshold
+	// (8/2=4): must be rejected. A `*` -> `/` mutant would accept this.
+	belowThreshold := "$argon2id$v=19$m=10,t=1,p=2$" + salt + "$" + hash
+	if _, err := ParsePHC(belowThreshold); err == nil {
+		t.Fatal("ParsePHC with memory=10, parallelism=2 (below real 8*parallelism threshold) accepted, want error")
+	}
+}

@@ -80,6 +80,14 @@ it is never cached, so git decides what's in it, not a stale cache entry — and
 a crasher found mid-run is recovered from the uploaded failure artifact if it
 isn't committed before the cache is pruned.
 
+`FuzzParseImageRef` and `FuzzParseLabels` are the exception: both are
+saturated (millions of executions, zero new interesting inputs), so the
+nightly and monthly lanes run them as a seed-replay only — the committed and
+cached corpus replayed through `go test -run`, no `-fuzz` minutes, no growth
+in `$GOCACHE/fuzz/` for either — while still catching a regression in what's
+already committed. The command above still runs a real 5-second `-fuzz` smoke
+for them locally; only the CI lanes' cadence differs.
+
 ### Benchmarks
 
 ```bash

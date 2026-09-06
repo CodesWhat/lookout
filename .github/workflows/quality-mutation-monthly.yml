@@ -67,7 +67,10 @@ jobs:
             mcover: 100
           - name: auth
             package: ./internal/auth
-            efficacy: 79.17
+            # efficacy ratcheted in run 33839463545 (2026-09-04): measured
+            # 89.58 across 3 samples, basis 89.58, 1.00pp buffer. mcover is
+            # untouched.
+            efficacy: 88.58
             mcover: 97.96
           - name: banner
             package: ./internal/banner
@@ -113,8 +116,13 @@ jobs:
             package: ./internal/metrics
             # workers=1 repeats: 91.76/94.44, 92.00/83.33, 91.11/94.74.
             # Floors retain observed slack for Gremlins run-to-run variance.
+            # mcover ratcheted in run 33839463545 (2026-09-04): measured
+            # 95.04, seeded 12.0pp buffer (mutation-ratchet.sh's
+            # metrics:mutator_coverage seed) rather than the observed pool,
+            # since mcover swings run to run and recording is still young.
+            # efficacy is untouched.
             efficacy: 90.00
-            mcover: 80.00
+            mcover: 83.04
             workers: 1
           - name: pool
             package: ./internal/pool
@@ -340,14 +348,34 @@ jobs:
 
           cat quality-history-record.json
 
+          # The ratchet job below needs each package's surviving and
+          # uncovered mutants to point an agent at the tests worth writing,
+          # not just the headline numbers this record already carries. Only
+          # a "gated" run actually has a mutation-report.json worth reading;
+          # every other mode already recorded why there is nothing to read.
+          if [ "${mode}" = "gated" ]; then
+            jq -c --arg name "${PACKAGE_NAME}" --arg pkg "${PACKAGE_PATH}" '{
+              name: $name, package: $pkg,
+              efficacy: (.test_efficacy // null), mutator_coverage: (.mutations_coverage // null),
+              survivors: [ .files[]? | .file_name as $f | .mutations[]
+                           | select(.status == "LIVED")   | {file:$f, line, column, mutator:.type} ],
+              uncovered: [ .files[]? | .file_name as $f | .mutations[]
+                           | select(.status == "NOT COVERED") | {file:$f, line, column, mutator:.type} ]
+            }' mutation-report.json >mutation-survivors.json
+          fi
+
       - name: Upload the quality history record
         if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: mutation-history-${{ matrix.name }}-${{ github.run_id }}
-          path: quality-history-record.json
+          path: |
+            quality-history-record.json
+            mutation-survivors.json
           if-no-files-found: warn
-          # Read by the history job in this same run and never again.
+          # Read by the history and ratchet jobs in this same run and never
+          # again; the ratchet job re-uploads survivors it wants to keep
+          # under its own 90-day artifact.
           retention-days: 1
 
   # PW-5.5. The one job in this workflow that can write to the repository, and
@@ -367,7 +395,12 @@ jobs:
   # that width; sixteen sequential appends from one job race nothing.
   history:
     name: "Record the mutation run in the quality history"
-    needs: gremlins
+    # PW-2.5. The survivor-identity record below reads mutation-advisory's
+    # own reports (mutation-advisory-*.json), not just the gating legs', so
+    # this job now waits on both. always() (already on this job) already
+    # tolerates a killed advisory leg; the cost is waiting on a matrix
+    # capped at timeout-minutes: 20.
+    needs: [gremlins, mutation-advisory]
     if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -404,6 +437,49 @@ jobs:
           pattern: mutation-history-*-${{ github.run_id }}
           path: records
 
+      # PW-2.5. The survivor record needs each advisory leg's own raw
+      # Gremlins report (mutation-advisory-<name>.json) to compute mutant
+      # identities for the advisory source; the 30-day retention on this
+      # artifact (mutation-advisory's own "Upload advisory rows and
+      # reports" step) is what makes it still be here.
+      - name: Download the advisory records
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: mutation-advisory-*-${{ github.run_id }}
+          path: advisory
+
+      # PW-2.5. One name|package per line, equal to the gating matrix above
+      # (scripts/mutation-config.test.mjs cross-checks it the same way it
+      # already cross-checks mutation-advisory-summary's own
+      # ADVISORY_GROUP_PACKAGES). This job runs after the matrix and has no
+      # access to its context, so the set is duplicated here rather than
+      # read from it.
+      - name: Record mutation survivors for the quality history
+        env:
+          MUTATION_PACKAGES: |
+            portwing|./cmd/portwing
+            server|./internal/server
+            adapter|./internal/adapter
+            adapter-drydock|./internal/adapter/drydock
+            audit|./internal/audit
+            auth|./internal/auth
+            banner|./internal/banner
+            config|./internal/config
+            docker|./internal/docker
+            edge|./internal/edge
+            generic|./internal/generic
+            log|./internal/log
+            mcp|./internal/mcp
+            metrics|./internal/metrics
+            pool|./internal/pool
+            protocol|./internal/protocol
+        run: |
+          set -euo pipefail
+          printf '%s\n' "${MUTATION_PACKAGES}" >mutation-packages.txt
+          scripts/ci/mutation-survivors-record.sh records advisory . mutation-packages.txt >survivors.json
+          cat survivors.json
+
       - name: Append each package to the quality history
         env:
           QUALITY_HISTORY_CREDENTIAL: ${{ secrets.GITHUB_TOKEN }}
@@ -414,7 +490,6 @@ jobs:
 
           if [ "${#records[@]}" -eq 0 ]; then
             echo "::warning::No per-package records were downloaded; nothing to append."
-            exit 0
           fi
 
           # Every record is untrusted input from another job: read as data
@@ -429,6 +504,144 @@ jobs:
             fi
             scripts/ci/quality-history-append.sh mutation "${numbers}"
           done
+
+          # Read via QUALITY_HISTORY_RECORD_FILE, not as an inline argument:
+          # a mutation-survivors record can reach the spec's 1 MiB ceiling,
+          # well past Linux's 128 KiB single-argument limit (MAX_ARG_STRLEN),
+          # so it is never captured into a shell variable or passed on argv.
+          if [ -s survivors.json ] && jq -e 'type == "object"' survivors.json >/dev/null 2>&1; then
+            QUALITY_HISTORY_RETAIN=12 QUALITY_HISTORY_RECORD_FILE=survivors.json \
+              scripts/ci/quality-history-append.sh mutation-survivors
+          else
+            echo "::warning::survivors.json is missing or not a JSON object; not appending mutation-survivors."
+          fi
+
+  # Proposes, never pushes. Raising a floor stays a reviewed two-file edit (the
+  # matrix above and expectedFloors in scripts/mutation-config.test.mjs) plus a
+  # per-package comment; this job's whole job is to make that edit easy to
+  # justify from data, not to make it directly. It reads this run's own
+  # per-package records and the quality-history series, computes proposals
+  # with scripts/ci/mutation-ratchet.sh, and stops. contents: read, same as
+  # the workflow default: unlike `history`, this job never writes to the
+  # repository, so it never needs more.
+  #
+  # PW-7.36: a package that timed out any mutants used to be skipped outright,
+  # which skipped exactly the packages with the most ratchet headroom (run
+  # 33839463545: adapter, adapter-drydock, docker, edge, mcp, server). The
+  # script now tolerates up to 5% of attempted mutants timing out and
+  # discounts them from the efficacy it feeds the ratchet, so a timed-out
+  # mutant can lower a proposal but never raise one; see the script's own
+  # header for the arithmetic.
+  ratchet:
+    name: "Quality: Mutation floor ratchet proposal"
+    needs: [gremlins, history]
+    if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c  # v2.21.0
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            api.github.com:443
+            github.com:443
+            results-receiver.actions.githubusercontent.com:443
+            *.actions.githubusercontent.com:443
+            *.blob.core.windows.net:443
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Read-only, into a subdirectory, never the working tree. The branch may
+      # not exist yet on the series' first run, so a missing ref is tolerated
+      # here and treated as "no history" by the script below rather than
+      # failing the job.
+      - name: Checkout quality-history
+        continue-on-error: true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: quality-history
+          path: quality-history
+          persist-credentials: false
+
+      - name: Download the per-package records
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: mutation-history-*-${{ github.run_id }}
+          path: records
+
+      - name: Propose floor ratchets
+        run: |
+          set -euo pipefail
+          ./scripts/ci/mutation-ratchet.sh records quality-history/mutation.jsonl mutation-ratchet-proposal.json
+
+      - name: Summarize
+        if: always()
+        run: |
+          set -euo pipefail
+
+          if [ ! -f mutation-ratchet-proposal.json ]; then
+            {
+              echo "### Mutation floor ratchet proposal"
+              echo ""
+              echo "No ratchet proposals this run."
+            } >>"$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          jq -c '.survivors_by_package' mutation-ratchet-proposal.json >mutation-survivors.json
+
+          {
+            echo "### Mutation floor ratchet proposal"
+            echo ""
+            echo "| package | metric | floor | measured | basis | proposed | gain | samples |"
+            echo "|---|---|---|---|---|---|---|---|"
+            jq -r '
+              .proposals[]
+              | "| \(.name) | \(.metric) | \(.current_floor) | \(.measured) | \(.basis) | \(.proposed) | \(.gain) | \(.samples) |"
+            ' mutation-ratchet-proposal.json
+
+            lowest_pkg="$(jq -r '.survivors_by_package[0].name // empty' mutation-ratchet-proposal.json)"
+            if [ -n "${lowest_pkg}" ]; then
+              echo ""
+              echo "Lowest-efficacy package: \`${lowest_pkg}\`, top 15 survivors:"
+              echo ""
+              echo '```'
+              jq -r --arg name "${lowest_pkg}" '
+                .survivors_by_package[]
+                | select(.name == $name)
+                | .survivors[:15][]
+                | ((.file // "") | gsub("`"; "") | gsub("\n"; " ")) as $file
+                | ((.mutator // "") | gsub("`"; "") | gsub("\n"; " ")) as $mutator
+                | "\($file):\(.line):\(.column)  \($mutator)"
+              ' mutation-ratchet-proposal.json
+              echo '```'
+            fi
+
+            if [ "$(jq '.proposals | length' mutation-ratchet-proposal.json)" -eq 0 ]; then
+              echo ""
+              echo "No ratchet proposals this run."
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the ratchet proposal
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: mutation-ratchet-${{ github.run_id }}
+          path: |
+            mutation-ratchet-proposal.json
+            mutation-survivors.json
+          if-no-files-found: warn
+          retention-days: 90
 
   # PW-6.8: Gremlins ships 11 mutator types and enables 5 of them. The 6 it
   # leaves off by default (invert-logical, invert-bitwise, invert-bwassign,
@@ -465,13 +678,105 @@ jobs:
   #
   # This job cannot gate: it never calls scripts/ci/mutation-gate.sh, and a
   # package whose run fails is reported as unavailable instead of failing the
-  # lane. It does fail when the whole set produces no mutants of any advisory
-  # type, because an advisory measurement that measured nothing is the same
-  # green-means-nothing problem PW-6.1 was about.
+  # lane. Each leg does fail when its own group produces no mutants of any
+  # advisory type, because an advisory measurement that measured nothing is
+  # the same green-means-nothing problem PW-6.1 was about.
+  #
+  # Each leg runs ONLY the 6 default-disabled mutators, not all 11. The
+  # gating matrix above already measures the 5 Gremlins enables by default,
+  # so re-running them here would just repeat work the gated leg already
+  # paid for. The 5 default-enabled flags are explicitly turned off below
+  # for that reason, and the efficacy this job reports is efficacy against
+  # the 6 extra mutators alone, not against the gating floor: there is
+  # nothing left to compare it to.
+  #
+  # It is a matrix, one leg per group of packages, rather than the single job
+  # this used to be. GitHub-hosted runners here kill a job with "The runner
+  # has received a shutdown signal" once it sustains high CPU for roughly
+  # 14-19 minutes. A single job running all 11 mutators over every package
+  # in the gating matrix above died that way twice, on 2026-09-03 and
+  # 2026-09-04, after completing only 3 of its 5 packages; a 4-group split
+  # of that same 11-mutator run died again on a later attempt, with auth at
+  # 4.3 min, edge at 6.0 min and adapter at 1.7 min complete but server
+  # still running 7+ minutes in when it was killed. Running all 11 mutators
+  # costs roughly 1.5-2x a gated leg's own time per package (gated server is
+  # 9.2 min, so server alone at 11 mutators projected to ~14-18 min, and
+  # edge+generic to ~15 min), which is why dropping to the 6 extra mutators
+  # matters as much as the split does. Groups are sized by the gated legs'
+  # own measured elapsed time (server ~9 min, generic ~6, edge ~5, docker ~3,
+  # everything else under 3): server, edge and generic each run alone, and
+  # the rest split across two more groups. scripts/mutation-config.test.mjs
+  # asserts every package in the gating matrix above appears in exactly one
+  # group here.
+  #
+  # Each leg writes its rows to a file instead of $GITHUB_STEP_SUMMARY and
+  # uploads them as an artifact; the mutation-advisory-summary job below
+  # downloads every leg's rows and writes the one combined table, the same
+  # shape this job used to write directly.
   mutation-advisory:
-    name: "Quality: Gremlins advisory mutators"
+    name: "Quality: Gremlins advisory mutators (${{ matrix.group }})"
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 20
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: server
+            # PW-6.8: measured 95.77% efficacy on the 6 extra mutators in run
+            # 33901506579 (2026-09-04): killed 68, lived 3 across
+            # ./internal/server. Floor is floor(measured) - 2pp of slack.
+            floor: 93
+            packages: |
+              ./internal/server|server|77.88
+          - group: edge
+            # Measured 82.56% in run 33901506579 (2026-09-04): killed 71,
+            # lived 15 across ./internal/edge.
+            floor: 80
+            packages: |
+              ./internal/edge|edge|74.73
+          - group: generic
+            # Measured 83.33% in run 33901506579 (2026-09-04): killed 5,
+            # lived 1 across ./internal/generic.
+            floor: 81
+            packages: |
+              ./internal/generic|generic|85.00
+          - group: misc-a
+            # adapter-drydock hit the same cliff as pool and protocol: run
+            # 33848880338 generated 32 extra mutants and TIMED OUT 30 of
+            # them under the default timeout coefficient (coverage-gather
+            # time x 3), scoring 0 killed/0 lived with efficacy unmeasured.
+            # drydock's tests are slow relative to its coverage gather, so
+            # it gets the same |40 coefficient.
+            #
+            # Measured 94.02% in run 33901506579 (2026-09-04): killed 110,
+            # lived 7 summed across adapter, adapter-drydock, auth and audit.
+            floor: 92
+            packages: |
+              ./internal/adapter|adapter|84.68
+              ./internal/adapter/drydock|adapter-drydock|82.50|40
+              ./internal/auth|auth|88.58
+              ./internal/audit|audit|88.31
+          - group: misc-b
+            # Measured 94.52% in run 33901506579 (2026-09-04): killed 138,
+            # lived 8 summed across docker, mcp and metrics.
+            floor: 92
+            packages: |
+              ./internal/docker|docker|90.39
+              ./internal/mcp|mcp|79.49
+              ./internal/metrics|metrics|90.00
+          - group: misc-c
+            # Measured 92.86% in run 33901506579 (2026-09-04): killed 39,
+            # lived 3 summed across portwing, banner, config, log, pool and
+            # protocol.
+            floor: 90
+            packages: |
+              ./cmd/portwing|portwing|100
+              ./internal/banner|banner|76.92
+              ./internal/config|config|82.22
+              ./internal/log|log|
+              ./internal/pool|pool|50.00|40
+              ./internal/protocol|protocol|100|40
 
     steps:
       - name: Harden Runner
@@ -515,53 +820,99 @@ jobs:
             --remove-self-assignments
           )
 
+          # The gating matrix above already measures these 5; running them
+          # again here would repeat that work for every package and is what
+          # pushed the 4-group split over the runner's CPU ceiling. They
+          # default to true, so each is turned off with an explicit =false.
+          default_mutator_flags=(
+            --arithmetic-base=false
+            --conditionals-boundary=false
+            --conditionals-negation=false
+            --increment-decrement=false
+            --invert-negatives=false
+          )
+
           # Check the flag names against the binary's own help before running
           # anything. An unknown flag would fail the first package and then be
           # swallowed by the per-package guard below, so a rename upstream
           # would read as five unavailable packages rather than as a broken
           # job. This is the check --threshold-efficacy never had.
+          # The check reads the already-captured string, never a pipe into
+          # grep -q: a producer piped straight to grep -q under pipefail can
+          # exit before the producer finishes writing, and the repo bans that
+          # shape outright regardless of whether it would misfire here.
           help_text="$(gremlins unleash --help)"
           for flag in "${advisory_flags[@]}"; do
-            if ! printf '%s\n' "${help_text}" | grep -qE -- "[[:space:]]${flag}([[:space:]]|=|$)"; then
+            if ! grep -qE -- "[[:space:]]${flag}([[:space:]]|=|$)" <<<"${help_text}"; then
               echo "advisory: gremlins ${GREMLINS_VERSION} has no ${flag} flag" >&2
               exit 1
             fi
           done
 
-          # package|name|efficacy floor the gating matrix above measured
-          # without these mutators. The floors are repeated here so the table
-          # can show what enabling them would cost against the current
-          # ratchet; scripts/mutation-config.test.mjs fails if the two drift.
-          advisory_packages=(
-            "./internal/auth|auth|79.17"
-            "./internal/edge|edge|74.73"
-            "./internal/adapter|adapter|84.68"
-            "./internal/server|server|77.88"
-            "./internal/mcp|mcp|79.49"
-          )
-
           headline_rows=()
           mutator_rows=()
           advisory_mutants=0
 
-          for entry in "${advisory_packages[@]}"; do
-            IFS='|' read -r package name floor <<<"${entry}"
+          # This leg's slice of the gating matrix above, one
+          # path|name|efficacy-floor triple per line, read from
+          # matrix.packages via the environment rather than a bash array
+          # literal so every group runs the identical loop body. The floor
+          # is the gating threshold for the 5 default mutators this job no
+          # longer runs, so it plays no part in this job's own output; it is
+          # kept only because scripts/mutation-config.test.mjs cross-checks
+          # it against the gating matrix and fails if a floor here drifts,
+          # or if a gating package is missing from every group or
+          # duplicated across two.
+          while IFS='|' read -r package name _ coefficient; do
+            [ -n "${package}" ] || continue
+
             report="mutation-advisory-${name}.json"
+
+            # Gremlins gives each mutant a wall-clock budget of the
+            # coverage-gathering time times the timeout coefficient (default
+            # 3). pool and protocol gather coverage in under 250 ms, so the
+            # default budget is a few hundred milliseconds for a whole
+            # build-and-test cycle and every mutant reports TIMED OUT. Timed
+            # out mutants are counted by mutator_statistics but excluded from
+            # killed+lived, so the row would publish a real-looking 0.00%.
+            # The gating matrix above and the gate-canary below already pass
+            # 40 for exactly these two packages; the coefficient rides along
+            # in the matrix line so it stays one source of truth.
+            coefficient_args=()
+            if [ -n "${coefficient}" ]; then
+              coefficient_args+=(--timeout-coefficient "${coefficient}")
+            fi
 
             if ! gremlins unleash --tags="" \
               "${advisory_flags[@]}" \
+              "${default_mutator_flags[@]}" \
+              "${coefficient_args[@]+"${coefficient_args[@]}"}" \
               --output "${report}" \
               "${package}" 2>&1 | tee "mutation-advisory-${name}.txt"; then
               echo "advisory: ${name} did not complete; reporting it as unavailable"
-              headline_rows+=("| \`${package}\` | unavailable | ${floor}% | | | | | |")
+              headline_rows+=("| \`${package}\` | unavailable | | | | |")
               mutator_rows+=("| \`${package}\` | unavailable | | | | | |")
+              continue
+            fi
+
+            # Gremlins v0.6.0's report.Do() returns without writing the JSON
+            # file when there are zero mutants of the requested types
+            # (report.go:71-73, 243-249), and still exits 0. internal/log
+            # produces zero mutants of these six advisory types, so a missing
+            # report here means "nothing to mutate", not "gremlins failed".
+            # Conflating the two would mislabel it unavailable forever; the
+            # gating matrix's zero_mutants convention for the same package is
+            # the model, an explicit zero row rather than a blank one.
+            if [ ! -f "${report}" ]; then
+              echo "advisory: ${name} produced no mutants of any advisory type; recording zero-mutants"
+              headline_rows+=("| \`${package}\` | 0 | 0 | 0 | 0 | n/a |")
+              mutator_rows+=("| \`${package}\` | 0 | 0 | 0 | 0 | 0 | 0 |")
               continue
             fi
 
             if ! metrics="$(jq -er '
                 [
                     (.test_efficacy // 0),
-                    (.mutations_coverage // 0),
                     (.mutants_killed // 0),
                     (.mutants_lived // 0),
                     (.mutants_not_covered // 0),
@@ -574,42 +925,48 @@ jobs:
                 ] | @tsv
             ' "${report}")"; then
               echo "advisory: ${name} wrote no readable report; reporting it as unavailable"
-              headline_rows+=("| \`${package}\` | unavailable | ${floor}% | | | | | |")
+              headline_rows+=("| \`${package}\` | unavailable | | | | |")
               mutator_rows+=("| \`${package}\` | unavailable | | | | | |")
               continue
             fi
 
-            IFS=$'\t' read -r efficacy mcover killed lived not_covered \
+            IFS=$'\t' read -r efficacy killed lived not_covered \
               logical bitwise bwassign assignments loopctrl self_assign <<<"${metrics}"
 
-            advisory_mutants=$((advisory_mutants + logical + bitwise + bwassign + assignments + loopctrl + self_assign))
-            headline_rows+=("$(awk -v p="${package}" -v e="${efficacy}" -v f="${floor}" \
-              -v c="${mcover}" -v k="${killed}" -v l="${lived}" -v n="${not_covered}" \
-              'BEGIN { printf "| `%s` | %.2f%% | %.2f%% | %+.2f | %.2f%% | %d | %d | %d |", p, e, f, e - f, c, k, l, n }')")
+            mutant_count=$((logical + bitwise + bwassign + assignments + loopctrl + self_assign))
+            advisory_mutants=$((advisory_mutants + mutant_count))
+
+            # Same guard the gating job's own script carries: mutants that
+            # all TIMED OUT leave killed+lived at zero and
+            # Gremlins scores efficacy 0.00 rather than declining to score.
+            # NOT COVERED plays no part in that ratio (Gremlins computes
+            # efficacy as killed/(killed+lived)), so a package that is all
+            # NOT COVERED also has killed+lived at zero and must trip this
+            # guard the same way; folding not_covered into the sum would let
+            # that case fall through and print the 0.00 as measured.
+            # Unmeasured is not the same as zero, so say unmeasured.
+            if [ "${mutant_count}" -gt 0 ] && [ "$((killed + lived))" -eq 0 ]; then
+              echo "advisory: ${name} produced ${mutant_count} mutants with no KILLED or LIVED verdict; check the TIMED OUT and NOT COVERED counts"
+              # shellcheck disable=SC2016  # the backticks are literal markdown
+              headline_rows+=("$(printf '| `%s` | %d | %d | %d | %d | unmeasured |' \
+                "${package}" "${mutant_count}" "${killed}" "${lived}" "${not_covered}")")
+              # shellcheck disable=SC2016  # the backticks are literal markdown
+              mutator_rows+=("$(printf '| `%s` | %d | %d | %d | %d | %d | %d |' \
+                "${package}" "${logical}" "${bitwise}" "${bwassign}" \
+                "${assignments}" "${loopctrl}" "${self_assign}")")
+              continue
+            fi
+            # shellcheck disable=SC2016  # the backticks are literal markdown
+            headline_rows+=("$(printf '| `%s` | %d | %d | %d | %d | %.2f%% |' \
+              "${package}" "${mutant_count}" "${killed}" "${lived}" "${not_covered}" "${efficacy}")")
             # shellcheck disable=SC2016  # the backticks are literal markdown
             mutator_rows+=("$(printf '| `%s` | %d | %d | %d | %d | %d | %d |' \
               "${package}" "${logical}" "${bitwise}" "${bwassign}" \
               "${assignments}" "${loopctrl}" "${self_assign}")")
-          done
+          done <<<"${PACKAGES}"
 
-          {
-            echo "### Mutation advisory: Gremlins' default-disabled mutators"
-            echo ""
-            echo "Advisory. These numbers gate nothing. The floors in the matrix were"
-            echo "measured with Gremlins' 5 default mutators; this run adds the 6 it"
-            echo "disables, so a negative delta is the cost of enabling them, not a"
-            echo "regression in the tests."
-            echo ""
-            echo "| Package | Efficacy | Gating floor | Delta | Mutator coverage | Killed | Lived | Not covered |"
-            echo "|---|---|---|---|---|---|---|---|"
-            printf '%s\n' "${headline_rows[@]}"
-            echo ""
-            echo "Mutants discovered per advisory mutator type:"
-            echo ""
-            echo "| Package | invert-logical | invert-bitwise | invert-bwassign | invert-assignments | invert-loopctrl | remove-self-assignments |"
-            echo "|---|---|---|---|---|---|---|"
-            printf '%s\n' "${mutator_rows[@]}"
-          } >>"$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "${headline_rows[@]}" >mutation-advisory-headline.txt
+          printf '%s\n' "${mutator_rows[@]}" >mutation-advisory-mutators.txt
 
           if [ "${advisory_mutants}" -eq 0 ]; then
             echo "advisory: the 6 default-disabled mutators produced no mutants at all" >&2
@@ -619,17 +976,188 @@ jobs:
           echo "advisory: ${advisory_mutants} mutants came from the default-disabled mutators"
         env:
           GOFLAGS: ""
+          PACKAGES: ${{ matrix.packages }}
 
-      - name: Upload advisory mutation reports
+      - name: Upload advisory rows and reports
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
-          name: mutation-advisory-${{ github.run_id }}
+          name: mutation-advisory-${{ matrix.group }}-${{ github.run_id }}
           path: |
             mutation-advisory-*.txt
             mutation-advisory-*.json
           if-no-files-found: warn
           retention-days: 30
+
+  # The mutation-advisory matrix above writes its rows to a file instead of
+  # $GITHUB_STEP_SUMMARY, because each leg only has one group's worth of
+  # them. This job downloads every leg's rows and writes the one combined
+  # table, the same two tables the single job used to write directly, so the
+  # advisory reader sees one summary regardless of how many legs produced it.
+  #
+  # It runs no Go, no Gremlins and nothing from the workspace beyond the rows
+  # it downloads: same PW-5.5 shape as the `history` job above, minus the
+  # write scope, because this job never pushes anything back to the repo.
+  mutation-advisory-summary:
+    name: "Quality: Gremlins advisory mutators summary"
+    needs: mutation-advisory
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c  # v2.21.0
+        with:
+          egress-policy: block
+          # Same set as the ratchet job above: a checkout-free download of
+          # this run's own artifacts, nothing else.
+          allowed-endpoints: >
+            api.github.com:443
+            github.com:443
+            results-receiver.actions.githubusercontent.com:443
+            *.actions.githubusercontent.com:443
+            *.blob.core.windows.net:443
+
+      - name: Download the advisory rows
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: mutation-advisory-*-${{ github.run_id }}
+          path: rows
+
+      - name: Combine and publish the advisory table
+        env:
+          # One line per package in the mutation-advisory matrix above,
+          # group|package, so a leg that produced no artifact still gets an
+          # explicit row instead of silently vanishing from the table.
+          # scripts/mutation-config.test.mjs cross-checks this list against
+          # that matrix's own groups and packages.
+          ADVISORY_GROUP_PACKAGES: |
+            server|./internal/server
+            edge|./internal/edge
+            generic|./internal/generic
+            misc-a|./internal/adapter
+            misc-a|./internal/adapter/drydock
+            misc-a|./internal/auth
+            misc-a|./internal/audit
+            misc-b|./internal/docker
+            misc-b|./internal/mcp
+            misc-b|./internal/metrics
+            misc-c|./cmd/portwing
+            misc-c|./internal/banner
+            misc-c|./internal/config
+            misc-c|./internal/log
+            misc-c|./internal/pool
+            misc-c|./internal/protocol
+          # PW-6.8: one line per advisory leg, group|floor, mirroring the
+          # matrix.include `floor:` field above. Duplicated for the same
+          # reason ADVISORY_GROUP_PACKAGES is: this job runs after the
+          # matrix and has no context left to read it from.
+          # scripts/mutation-config.test.mjs cross-checks this against the
+          # advisory matrix's own floors.
+          ADVISORY_GROUP_FLOORS: |
+            server|93
+            edge|80
+            generic|81
+            misc-a|92
+            misc-b|92
+            misc-c|90
+        run: |
+          set -euo pipefail
+
+          # A leg killed before it could upload (the runner's CPU shutdown
+          # signal, PW-6.8's own comment above) leaves no rows file for its
+          # group, and `cat ... || true` below would read that silently: the
+          # summary renders as complete with one group just missing. Every
+          # expected group is checked here, and each package in a missing
+          # group gets an explicit row instead of vanishing.
+          declare -A group_present=()
+          missing_groups=()
+          missing_headline_rows=()
+          missing_mutator_rows=()
+
+          while IFS='|' read -r group package; do
+            [ -n "${group}" ] || continue
+            if [ -z "${group_present[${group}]:-}" ]; then
+              if compgen -G "rows/mutation-advisory-${group}-*/mutation-advisory-headline.txt" >/dev/null; then
+                group_present[${group}]="yes"
+              else
+                group_present[${group}]="no"
+                missing_groups+=("${group}")
+              fi
+            fi
+            if [ "${group_present[${group}]}" = "no" ]; then
+              missing_headline_rows+=("| \`${package}\` | missing (leg produced no artifact) | | | | |")
+              missing_mutator_rows+=("| \`${package}\` | missing | missing | missing | missing | missing | missing |")
+            fi
+          done <<<"${ADVISORY_GROUP_PACKAGES}"
+
+          # PW-6.8: each present leg's headline rows already carry killed and
+          # lived per package (this job never re-runs Gremlins); this sums
+          # them per group and compares the sum's efficacy on the 6 extra
+          # mutators against the floor measured in run 33901506579. A miss is
+          # a ::warning::, never a failing exit: this job stays advisory the
+          # same way the legs above do, and the missing-group check below is
+          # the only thing in this job allowed to fail it.
+          while IFS='|' read -r group floor; do
+            [ -n "${group}" ] || continue
+            [ "${group_present[${group}]:-no}" = "yes" ] || continue
+            killed_sum=0
+            lived_sum=0
+            while IFS='|' read -r _ _ killed lived _ _; do
+              killed="${killed// /}"
+              lived="${lived// /}"
+              case "${killed}" in ''|*[!0-9]*) continue ;; esac
+              case "${lived}" in ''|*[!0-9]*) continue ;; esac
+              killed_sum=$((killed_sum + killed))
+              lived_sum=$((lived_sum + lived))
+            done < <(sed 's/^|//;s/|$//' rows/mutation-advisory-"${group}"-*/mutation-advisory-headline.txt)
+            total=$((killed_sum + lived_sum))
+            if [ "${total}" -gt 0 ]; then
+              efficacy="$(awk -v k="${killed_sum}" -v t="${total}" 'BEGIN { printf "%.2f", (k / t) * 100 }')"
+              if awk -v e="${efficacy}" -v f="${floor}" 'BEGIN { exit !(e < f) }'; then
+                echo "::warning::advisory group ${group} measured ${efficacy}% efficacy on the 6 extra mutators, below its floor of ${floor}%"
+              fi
+            fi
+          done <<<"${ADVISORY_GROUP_FLOORS}"
+
+          {
+            echo "### Mutation advisory: Gremlins' default-disabled mutators"
+            echo ""
+            echo "Advisory. These numbers gate nothing. Each leg runs ONLY the 6"
+            echo "mutator types Gremlins disables by default; the gating matrix above"
+            echo "already measures the 5 it enables, so efficacy here is efficacy"
+            echo "against those 6 extra mutators alone, not against the gating floor."
+            echo ""
+            echo "| Package | Extra mutants | Killed | Lived | Not covered | Efficacy on extra mutators |"
+            echo "|---|---|---|---|---|---|"
+            cat rows/*/mutation-advisory-headline.txt 2>/dev/null || true
+            if [ "${#missing_headline_rows[@]}" -gt 0 ]; then
+              printf '%s\n' "${missing_headline_rows[@]}"
+            fi
+            echo ""
+            echo "Mutants discovered per advisory mutator type:"
+            echo ""
+            echo "| Package | invert-logical | invert-bitwise | invert-bwassign | invert-assignments | invert-loopctrl | remove-self-assignments |"
+            echo "|---|---|---|---|---|---|---|"
+            cat rows/*/mutation-advisory-mutators.txt 2>/dev/null || true
+            if [ "${#missing_mutator_rows[@]}" -gt 0 ]; then
+              printf '%s\n' "${missing_mutator_rows[@]}"
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"
+
+          # A missing group is the same green-means-nothing failure PW-6.1
+          # was about: this job runs nothing but the download and the render,
+          # so failing it here is safe and is the only place left that can
+          # notice a leg never uploaded.
+          if [ "${#missing_groups[@]}" -gt 0 ]; then
+            echo "::error::advisory legs produced no artifact for group(s): ${missing_groups[*]}" >&2
+            exit 1
+          fi
 
   # PW-6.1: the gate this workflow depends on silently stopped gating, and
   # every job stayed green while five packages measured below their floor.

@@ -75,6 +75,7 @@ The nonce LRU cache (capacity controlled by `NONCE_LRU_SIZE`, default 10,000) tr
 
 - **Minimal attack surface**: static binary, three direct dependencies, stdlib crypto only, Wolfi OS base image with no package manager.
 - **Supply chain**: SHA-pinned GitHub Actions with harden-runner on every job, weekly govulncheck/grype/gosec scans, OpenSSF Scorecard, cosign-signed images, SLSA Build L2 provenance, per-archive CycloneDX SBOMs, and a container-image SBOM attestation on every release.
+- **Published-image rescan**: every Monday, Grype rescans the currently published GHCR release image (the latest non-prerelease tag, both `linux/amd64` and `linux/arm64`) at the same HIGH/CRITICAL cutoff and `.grype.yaml` suppressions used at release time, so a CVE disclosed after a release ships doesn't go unnoticed until the next one. A failing scan fails the workflow run and uploads SARIF results to the Security tab; the lane runs on the Monday cron and on manual dispatch, and isn't wired into the automated quality-lane tracking-issue notifier, so a red run has to be caught in the Actions tab.
 
 ## What to include in a report
 

@@ -357,6 +357,8 @@ In addition to host/container metrics, the Prometheus endpoints (`/_portwing/met
 
 Its relationship to `ErrHostMetricsUnsupported`/`portwing_host_metrics_supported` (which cover the `/proc`-derived fields) is one-directional, not independent: a broken data root leaves the `/proc` fields intact, but a missing `/proc` short-circuits collection before `statfs` runs, so no disk figure is reported on a host without procfs even though `statfs` would have worked there.
 
+**Failed collection.** When collection fails outright — `ErrHostMetricsUnsupported`, i.e. a host with no procfs — the tick emits an `error` frame with `code` `host-metrics-unavailable` and the collection error as its `message`, on the same 30-second cadence as the `metrics` frame it replaces, and with no `requestId` because the tick answers no request. It does **not** emit a `metrics` frame: collection returns a partially populated snapshot alongside the error, and a zero-filled `metrics` frame is indistinguishable from a real reading of a completely idle host. This is the wire's counterpart to `portwing_host_metrics_supported 0` on the Prometheus endpoints and to the MCP `host_metrics` tool's error: the failing tick carries something instead of nothing, so a controller that reads `code` off a `requestId`-less `error` frame can tell an unsupported host from a supported one that has stopped reporting. Reading it is opt-in, and no controller does yet. Drydock's edge adapter returns early on any `error` frame that carries no `requestId`, so the frame arrives and is dropped with no log and no state change; that same guard is what makes the frame safe to send unnegotiated, since no controller can mis-correlate it with a pending request.
+
 | Metric | Source | Platform |
 |--------|--------|----------|
 | CPU usage | `/proc/stat` (delta-based) | Linux |
@@ -562,6 +564,13 @@ looping forever. Everything else (timing/capacity conditions like
 `agent-already-connected`, and any unrecognized code) is retried with backoff.
 This code set mirrors the drydock controller and is not itself a versioned wire
 contract, so an unrecognized code defaults to retry rather than a hard stop.
+
+Per-connection state does not survive the drop. Exec sessions are closed and
+`bodyStream: true` reassemblies still waiting for their `stream_end` are
+dropped, releasing their `requestId`s, because the frames that would have
+completed them died with the connection. A controller may therefore retry a
+streamed request under the same `requestId` immediately after reconnecting
+without drawing the duplicate-`requestId` rejection of §3.3.
 
 ### 13.2 Keepalive
 

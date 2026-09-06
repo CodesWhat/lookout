@@ -415,6 +415,11 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
+          # The contract script checks that every vX.Y.Z tag still has its
+          # CHANGELOG heading and fails hard when it sees no tags at all, so
+          # a shallow clone (which carries none) would fail this job on every
+          # PR. Full depth brings the tags along.
+          fetch-depth: 0
 
       # Pure grep/awk/shasum over files already in the checkout, so the only
       # network this job needs is the clone itself.

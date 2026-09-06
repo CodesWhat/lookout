@@ -40,7 +40,7 @@ agent's privilege and attack surface without improving its core job.
 “Not documented” means the reviewed primary documentation did not establish
 the capability. It is intentionally different from a definitive “no.”
 
-| Capability | Portwing v0.9.13 | Portainer Agent | Komodo Periphery | Arcane Agent | Hawser |
+| Capability | Portwing v0.9.14 | Portainer Agent | Komodo Periphery | Arcane Agent | Hawser |
 | --- | --- | --- | --- | --- | --- |
 | Inbound mode | HTTP/S with Docker API proxy and higher-level endpoints | Classic Agent | Core-to-Periphery supported | Direct mode on agent port | HTTP/S Docker API proxy |
 | Outbound / NAT mode | Persistent WebSocket to Drydock; no inbound port | Edge Agent reverse tunnel | Bidirectional WebSocket; Periphery can dial Core | Edge mode over gRPC or WebSocket | Persistent WebSocket to Dockhand |

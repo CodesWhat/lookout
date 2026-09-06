@@ -183,6 +183,24 @@ func TestWriteContainerPrometheusNoData(t *testing.T) {
 			},
 		},
 		{
+			// Kills the INVERT_LOGICAL mutant at runtime_prom.go:95:16
+			// (`err != nil || len(containers) == 0` turned into `&&`). A list
+			// error alongside a non-empty containers slice whose stats are
+			// fully populated is the case that discriminates AND from OR:
+			// real code short-circuits true on err != nil alone and returns
+			// immediately with no output. The mutant requires len==0 too;
+			// since it is not, the mutant proceeds to fetch stats and emit a
+			// clean, complete metrics line for c1 instead of nothing.
+			name: "list error with usable container data",
+			client: &dockerMetricsFake{
+				listErr:    errors.New("list unavailable"),
+				containers: []docker.ContainerJSON{{ID: "c1"}},
+				stats: map[string]*docker.ContainerStatsResponse{
+					"c1": mustContainerStats(t, `{"cpu_stats":{"cpu_usage":{"total_usage":1000000000}},"memory_stats":{"usage":100,"limit":200},"networks":{}}`),
+				},
+			},
+		},
+		{
 			name:   "empty list",
 			client: &dockerMetricsFake{},
 		},
@@ -204,6 +222,54 @@ func TestWriteContainerPrometheusNoData(t *testing.T) {
 				t.Fatalf("unexpected metrics without usable data:\n%s", b.String())
 			}
 		})
+	}
+}
+
+// TestWriteContainerPrometheusEmitsMemoryLimitAfterZeroLimit verifies the
+// container_spec_memory_limit_bytes emission loop keeps going past a
+// zero-limit result to emit a later, valid nonzero-limit result, killing the
+// INVERT_LOOPCTRL mutant at runtime_prom.go:182:4 (`continue` -> `break`).
+// The first container's memory_stats.limit is 0; the second's is nonzero.
+// `valid` preserves container/index order (results[idx] is written by
+// index, and valid iterates results in index order regardless of goroutine
+// scheduling), so the zero-limit result comes first. Real code's `continue`
+// skips only that result and still reaches and emits the second, nonzero
+// result's line. The mutant's `break` stops the entire loop at the first
+// (zero-limit) result, permanently missing the second result's line even
+// though it is valid.
+func TestWriteContainerPrometheusEmitsMemoryLimitAfterZeroLimit(t *testing.T) {
+	t.Parallel()
+
+	zeroLimitStats := mustContainerStats(t, `{
+		"cpu_stats":{"cpu_usage":{"total_usage":1000000000}},
+		"memory_stats":{"usage":100,"limit":0},
+		"networks":{}
+	}`)
+	hasLimitStats := mustContainerStats(t, `{
+		"cpu_stats":{"cpu_usage":{"total_usage":1000000000}},
+		"memory_stats":{"usage":200,"limit":4096},
+		"networks":{}
+	}`)
+	client := &dockerMetricsFake{
+		containers: []docker.ContainerJSON{
+			{ID: "zero-limit"},
+			{ID: "has-limit"},
+		},
+		stats: map[string]*docker.ContainerStatsResponse{
+			"zero-limit": zeroLimitStats,
+			"has-limit":  hasLimitStats,
+		},
+	}
+
+	var b strings.Builder
+	metrics.WriteContainerPrometheus(context.Background(), &b, client, noEscape)
+	body := b.String()
+
+	if !strings.Contains(body, `container_spec_memory_limit_bytes{id="has-limit",name="has-limit",image=""} 4096`) {
+		t.Fatalf("missing memory limit line for the container after the zero-limit one:\n%s", body)
+	}
+	if strings.Contains(body, `container_spec_memory_limit_bytes{id="zero-limit"`) {
+		t.Fatalf("zero memory limit should be omitted:\n%s", body)
 	}
 }
 

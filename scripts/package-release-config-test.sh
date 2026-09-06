@@ -256,6 +256,52 @@ if ! echo "${release_version}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' ||
 	previous_version="unresolved"
 fi
 
+# A prep PR can rename an already-released heading instead of inserting a
+# fresh one above it (portwing#283: v0.9.12's heading was edited in place to
+# read v0.9.13, so every v0.9.12 entry now reads as if it shipped in
+# v0.9.13). A missing release_version/previous_version pair above cannot
+# catch that, because the rename still leaves exactly two dated headings in
+# place. Check every locally known "vX.Y.Z" tag instead: each one names a
+# release that already happened, so CHANGELOG.md must still carry that
+# heading. This only sees tags the checkout actually has, which is why it
+# runs locally on pre-push as well as in CI. The Release Contract job in
+# ci-verify.yml and release-cut.yml check out with fetch-depth: 0 so the tags
+# come along, but the org's reusable GoReleaser gate runs this script from a
+# depth-1 clone that carries no tags at all. A shallow checkout therefore
+# says so and skips this one check, loudly, instead of passing vacuously or
+# failing every PR; a full checkout with no release tags is a hard failure,
+# because that shape can only be a broken clone. Releases
+# through v0.6.0 headed the section without a "v" prefix ("## [0.6.0]");
+# accept either form so this doesn't flag that older, still-correct
+# convention. The match is anchored to the start of the line and requires a
+# trailing "YYYY-MM-DD" date, so a heading-shaped substring inside prose or a
+# code fence (e.g. "see the old \`## [v0.6.0] -\` format") cannot stand in for
+# a real heading.
+if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+	release_tags="$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)"
+	if [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = "true" ] && [ -z "${release_tags}" ]; then
+		echo "SKIP: shallow checkout carries no release tags, so the tag-heading check did not run here; it runs in Release Contract, release-cut, and pre-push" >&2
+	elif [ -z "${release_tags}" ]; then
+		echo "FAIL: no release tags found in a full checkout" >&2
+		failures=$((failures + 1))
+	else
+		missing_tag_headings=""
+		for release_tag in ${release_tags}; do
+			unprefixed_tag="${release_tag#v}"
+			release_tag_regex="${release_tag//./\\.}"
+			unprefixed_tag_regex="${unprefixed_tag//./\\.}"
+			if ! grep -Eq "^## \[${release_tag_regex}\] - [0-9]{4}-[0-9]{2}-[0-9]{2}\$" CHANGELOG.md &&
+				! grep -Eq "^## \[${unprefixed_tag_regex}\] - [0-9]{4}-[0-9]{2}-[0-9]{2}\$" CHANGELOG.md; then
+				missing_tag_headings="${missing_tag_headings} ${release_tag}"
+			fi
+		done
+		if [ -n "${missing_tag_headings}" ]; then
+			echo "FAIL: CHANGELOG.md has no '## [vX.Y.Z] - YYYY-MM-DD' heading for tag(s):${missing_tag_headings} (a prep PR likely renamed an existing heading instead of inserting a new one; restore the missing section(s) with their original entries)" >&2
+			failures=$((failures + 1))
+		fi
+	fi
+fi
+
 require_text ".goreleaser.yml" "${public_site}/" "published package metadata must use the public website"
 require_text "README.md" "${public_site}/docs/installation" "the repository landing page must link the public package guide"
 require_text "docs/src/lib/site-config.ts" 'domain: "portwing.codeswhat.com"' "documentation metadata must use the public website"
@@ -315,11 +361,27 @@ require_current_release_examples "docs/content/docs/security-model.mdx" \
 # catches a half-finished bump: an rpm example sitting next to a checked deb
 # example, a sample JSON payload, an attestation command in a doc. Enumerating
 # surfaces only ever finds the surfaces someone remembered to enumerate.
-if git grep -n -F -- "$previous_version" -- \
+# A "since v<previous>" callout in README.md is the one deliberate exception:
+# a docs-only patch's release note (README's [!NOTE] block, v0.9.13) names the
+# prior release on purpose to say nothing binary changed since it, which is
+# not a forgotten bump. The exemption is scoped to that one file and that
+# exact phrase, so the same stale literal sitting in any other matched file -
+# an rpm example, a doc's attestation command - still fails; a broader
+# file-wide exemption would let a stale version hide behind an unrelated
+# "since v<previous>" line anywhere in the repo.
+stale_previous_version_matches="$(git grep -n -F -- "$previous_version" -- \
 	'*.md' '*.mdx' '*.ts' '*.tsx' '*.yaml' '*.yml' '*.txt' \
 	':(exclude)CHANGELOG.md' \
-	':(exclude)scripts/package-release-config-test.sh'; then
+	':(exclude)scripts/package-release-config-test.sh' || true)"
+if [ -n "${stale_previous_version_matches}" ]; then
+	stale_previous_version_matches="$(awk -v exempt="since v${previous_version}" '
+		index($0, "README.md:") == 1 && index($0, exempt) { next }
+		{ print }
+	' <<<"${stale_previous_version_matches}")"
+fi
+if [ -n "${stale_previous_version_matches}" ]; then
 	echo "FAIL: stale references to v${previous_version} remain outside the changelog" >&2
+	echo "${stale_previous_version_matches}" >&2
 	failures=$((failures + 1))
 fi
 

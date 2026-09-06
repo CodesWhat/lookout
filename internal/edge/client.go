@@ -20,6 +20,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -102,6 +103,12 @@ var maxStreamedRequestBodyBytes int64 = 1024 * 1024 * 1024 // 1 GB
 // the real 30s.
 var requestBodyStreamIdleTimeout = 30 * time.Second
 
+// reconnectWait is the timer the reconnect-retry loop waits on between
+// attempts. A var, not a direct time.After call, so tests can observe the
+// exact backoff delay sequence deterministically instead of inferring it
+// from how many reconnects fit in a wall-clock window.
+var reconnectWait = time.After
+
 type outboundQueueState struct {
 	mu     sync.Mutex
 	bytes  int64
@@ -138,6 +145,18 @@ type dockerAPI interface {
 	ResizeExec(ctx context.Context, execID string, cols, rows int) error
 }
 
+// hostCollector is the *metrics.Collector subset sendMetrics depends on,
+// defined on the consumer side like dockerAPI above. *metrics.Collector
+// satisfies it structurally.
+//
+// The seam is what makes the failed-collection branch testable at all:
+// Collect's only error is a missing /proc, which cannot be arranged on the
+// Linux hosts that run CI, and the field's concrete type meant the branch had
+// no unit coverage anywhere.
+type hostCollector interface {
+	Collect() (*metrics.HostMetrics, error)
+}
+
 // edgeMessageSender wraps the edge Client to implement adapter.MessageSender.
 type edgeMessageSender struct {
 	client *Client
@@ -163,7 +182,7 @@ type Client struct {
 	dockerClient dockerAPI
 	adapter      adapter.EdgeAdapter
 	compose      *docker.ComposeManager
-	collector    *metrics.Collector
+	collector    hostCollector
 	metrics      *metrics.Registry
 	auditor      *audit.Logger
 	startTime    time.Time
@@ -224,8 +243,39 @@ type Client struct {
 	dispatchingBodies map[uint64]int64
 	nextDispatchSeq   uint64
 
+	// metricsCollectFailing records whether the last host-metrics collection
+	// failed, so sendMetrics can log the transitions instead of repeating one
+	// warning every heartbeat forever on a host that can never report them.
+	// It tracks the collection, not the connection, so a reconnect does not
+	// re-announce a condition that never changed. Atomic because Swap is what
+	// makes the transition log fire exactly once, which holds even if a caller
+	// is ever added off the write pump.
+	metricsCollectFailing atomic.Bool
+
 	// Health server for Docker HEALTHCHECK.
 	healthServer *http.Server
+	// healthServerDone is closed by the ListenAndServe goroutine started in
+	// startHealthServer once it has returned and performed its post-Shutdown
+	// error check (and logged, if warranted). It gives callers — chiefly
+	// tests asserting on that log — a happens-before point instead of
+	// racing the goroutine with a poll loop. Each startHealthServer call
+	// creates its own channel and hands it to its own goroutine, so a
+	// second start cannot double-close or leave an earlier channel
+	// unclosed.
+	healthServerDone chan struct{}
+	// healthListenAddr holds the net.Addr the health server's BaseContext
+	// hook captured once its listener bound. It lets callers — chiefly
+	// tests using an OS-assigned port ("0") — discover the real bound
+	// address instead of racing a separate allocate/close/rebind, the same
+	// pattern internal/server.Server.Addr uses for the main HTTP server.
+	//
+	// A pointer, not an atomic.Value, because startHealthServer has to be
+	// able to reset it: BaseContext only runs on a successful listen, so a
+	// restart that fails to bind would otherwise leave the previous server's
+	// address readable and break HealthAddr's nil-until-bound contract.
+	// atomic.Value cannot store a nil interface, which is what that reset
+	// needs to write.
+	healthListenAddr atomic.Pointer[net.Addr]
 }
 
 // pendingRequestBody accumulates the stream/stream_end frames that follow a
@@ -241,6 +291,11 @@ type pendingRequestBody struct {
 	// already elapsed, so a timeout callback can still be in flight when a
 	// chunk re-arms the timer; each callback carries the gen it was armed
 	// with and no-ops when it no longer matches. Guarded by pendingBodiesMu.
+	//
+	// It separates armings of this entry and nothing more. Every entry
+	// starts at 0, so it cannot separate this entry from a later one
+	// registered under the same RequestID; that is the entry-pointer half of
+	// failPendingBody's match.
 	gen uint64
 }
 
@@ -326,7 +381,7 @@ func (c *Client) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(waitDuration):
+		case <-reconnectWait(waitDuration):
 		}
 
 		// Exponential backoff.
@@ -388,6 +443,31 @@ func (c *Client) connect(ctx context.Context) (bool, error) {
 	c.connMu.Lock()
 	c.conn = conn
 	c.connMu.Unlock()
+
+	// Cancelling ctx has to reach the socket, not only the loops that poll it.
+	// readPump checks ctx once per iteration, at the top; once it is inside
+	// conn.ReadMessage the cancel is invisible to it until the controller
+	// closes the socket or the steady-state read deadline expires — and that
+	// deadline floors at 60 seconds (readDeadline), which outlives both
+	// Docker's and Kubernetes' default SIGKILL grace. A healthy controller
+	// with nothing to say is exactly the case that hits it. Closing the conn
+	// is what makes the blocked read fail, so SIGTERM unwinds in milliseconds
+	// instead of up to a minute.
+	//
+	// The read error that close produces is not a reconnect signal: Run tests
+	// ctx.Err() before it looks at connect's error, so it returns ctx.Err()
+	// without reaching IncReconnect.
+	//
+	// The closure captures this conn, not c.conn, so even a callback that ran
+	// late could only close the generation it was registered for and never a
+	// replacement the reconnect loop has since installed. stopOnCancel is
+	// still deferred, because an AfterFunc that is never stopped stays
+	// registered on ctx for as long as the agent runs and the reconnect loop
+	// would add one per attempt. Nothing is logged here: the close is expected
+	// and gorilla's Close only forwards the net.Conn's error, which the
+	// teardown path below reports already.
+	stopOnCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopOnCancel()
 
 	// Send hello.
 	if err := c.sendHello(ctx); err != nil {
@@ -506,7 +586,7 @@ func (c *Client) connect(ctx context.Context) (bool, error) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		c.sendPump(pumpCtx, conn, sendCh)
+		c.sendPump(pumpCtx, ctx, conn, sendCh)
 	}()
 
 	// Let adapter handle initial sync (container sync, component sync, etc.).
@@ -539,6 +619,10 @@ func (c *Client) connect(ctx context.Context) (bool, error) {
 	// their Docker exec conns) don't leak across reconnects; the next
 	// connection starts with a clean exec table.
 	c.closeAllExecSessions()
+	// Same for the streamed request bodies still reassembling: their
+	// stream_end died with the connection, so the next one starts with a
+	// clean pending table instead of rejecting the controller's retries.
+	c.failAllPendingBodies()
 
 	// Close connection.
 	c.connMu.Lock()
@@ -877,11 +961,16 @@ func (c *Client) registerPendingBody(req protocol.RequestMessage, target outboun
 		return
 	}
 	pb := &pendingRequestBody{req: req, target: target}
-	// gen 0 is the arming generation for this first timer; appendPendingBody
-	// bumps it on every re-arm so a callback that already fired can tell it
-	// lost the race and must not fail a live upload.
+	// The callback names the entry it was armed for, not just the RequestID
+	// it is filed under: the ID is freed and re-registered while a callback
+	// for it may already be running (the teardown drain then the controller's
+	// retry, or stream_end then a second request under the same ID), and the
+	// successor starts at gen 0 exactly like this one. gen 0 is this first
+	// timer's arming generation; appendPendingBody bumps it on every re-arm
+	// so a callback that already fired can tell it lost the race and must not
+	// fail a live upload.
 	pb.timer = time.AfterFunc(requestBodyStreamIdleTimeout, func() {
-		c.failPendingBody(req.RequestID, 0)
+		c.failPendingBody(req.RequestID, pb, 0)
 	})
 	c.pendingBodies[req.RequestID] = pb
 	c.pendingBodiesMu.Unlock()
@@ -952,7 +1041,7 @@ func (c *Client) appendPendingBody(requestID, encodedChunk string) bool {
 	gen := pb.gen
 	pb.timer.Stop()
 	pb.timer = time.AfterFunc(requestBodyStreamIdleTimeout, func() {
-		c.failPendingBody(requestID, gen)
+		c.failPendingBody(requestID, pb, gen)
 	})
 	c.pendingBodiesMu.Unlock()
 	return true
@@ -1080,15 +1169,36 @@ func (c *Client) dispatchStreamedBody(ctx context.Context, req protocol.RequestM
 
 // failPendingBody is the idle-timeout callback for a pending body: it
 // removes the entry and reports the timeout to the controller as a
-// TypeError, but only when gen still matches the generation the firing timer
-// was armed with. A mismatch means a chunk re-armed the timer after this
-// callback had already fired, so the upload is alive and this firing must be
-// dropped. (The size-cap and decode-failure paths clean up inline in
+// TypeError, but only when the entry filed under requestID is still the one
+// this callback was armed for (want), at the generation it was armed with
+// (gen).
+//
+// Both halves of that match are needed, and they cover different races.
+//
+// The entry pointer is what stops a fired callback from killing a successor.
+// time.Timer.Stop does not wait for a callback that has already started, so
+// one can be parked on this mutex while its entry is removed and the same
+// RequestID is registered again: failAllPendingBodies then the controller's
+// retry on the new connection is the reachable case, and finishPendingBody or
+// appendPendingBody's cleanup paths followed by a re-use of the ID is the
+// same shape within one connection. The successor is a fresh entry at gen 0,
+// so requestID and gen alone match it and this callback would delete a live
+// upload and time it out on the wire. Comparing the entry instead cannot
+// match a successor: a successor is always a different allocation, and the
+// closure holds want alive, so its address is not recycled underneath the
+// comparison.
+//
+// The generation covers what identity cannot: the same entry re-arming its
+// timer on every chunk. Reset cannot recall an AfterFunc whose deadline
+// already elapsed, so a callback queued before the chunk landed still points
+// at the live entry and must drop its firing.
+//
+// (The size-cap and decode-failure paths clean up inline in
 // appendPendingBody.)
-func (c *Client) failPendingBody(requestID string, gen uint64) {
+func (c *Client) failPendingBody(requestID string, want *pendingRequestBody, gen uint64) {
 	c.pendingBodiesMu.Lock()
 	pb, ok := c.pendingBodies[requestID]
-	if !ok || pb.gen != gen {
+	if !ok || pb != want || pb.gen != gen {
 		c.pendingBodiesMu.Unlock()
 		return
 	}
@@ -1369,12 +1479,51 @@ func (c *Client) writePump(ctx context.Context) {
 	}
 }
 
-// sendMetrics collects and sends host metrics.
+// metricsUnavailableCode is the error frame's `code` when host metrics could
+// not be collected — the wire's marker for "this agent is alive and cannot
+// report these numbers", as distinct from an agent that has gone quiet.
+const metricsUnavailableCode = "host-metrics-unavailable"
+
+// sendMetrics collects and sends host metrics, and reports a failed collection
+// instead of swallowing it.
+//
+// Collect hands back a partially populated snapshot alongside its error, and
+// forwarding that is exactly what ErrHostMetricsUnsupported exists to prevent:
+// a zero-filled metrics frame is indistinguishable from a real reading of a
+// completely idle host. The other two surfaces both answer a failed collection
+// with an explicit marker rather than zeros — Prometheus omits the host series
+// behind `portwing_host_metrics_supported 0`, and the MCP host_metrics tool
+// returns an error naming the missing procfs — so this one answers with the
+// wire's own error frame (SPEC 3.3, 8), carrying metricsUnavailableCode.
+// Staying silent, which is what it used to do, left the controller unable to
+// tell an unsupported host from a dead agent.
+//
+// The frame keeps the metrics cadence: one per heartbeat, same as the metrics
+// frame it stands in for, so the signal is periodic rather than one-shot. The
+// log does not: the level marks the transition, because the failure is
+// permanent on a host with no procfs and warning every 30 seconds forever
+// would bury the tick that actually changed something. First failure (at
+// startup, or the first after a recovery) warns, repeats while failed drop to
+// debug, and a recovery says so once at info. Swap reports the previous state,
+// so exactly one call logs each transition.
 func (c *Client) sendMetrics() {
 	m, err := c.collector.Collect()
 	if err != nil {
-		slog.Debug("metrics collection failed", "error", err)
+		if c.metricsCollectFailing.Swap(true) {
+			slog.Debug("metrics collection failed", "error", err)
+		} else {
+			slog.Warn("metrics collection failed", "error", err)
+		}
+		// Best-effort, like the metrics send below. Sent on every failed tick
+		// whatever the log level, so the controller's signal stays periodic.
+		_ = c.sendTypedMessage(protocol.TypeError, protocol.ErrorMessage{
+			Message: err.Error(),
+			Code:    metricsUnavailableCode,
+		})
 		return
+	}
+	if c.metricsCollectFailing.Swap(false) {
+		slog.Info("metrics collection recovered")
 	}
 	// Best-effort metrics send; connection loss surfaces on the read pump.
 	_ = c.sendTypedMessage(protocol.TypeMetrics, m)
@@ -1518,7 +1667,17 @@ func outboundEnvelopeBytes(env protocol.Envelope) int64 {
 // head-of-line-blocking every sender or stalling the read pump, and a write
 // that can't complete within writeWait evicts the connection rather than
 // blocking forever.
-func (c *Client) sendPump(ctx context.Context, conn *websocket.Conn, sendCh chan protocol.Envelope) {
+//
+// It takes two contexts because they answer different questions. ctx is the
+// per-connection pump context, and cancelling it is how a dropped tunnel
+// stops this pump. shutdownCtx is Run's own context, and its cancellation is
+// the agent exiting. Only the outer one can classify a write failure, and it
+// has to be the outer one: connect closes the conn from a context.AfterFunc
+// on cancel, and that callback runs on its own goroutine, so a write can fail
+// against the closed conn before the pump context has been cancelled. The
+// outer context's error is already set before any child cancellation starts,
+// which makes the check below race-free where a check on ctx would not be.
+func (c *Client) sendPump(ctx, shutdownCtx context.Context, conn *websocket.Conn, sendCh chan protocol.Envelope) {
 	c.connMu.Lock()
 	state := c.sendState
 	if c.sendCh != sendCh {
@@ -1543,6 +1702,13 @@ func (c *Client) sendPump(ctx context.Context, conn *websocket.Conn, sendCh chan
 			}
 			if err := conn.WriteJSON(env); err != nil {
 				state.release(env)
+				if shutdownCtx.Err() != nil {
+					// Shutdown closed the conn out from under this write.
+					// Nothing is wrong and there is no generation left to
+					// evict, so this neither warns nor calls failConn.
+					slog.Debug("websocket write abandoned, shutting down", "type", env.Type, "error", err)
+					return
+				}
 				slog.Warn("websocket write failed", "type", env.Type, "error", err)
 				c.failConn(conn, "write failed")
 				return
@@ -1573,6 +1739,53 @@ func (c *Client) closeAllExecSessions() {
 		}
 		return true
 	})
+}
+
+// failAllPendingBodies drops every streamed request body still reassembling
+// and releases its RequestID. It is closeAllExecSessions' sibling on the same
+// teardown path: both own per-connection state that the next connection must
+// not inherit.
+//
+// Without it a dropped tunnel leaves the entries registered with their idle
+// timers running, so the controller's retry of the same RequestID after
+// reconnect is answered with a duplicate-requestId rejection until
+// requestBodyStreamIdleTimeout expires — up to 30 seconds of a request that
+// can never succeed, on a connection that is otherwise healthy.
+//
+// Nothing goes on the wire. sendPump has already returned by the time teardown
+// runs, so its queue reports closed and every send would take the eviction
+// branch instead: a spurious "evicting controller connection" warning and a
+// second Close on the conn that connect is about to close anyway, per pending
+// body. closeAllExecSessions is silent for the same reason.
+//
+// Swapping the map out under the lock before touching any timer is what makes
+// this safe against a timeout callback racing it: failPendingBody looks the
+// entry up under the same lock, finds nothing, and returns without sending.
+// Stopping an already-fired timer is a no-op, so the two cannot double-fail
+// one request.
+//
+// The swap is not enough on its own once the controller reconnects, because
+// by then the table is not empty: the retry has registered a fresh entry
+// under the same RequestID, at the same gen 0 the drained one was armed at.
+// What keeps a callback parked since the old connection from deleting it is
+// that failPendingBody matches on the entry it was armed for, not on the
+// RequestID.
+func (c *Client) failAllPendingBodies() {
+	c.pendingBodiesMu.Lock()
+	dropped := c.pendingBodies
+	c.pendingBodies = nil
+	c.pendingBodiesMu.Unlock()
+
+	if len(dropped) == 0 {
+		return
+	}
+	for requestID, pb := range dropped {
+		pb.timer.Stop()
+		slog.Debug("dropping streamed request body: controller connection lost",
+			"request_id", applog.Sanitize(requestID))
+	}
+	slog.Warn("controller connection lost with streamed request bodies in flight",
+		"count", len(dropped))
 }
 
 // msEdge returns elapsed milliseconds since start as a float64.
@@ -1615,6 +1828,11 @@ func closeWebSocket(conn *websocket.Conn, context string) {
 // metrics server used by Docker, Kubernetes, and Prometheus.
 func (c *Client) startHealthServer() {
 	c.ensureOperationalState()
+	// Every call starts unbound. BaseContext below only fires once the
+	// listener is up, so without this a restart that cannot bind (the port
+	// taken in the gap, say) would leave the previous server's address in
+	// place and HealthAddr would hand out an address nothing is serving.
+	c.healthListenAddr.Store(nil)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1668,7 +1886,12 @@ func (c *Client) startHealthServer() {
 		fmt.Fprintf(&b, "# HELP portwing_uptime_seconds Seconds since the agent started.\n")
 		fmt.Fprintf(&b, "# TYPE portwing_uptime_seconds gauge\n")
 		fmt.Fprintf(&b, "portwing_uptime_seconds %g\n", time.Since(c.startTime).Seconds())
-		metrics.WriteHostPrometheus(&b, c.collector)
+		// The host series need the real collector's concrete type, which
+		// production always holds. A test-injected fake leaves them out, the
+		// same absence a nil collector produced before.
+		if hostCol, ok := c.collector.(*metrics.Collector); ok {
+			metrics.WriteHostPrometheus(&b, hostCol)
+		}
 		if dockerMetrics, ok := c.dockerClient.(metrics.DockerMetricsClient); ok {
 			metrics.WriteContainerPrometheus(r.Context(), &b, dockerMetrics, metrics.EscapeLabelValue)
 		}
@@ -1680,13 +1903,35 @@ func (c *Client) startHealthServer() {
 		Addr:              c.cfg.BindAddress + ":" + c.cfg.Port,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
+		// BaseContext runs once, right after the listener binds, which is
+		// the only hook stdlib gives us to learn the bound address without
+		// owning the listener ourselves.
+		BaseContext: func(ln net.Listener) context.Context {
+			addr := ln.Addr()
+			c.healthListenAddr.Store(&addr)
+			return context.Background()
+		},
 	}
 
+	done := make(chan struct{})
+	c.healthServerDone = done
 	go func() {
 		if err := c.healthServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slog.Warn("health server error", "error", err)
 		}
+		close(done)
 	}()
+}
+
+// HealthAddr returns the address the health server bound, or nil if it
+// hasn't bound one yet (or startHealthServer hasn't been called). It lets
+// callers — chiefly tests using an OS-assigned port ("0") — discover the
+// real bound address instead of racing a separate allocate/close/rebind.
+func (c *Client) HealthAddr() net.Addr {
+	if addr := c.healthListenAddr.Load(); addr != nil {
+		return *addr
+	}
+	return nil
 }
 
 func (c *Client) ensureOperationalState() {

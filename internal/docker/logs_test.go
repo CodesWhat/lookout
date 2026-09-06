@@ -209,3 +209,148 @@ type errReader struct {
 func (r errReader) Read([]byte) (int, error) {
 	return 0, r.err
 }
+
+// ---- decodeMultiplexedLogStream: maxLogFrameSize boundary ----
+
+// TestDecodeMultiplexedLogStream_FrameAtCapIsNotSkipped exercises the exact
+// boundary of the "size > maxLogFrameSize" check: a frame whose declared
+// size equals maxLogFrameSize must be read and emitted like any other frame,
+// not treated as oversized and skipped.
+func TestDecodeMultiplexedLogStream_FrameAtCapIsNotSkipped(t *testing.T) {
+	t.Parallel()
+
+	payload := bytes.Repeat([]byte{'A'}, maxLogFrameSize)
+	input := append(
+		dockerLogFrame(byte(ContainerLogStdout), payload),
+		dockerLogFrame(byte(ContainerLogStdout), []byte("second"))...,
+	)
+
+	var got [][]byte
+	err := decodeMultiplexedLogStream(bytes.NewReader(input), func(_ ContainerLogStream, p []byte) error {
+		got = append(got, append([]byte(nil), p...))
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("decodeMultiplexedLogStream: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("emit calls = %d, want 2 (a frame at exactly maxLogFrameSize must not be skipped)", len(got))
+	}
+	if len(got[0]) != maxLogFrameSize {
+		t.Fatalf("first payload length = %d, want %d", len(got[0]), maxLogFrameSize)
+	}
+	if string(got[1]) != "second" {
+		t.Fatalf("second payload = %q, want %q", got[1], "second")
+	}
+}
+
+// TestDecodeMultiplexedLogStream_OversizedFrameSkippedThenContinues exercises
+// the negation boundary of the "io.CopyN(...) err != nil" check on its
+// success side: when an oversized frame's payload is fully present, discard
+// must succeed silently (no emit for it) and decoding must continue onto the
+// next frame.
+func TestDecodeMultiplexedLogStream_OversizedFrameSkippedThenContinues(t *testing.T) {
+	t.Parallel()
+
+	oversized := dockerLogFrame(byte(ContainerLogStdout), bytes.Repeat([]byte{'B'}, maxLogFrameSize+1))
+	input := append(oversized, dockerLogFrame(byte(ContainerLogStderr), []byte("after"))...)
+
+	type call struct {
+		stream  ContainerLogStream
+		payload []byte
+	}
+	var got []call
+	err := decodeMultiplexedLogStream(bytes.NewReader(input), func(s ContainerLogStream, p []byte) error {
+		got = append(got, call{s, append([]byte(nil), p...)})
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("decodeMultiplexedLogStream: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("emit calls = %d, want 1 (oversized frame must be skipped, not emitted)", len(got))
+	}
+	if got[0].stream != ContainerLogStderr || string(got[0].payload) != "after" {
+		t.Fatalf("emit = %+v, want stderr %q", got[0], "after")
+	}
+}
+
+// TestDecodeMultiplexedLogStream_OversizedFrameTruncatedReturnsError is the
+// failure-side mirror of the test above: when an oversized frame's payload
+// is NOT fully present, the CopyN discard fails and decoding must return a
+// wrapped error rather than silently continuing.
+func TestDecodeMultiplexedLogStream_OversizedFrameTruncatedReturnsError(t *testing.T) {
+	t.Parallel()
+
+	header := dockerLogHeader(byte(ContainerLogStdout), maxLogFrameSize+100)
+	// Only a few bytes of the claimed oversized payload actually follow.
+	input := append(header, []byte("short")...)
+
+	err := decodeMultiplexedLogStream(bytes.NewReader(input), func(ContainerLogStream, []byte) error {
+		t.Fatal("emit called for a frame whose oversized payload was never fully available")
+		return nil
+	})
+	if err == nil {
+		t.Fatal("expected an error when discarding a truncated oversized frame")
+	}
+	if !strings.Contains(err.Error(), "skipping oversized log frame") {
+		t.Fatalf("error = %v, want it to mention 'skipping oversized log frame'", err)
+	}
+}
+
+// ---- decodeMultiplexedLogStream: zero-byte payload read ----
+
+// TestDecodeMultiplexedLogStream_ZeroByteReadNotEmitted exercises the
+// boundary of the "n > 0" check after io.ReadFull: when the payload read
+// yields zero bytes (the reader ends immediately after the header), emit
+// must not be called with an empty payload.
+func TestDecodeMultiplexedLogStream_ZeroByteReadNotEmitted(t *testing.T) {
+	t.Parallel()
+
+	// Header claims a 5-byte payload, but no payload bytes follow at all.
+	header := dockerLogHeader(byte(ContainerLogStdout), 5)
+
+	err := decodeMultiplexedLogStream(bytes.NewReader(header), func(ContainerLogStream, []byte) error {
+		t.Fatal("emit called despite zero payload bytes being read")
+		return nil
+	})
+	if err == nil {
+		t.Fatal("expected an error when the payload read yields zero bytes, got nil")
+	}
+}
+
+// ---- looksMultiplexed ----
+
+// TestLooksMultiplexed exercises each of the four ANDed conditions in
+// isolation: for every condition, the other three are held true so that
+// only the guard under test can turn the overall result from true to
+// false. This kills each individual invert-&&-to-|| mutation, since an
+// inverted operator would let the surrounding true operands paper over the
+// one false operand this case targets.
+func TestLooksMultiplexed(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		header []byte
+		want   bool
+	}{
+		{name: "valid stdout frame header", header: []byte{1, 0, 0, 0, 0, 0, 0, 0}, want: true},
+		{name: "valid stderr frame header", header: []byte{2, 0, 0, 0, 0, 0, 0, 0}, want: true},
+		{name: "too short fails length check", header: []byte{1, 0, 0, 0, 0, 0, 0}, want: false},
+		{name: "stream type out of range fails first byte check", header: []byte{3, 0, 0, 0, 0, 0, 0, 0}, want: false},
+		{name: "byte 1 nonzero fails second byte check", header: []byte{1, 1, 0, 0, 0, 0, 0, 0}, want: false},
+		{name: "byte 2 nonzero fails third byte check", header: []byte{1, 0, 1, 0, 0, 0, 0, 0}, want: false},
+		{name: "byte 3 nonzero fails fourth byte check", header: []byte{1, 0, 0, 1, 0, 0, 0, 0}, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := looksMultiplexed(tt.header); got != tt.want {
+				t.Fatalf("looksMultiplexed(%v) = %v, want %v", tt.header, got, tt.want)
+			}
+		})
+	}
+}

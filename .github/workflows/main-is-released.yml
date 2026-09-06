@@ -22,11 +22,49 @@ name: "Release: Main Is Released"
 # branch that has it, so this cannot be exercised end to end until it has been
 # promoted. Dispatch it once after the first promotion rather than assuming the
 # first scheduled run will be the proof.
+#
+# A tagged main can still have drifted from the dev branch it was promoted
+# from — the tag check alone would pass on that (PW-3.6; run 33753625450
+# succeeded on the tag check alone). The `tree-parity` job below is the
+# second half, and it asserts two different things on two different
+# schedules:
+#
+#   * On EVERY run (schedule and dispatch alike): that origin/main carries
+#     no commit missing from the active origin/dev/* branch. This is an
+#     ANCESTRY question, not a tree question, and it holds at all times, not
+#     just right after a promotion: this repo's flow only ever advances main
+#     by a two-parent merge FROM dev (CONTRIBUTING.md), and the promotion
+#     procedure reconciles dev with a `git merge -s ours origin/main` right
+#     after, which records main's tip as an ancestor of dev without
+#     adopting main's tree. So origin/main is always expected to be an
+#     ancestor of origin/dev/*, in every window, including the weeks between
+#     releases where dev has moved on and legitimately carries commits main
+#     doesn't have yet — that direction is normal and this check does not
+#     look at it.
+#   * ONLY when dispatched with `require_tree_parity: true`: that
+#     origin/main and origin/dev/* share an identical TREE, per the house
+#     invariant ("after every promotion,
+#     `git diff --quiet origin/main origin/dev/<branch>` must hold"). Tree
+#     equality can only ever be claimed immediately after a promotion —
+#     dev's very next commit breaks it by design, and some promotions use a
+#     squash merge elsewhere in the org, which breaks ancestry but not tree
+#     equality — so this is opt-in rather than run on the same schedule as
+#     the ancestry check, which would otherwise be red for most of the
+#     month and teach everyone to ignore it.
 
 on:
   schedule:
     - cron: "23 7 * * *"
   workflow_dispatch:
+    inputs:
+      require_tree_parity:
+        description: >-
+          Also assert origin/main and the active dev branch share an
+          identical tree. Only true immediately after a promotion, before
+          dev's next commit.
+        required: false
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -35,3 +73,63 @@ jobs:
     permissions:
       contents: read
     uses: CodesWhat/.github/.github/workflows/main-is-released.yml@11004e42d7d19e86eb3b7777c467ec9522b784e1  # main, 2026-08-21
+
+  tree-parity:
+    name: "Tree Parity"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c  # v2.21.0
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Find the active dev branch
+        id: dev-branch
+        run: |
+          set -euo pipefail
+          mapfile -t branches < <(git branch -r --format='%(refname:short)' | grep -E '^origin/dev/' || true)
+          count="${#branches[@]}"
+          if [ "${count}" -ne 1 ]; then
+            echo "::error::expected exactly one origin/dev/* branch, found ${count}: ${branches[*]:-(none)}"
+            exit 1
+          fi
+          echo "Active dev branch: ${branches[0]}"
+          echo "ref=${branches[0]}" >> "${GITHUB_OUTPUT}"
+
+      - name: Assert origin/main commits are all on origin/dev/*
+        env:
+          DEV_REF: ${{ steps.dev-branch.outputs.ref }}
+        run: |
+          set -euo pipefail
+          missing="$(git rev-list origin/main ^"${DEV_REF}")"
+          if [ -n "${missing}" ]; then
+            echo "::error::origin/main carries commits ${DEV_REF} lacks"
+            git log --oneline origin/main ^"${DEV_REF}"
+            exit 1
+          fi
+          echo "origin/main has no commits missing from ${DEV_REF}."
+
+      - name: Assert origin/main and origin/dev/* share a tree
+        if: github.event_name == 'workflow_dispatch' && inputs.require_tree_parity
+        env:
+          DEV_REF: ${{ steps.dev-branch.outputs.ref }}
+        run: |
+          set -euo pipefail
+          if ! git diff --quiet origin/main "${DEV_REF}"; then
+            echo "::error::origin/main and ${DEV_REF} trees differ"
+            git diff --stat origin/main "${DEV_REF}"
+            exit 1
+          fi
+          echo "origin/main and ${DEV_REF} trees are equal."

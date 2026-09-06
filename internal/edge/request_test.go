@@ -135,7 +135,7 @@ func TestHandleRequestError(t *testing.T) {
 func TestDelayedRequestResponseCannotReachReplacementConnection(t *testing.T) {
 	t.Parallel()
 
-	c, _ := newTestClient(t)
+	c, _ := newHandshakeTestClient(t)
 	oldCh := make(chan protocol.Envelope, 1)
 	oldState := &outboundQueueState{}
 	c.connMu.Lock()

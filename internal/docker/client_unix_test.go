@@ -1,9 +1,11 @@
 package docker
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -61,6 +63,48 @@ func TestNewClient_Success(t *testing.T) {
 	}
 	if c.socketPath != socketPath {
 		t.Fatalf("socketPath = %q, want %q", c.socketPath, socketPath)
+	}
+}
+
+// TestNewClient_DialTimeoutMatchesRequestTimeoutSeconds verifies NewClient
+// converts its requestTimeout (seconds) into dialTimeout via multiplication
+// by time.Second, not some other operator. Dividing instead (as a mutant
+// would) collapses a small integer number of seconds to zero nanoseconds.
+func TestNewClient_DialTimeoutMatchesRequestTimeoutSeconds(t *testing.T) {
+	t.Parallel()
+
+	socketPath := startUnixHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"Version":"24.0.5","ApiVersion":"1.45"}`) //nolint:errcheck
+	}))
+
+	c, err := NewClient(socketPath, 7)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if c.dialTimeout != 7*time.Second {
+		t.Fatalf("dialTimeout = %v, want %v", c.dialTimeout, 7*time.Second)
+	}
+}
+
+// TestDefaultDialTimeoutEqualsThirtySeconds pins the fallback dial timeout's
+// value so an arithmetic change to its definition (e.g. 30 / time.Second
+// instead of 30 * time.Second) is caught even though the const declaration
+// itself carries no runtime coverage.
+func TestDefaultDialTimeoutEqualsThirtySeconds(t *testing.T) {
+	t.Parallel()
+
+	if defaultDialTimeout != 30*time.Second {
+		t.Fatalf("defaultDialTimeout = %v, want %v", defaultDialTimeout, 30*time.Second)
+	}
+}
+
+// TestMaxDockerErrorBodyBytesEquals4KiB pins the docker-error-body read cap,
+// same reasoning as TestDefaultDialTimeoutEqualsThirtySeconds above.
+func TestMaxDockerErrorBodyBytesEquals4KiB(t *testing.T) {
+	t.Parallel()
+
+	if maxDockerErrorBodyBytes != 4*1024 {
+		t.Fatalf("maxDockerErrorBodyBytes = %d, want %d", maxDockerErrorBodyBytes, 4*1024)
 	}
 }
 
@@ -508,16 +552,34 @@ type errCloseConn struct {
 
 func (e *errCloseConn) Close() error { return e.closeErr }
 
+// TestCloseConn_Error verifies closeConn logs (via slog.Debug) when Close
+// returns an error, and not just that it avoids panicking. Not parallel: it
+// swaps the global slog default logger for the duration of the test: see the
+// package note above TestEventStream_run_ErrorLogging-style tests for why
+// that's safe here (serial tests fully run before any parallel test body
+// starts executing).
 func TestCloseConn_Error(t *testing.T) {
-	t.Parallel()
+	var buf bytes.Buffer
+	orig := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(orig)
 
 	// closeConn with a conn that errors on Close should log but not panic.
 	c := &errCloseConn{Conn: nil, closeErr: fmt.Errorf("close failed")}
 	closeConn(c, "test context") // must not panic
+
+	if !strings.Contains(buf.String(), "closing docker connection") {
+		t.Fatalf("expected a debug log for the failed Close, got: %s", buf.String())
+	}
 }
 
+// TestCloseConn_NoError verifies closeConn does NOT log when Close succeeds,
+// the mirror case of TestCloseConn_Error. Not parallel, same reasoning.
 func TestCloseConn_NoError(t *testing.T) {
-	t.Parallel()
+	var buf bytes.Buffer
+	orig := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(orig)
 
 	// closeConn on a conn that closes cleanly should not log or panic.
 	c1, c2 := net.Pipe()
@@ -525,4 +587,8 @@ func TestCloseConn_NoError(t *testing.T) {
 
 	// closeConn calls c1.Close() which should succeed.
 	closeConn(c1, "test context")
+
+	if strings.Contains(buf.String(), "closing docker connection") {
+		t.Fatalf("did not expect a debug log for a clean Close, got: %s", buf.String())
+	}
 }

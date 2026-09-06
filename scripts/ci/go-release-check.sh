@@ -21,6 +21,9 @@ bash scripts/pre-push-config-test.sh
 bash scripts/fuzz-tier-config-test-test.sh
 bash scripts/fuzz-tier-config-test.sh
 bash scripts/fuzz-run-script-test.sh
+bash scripts/fuzz-score-script-test.sh
+bash scripts/fuzz-replay-script-test.sh
+bash scripts/fuzz-history-merge-script-test.sh
 bash scripts/cflite-config-test-test.sh
 bash scripts/cflite-config-test.sh
 bash scripts/codeql-trigger-config-test-test.sh
@@ -33,9 +36,16 @@ bash scripts/quality-integration-engines-config-test-test.sh
 bash scripts/quality-integration-engines-config-test.sh
 bash scripts/quality-history-config-test-test.sh
 bash scripts/quality-history-config-test.sh
+bash scripts/main-is-released-config-test-test.sh
+bash scripts/main-is-released-config-test.sh
+bash scripts/starchart-config-test-test.sh
+bash scripts/starchart-config-test.sh
 bash scripts/drydock-compat-script-test.sh
 bash scripts/benchstat-gate-script-test.sh
 bash scripts/benchstat-walk-baselines-test.sh
 bash scripts/mutation-gate-script-test.sh
+bash scripts/mutation-ratchet-script-test.sh
 bash scripts/quality-history-script-test.sh
 bash scripts/quality-history-record-test.sh
+bash scripts/mutation-survivors-record-test.sh
+bash scripts/mutation-survivors-diff-test.sh

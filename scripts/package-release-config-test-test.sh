@@ -13,6 +13,15 @@ if [ -z "${release_version}" ]; then
 	exit 1
 fi
 
+previous_version="$(
+	grep -E '^## \[v[0-9]+\.[0-9]+\.[0-9]+\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$' CHANGELOG.md |
+		sed -n '2{s/^## \[v\([0-9.]*\)\].*/\1/p;}' || true
+)"
+if [ -z "${previous_version}" ]; then
+	echo "FAIL: could not derive previous version from CHANGELOG.md" >&2
+	exit 1
+fi
+
 restore_release_workflows() {
 	cp .github/workflows/release.yml "${fixture}/.github/workflows/"
 	cp .github/workflows/release-cut.yml "${fixture}/.github/workflows/"
@@ -37,6 +46,7 @@ restore_release_workflows
 restore_grype_workflow
 git -C "${fixture}" init -q
 git -C "${fixture}" add .
+git -C "${fixture}" -c user.email=test@example.com -c user.name=test commit -q -m 'fixture commit'
 
 expect_release_contract_failure() {
 	local expected="$1"
@@ -54,6 +64,31 @@ expect_release_contract_failure() {
 		exit 1
 	fi
 }
+
+# A full checkout with no release tags can only be a broken clone, so the
+# guard must fail loudly there instead of passing vacuously. Exercise that
+# shape before the fixture is tagged at all.
+expect_release_contract_failure \
+	"FAIL: no release tags found in a full checkout" \
+	"the package release contract must reject a full checkout with no release tags at all"
+
+# A depth-1 clone carries no tags either, and the org's reusable GoReleaser
+# gate runs the script from one. That shape must pass with a visible SKIP
+# line, not fail every PR and not pass silently.
+shallow="$(mktemp -d)"
+git clone -q --depth 1 "file://${fixture}" "${shallow}/repo" 2>/dev/null
+set +e
+shallow_output="$(cd "${shallow}/repo" && bash scripts/package-release-config-test.sh 2>&1)"
+shallow_status=$?
+set -e
+rm -rf "${shallow}"
+if [ "${shallow_status}" -ne 0 ] || ! grep -Fq "SKIP: shallow checkout carries no release tags" <<<"${shallow_output}"; then
+	echo "FAIL: a shallow checkout must skip the tag-heading check with a SKIP line and pass" >&2
+	echo "${shallow_output}" >&2
+	exit 1
+fi
+
+git -C "${fixture}" tag "v${release_version}"
 
 if ! (cd "${fixture}" && bash scripts/package-release-config-test.sh >/dev/null); then
 	echo "FAIL: complete package release fixture must pass" >&2
@@ -316,6 +351,8 @@ location
 EOF
 
 prefix_version="${release_version}0"
+readme_prefix_backup="${fixture}/README.md.prefix-version-backup"
+cp "${fixture}/README.md" "${readme_prefix_backup}"
 
 awk -v from="VERSION=${release_version}" -v to="VERSION=${prefix_version}" '
 	!changed && index($0, from) {
@@ -342,6 +379,7 @@ if ! grep -Fq "${expected_diagnostic}" <<<"${validator_output}"; then
 	echo "${validator_output}" >&2
 	exit 1
 fi
+mv "${readme_prefix_backup}" "${fixture}/README.md"
 
 expect_stale_release_example_failure() {
 	local file="$1"
@@ -370,5 +408,64 @@ expect_release_contract_failure \
 	"FAIL: .gitleaksignore entries must be commit-pinned" \
 	"the package release contract must reject a line-pinned .gitleaksignore working-tree fingerprint"
 mv "${gitleaksignore_backup}" "${fixture}/.gitleaksignore"
+
+# The stale-previous-version exemption is scoped to README.md's "since
+# v<previous>" release note only. A plain previous-version literal anywhere
+# else - including another Markdown file - must still fail.
+releasing_stale_backup="${fixture}/RELEASING.md.stale-version-backup"
+cp "${fixture}/RELEASING.md" "${releasing_stale_backup}"
+printf '\nStale reference to v%s.\n' "${previous_version}" >>"${fixture}/RELEASING.md"
+expect_release_contract_failure \
+	"FAIL: stale references to v${previous_version} remain outside the changelog" \
+	"the package release contract must reject a plain stale previous-version literal in a non-README markdown file"
+mv "${releasing_stale_backup}" "${fixture}/RELEASING.md"
+
+# The exact "since v<previous>" phrase in README.md is the one exempted
+# shape; it must not fail on its own.
+readme_since_backup="${fixture}/README.md.since-phrase-backup"
+cp "${fixture}/README.md" "${readme_since_backup}"
+printf '\nNo changes since v%s.\n' "${previous_version}" >>"${fixture}/README.md"
+if ! (cd "${fixture}" && bash scripts/package-release-config-test.sh >/dev/null); then
+	echo "FAIL: a 'since v<previous>' phrase in README.md must not fail the stale-version check" >&2
+	exit 1
+fi
+mv "${readme_since_backup}" "${fixture}/README.md"
+
+# The same "since v<previous>" phrase outside README.md is not exempt; the
+# exemption is scoped by file, not just by phrase.
+releasing_since_backup="${fixture}/RELEASING.md.since-phrase-backup"
+cp "${fixture}/RELEASING.md" "${releasing_since_backup}"
+printf '\nNo changes since v%s.\n' "${previous_version}" >>"${fixture}/RELEASING.md"
+expect_release_contract_failure \
+	"FAIL: stale references to v${previous_version} remain outside the changelog" \
+	"the package release contract must reject the 'since v<previous>' phrase outside README.md"
+mv "${releasing_since_backup}" "${fixture}/RELEASING.md"
+
+# The CHANGELOG-vs-tag guard only sees tags the checkout actually has, so
+# exercising it needs a real tag in the fixture repo. It guards against
+# portwing#283: a prep PR renamed the v0.9.12 heading to v0.9.13 instead of
+# inserting a fresh section, leaving the already-tagged v0.9.12 release with
+# no matching heading. "v${release_version}" stays tagged for the whole
+# fixture lifetime and always has a matching heading, so adding a second tag
+# with no heading is what isolates the failure below.
+git -C "${fixture}" tag v0.0.1
+expect_release_contract_failure \
+	"FAIL: CHANGELOG.md has no '## [vX.Y.Z] - YYYY-MM-DD' heading for tag(s): v0.0.1" \
+	"the package release contract must reject a git tag with no matching CHANGELOG.md heading"
+git -C "${fixture}" tag -d v0.0.1 >/dev/null
+
+# A heading-shaped substring that is not anchored at the start of the line -
+# prose referencing the old heading text, or the same text sitting inside a
+# code fence - must not satisfy the guard either.
+changelog_decoy_backup="${fixture}/CHANGELOG.md.decoy-backup"
+cp "${fixture}/CHANGELOG.md" "${changelog_decoy_backup}"
+# shellcheck disable=SC2016 # The backticks are a literal Markdown code span, not command substitution.
+printf '%s\n' 'not a real heading: `## [v0.0.2] - 2099-01-01`' >>"${fixture}/CHANGELOG.md"
+git -C "${fixture}" tag v0.0.2
+expect_release_contract_failure \
+	"FAIL: CHANGELOG.md has no '## [vX.Y.Z] - YYYY-MM-DD' heading for tag(s): v0.0.2" \
+	"the package release contract must reject a heading-shaped substring that is not anchored at the start of the line"
+git -C "${fixture}" tag -d v0.0.2 >/dev/null
+mv "${changelog_decoy_backup}" "${fixture}/CHANGELOG.md"
 
 echo "Package release contract self-tests passed."

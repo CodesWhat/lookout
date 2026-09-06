@@ -1,11 +1,14 @@
 package docker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -457,6 +460,112 @@ func TestEventStream_run_ErrorLogging(t *testing.T) {
 		cancel()
 	case <-ctx.Done():
 		t.Fatal("timed out waiting for event after reconnect")
+	}
+}
+
+// TestEventStream_run_LogsOnlyOnConnectionError exercises the negation
+// boundary of the "err != nil" check that guards the slog.Warn call: it
+// must log only when readEvents actually returned an error, not on every
+// reconnect. Not parallel: swaps the global slog default logger for the
+// test's duration (see TestCloseConn_Error in client_unix_test.go for why
+// that's safe with the surrounding serial/parallel test ordering).
+func TestEventStream_run_LogsOnlyOnConnectionError(t *testing.T) {
+	var callCount atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := callCount.Add(1)
+		if n == 1 {
+			// First connection: error, so the disconnect log SHOULD fire.
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		// Second connection: succeeds, decodes one event, then hits EOF —
+		// readEvents returns nil, so the disconnect log must NOT fire for it.
+		w.WriteHeader(http.StatusOK)
+		enc := json.NewEncoder(w)
+		enc.Encode(DockerEvent{ID: "ctr1", Action: "start"}) //nolint:errcheck
+	}))
+	defer srv.Close()
+
+	var buf bytes.Buffer
+	orig := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(orig)
+
+	// cleanReconnect closes on the second call to after: the backoff fired
+	// after the first (errored) connection, so a second call means run() has
+	// already finished readEvents for the second (clean) connection and
+	// observed err == nil. Only cancel once that's signaled, so the test
+	// doesn't race cancellation against readEvents still decoding the
+	// trailing EOF for the clean connection.
+	cleanReconnect := make(chan struct{})
+	var afterCalls atomic.Int32
+
+	c := newTestClient(srv)
+	es := &EventStream{
+		client:       c,
+		initialDelay: 10 * time.Millisecond,
+		maxDelay:     20 * time.Millisecond,
+		// Fire the reconnect backoff immediately instead of sleeping in real
+		// time: this test is serial and Gremlins reruns it per mutant, so a
+		// real wait here only matters if the backoff itself is broken
+		// (covered separately by TestEventStream_run_BackoffCapped).
+		after: func(time.Duration) <-chan time.Time {
+			if afterCalls.Add(1) == 2 {
+				close(cleanReconnect)
+			}
+			ready := make(chan time.Time, 1)
+			ready <- time.Now()
+			return ready
+		},
+	}
+
+	// 1s is plenty once the backoff fires immediately; it only matters if a
+	// mutant breaks the reconnect loop outright.
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	ch, err := es.Subscribe(ctx)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	select {
+	case ev, ok := <-ch:
+		if !ok {
+			t.Fatal("channel closed before receiving event")
+		}
+		if ev.Action != "start" {
+			t.Fatalf("Action = %q, want %q", ev.Action, "start")
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for event after reconnect")
+	}
+
+	select {
+	case <-cleanReconnect:
+		cancel()
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for clean reconnect")
+	}
+	for range ch {
+	}
+
+	logged := buf.String()
+	got := strings.Count(logged, "docker event stream disconnected")
+	if got != 1 {
+		t.Fatalf("disconnect log count = %d, want exactly 1 (only the errored connection), log:\n%s", got, logged)
+	}
+	// The one log line must carry the actual connection error (from the 403
+	// response), not a nil error: a mutant that flips the guard to fire on
+	// success (err == nil) instead of failure would still log exactly once,
+	// but with error=<nil> for the successful second connection instead of
+	// the forbidden-response error for the first.
+	if !strings.Contains(logged, "docker error (status 403)") {
+		t.Fatalf("expected the disconnect log to carry the 403 connection error, got:\n%s", logged)
+	}
+	if strings.Contains(logged, "error=<nil>") {
+		t.Fatalf("disconnect log fired with a nil error, want it only on the failed connection:\n%s", logged)
 	}
 }
 

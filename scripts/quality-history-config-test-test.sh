@@ -17,19 +17,21 @@ tab="$(printf '\t')"
 contract="scripts/quality-history-config-test.sh"
 soak="${test_root}/soak.yml"
 mutation="${test_root}/mutation.yml"
+fuzz="${test_root}/fuzz.yml"
 append="${test_root}/append.sh"
 
 reset_fixtures() {
 	cp .github/workflows/quality-soak-weekly.yml "${soak}"
 	cp .github/workflows/quality-mutation-monthly.yml "${mutation}"
+	cp .github/workflows/quality-fuzz-nightly.yml "${fuzz}"
 	cp scripts/ci/quality-history-append.sh "${append}"
 	chmod +x "${append}"
 }
 
 assert_passes() {
-	if ! bash "${contract}" "${soak}" "${mutation}" "${append}" >/dev/null 2>&1; then
+	if ! bash "${contract}" "${soak}" "${mutation}" "${fuzz}" "${append}" >/dev/null 2>&1; then
 		echo "FAIL: $1" >&2
-		bash "${contract}" "${soak}" "${mutation}" "${append}" >&2 || true
+		bash "${contract}" "${soak}" "${mutation}" "${fuzz}" "${append}" >&2 || true
 		exit 1
 	fi
 }
@@ -41,7 +43,7 @@ assert_rejected() {
 	local status
 
 	set +e
-	output="$(bash "${contract}" "${soak}" "${mutation}" "${append}" 2>&1)"
+	output="$(bash "${contract}" "${soak}" "${mutation}" "${fuzz}" "${append}" 2>&1)"
 	status=$?
 	set -e
 
@@ -260,7 +262,7 @@ assert_rejected \
 
 reset_fixtures
 # shellcheck disable=SC2016 # A sed program over the append script's literal text.
-sed -i.bak 's/grep -Fxq "${record}"/grep -Fq "nothing-like-it"/' "${append}"
+sed -i.bak 's/grep -Fxqf "${record_tmp}"/grep -Fq "nothing-like-it"/' "${append}"
 assert_rejected \
 	"must not append a record the branch already carries" \
 	"contract must reject an appender that can write a duplicate row"

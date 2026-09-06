@@ -108,6 +108,8 @@ export const roadmap: Milestone[] = [
       "Edge sends component ownership before raw inventory; full feature compatibility requires Drydock v1.6.0-rc.11+ while DrydockCompat remains 1.4.0",
       "Edge mode shares the cursor-based NDJSON audit exporter on its explicitly private, unauthenticated operations listener",
       "Exec and Docker proxy failures preserve bounded daemon/sockguard error details through the controller path",
+      "Tagged Portwing × Drydock × Sockguard acceptance matrix passed in standard and edge modes — completed 2026-08-29",
+      "Controller-backed enrollment, overlapping-key rotation, revocation, and clock-skew recovery exercised against a real Drydock controller — completed 2026-08-29",
     ],
   },
   {
@@ -118,10 +120,8 @@ export const roadmap: Milestone[] = [
     items: [
       "Stable HTTP API and environment-variable surface under semantic-versioning guarantees",
       "Stable agent ↔ controller wire protocol — no breaking changes without a major bump",
-      "Threat model review, CVE-clean base image, published security policy at security@codeswhat.com",
-      "Tagged Portwing × Drydock × Sockguard acceptance matrix in standard and edge modes",
-      "Controller-backed enrollment, overlapping-key rotation, revocation, and clock-skew recovery exercise",
-      "Versioned competitive review with sourced feature ownership and explicit non-goals",
+      "Threat model review; the HIGH+ CVE gate is already enforced on every release image, and v1.0 keeps it",
+      "Final re-verify of the published competitive review against primary sources at the v1.0 cut",
     ],
   },
 ];

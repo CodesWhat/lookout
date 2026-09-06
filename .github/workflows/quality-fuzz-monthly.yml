@@ -12,17 +12,64 @@ run-name: >-
 # the shorter tiers miss, plus on-demand longer runs via `workflow_dispatch`
 # before a release. Mirrors sockguard's monthly tier; same rationale.
 #
-# 1 hour per fuzzer × 10 fuzzers × matrix-parallel = ~1 hour wall time. Crashes
-# upload with 180-day retention so a failing input from an older monthly run
-# stays recoverable long enough to turn into a committed regression test.
+# The 1-hour budget is unchanged, but it no longer runs as one job. Since
+# ~2026-09-01 GitHub-hosted ubuntu-24.04 runners kill any job that saturates
+# CPU for more than roughly 14-19 minutes with "The runner has received a
+# shutdown signal" (exit 143) — not a platform incident, not a fuzz finding.
+# Run 33514192612 (2026-09-01) died at 19 minutes into what used to be a
+# single 60-minute-per-fuzzer job; quality-fuzz-monthly-rerun.yml exists to
+# triage that failure mode after the fact, but the fix that stops it from
+# happening in the first place lives here: every fuzzer's hour is now six
+# PARALLEL 10-minute legs (`matrix.chunk: [1..6]`) instead of one 60-minute
+# leg. The property that matters is that no leg JOB occupies a runner with
+# a CPU-saturating workload for more than one fuzztime — which is why the
+# leg's Fuzz step runs with FUZZ_RETRIES=1 rather than the shared default
+# of 2: a retry re-runs the full -fuzztime on a boundary flake, and two
+# fuzztimes in one job is exactly the shutdown-signal candidate this
+# redesign exists to eliminate. 12 minutes (720s) is the hard per-leg
+# cap enforced below — 2 minutes of headroom under the ~14-minute low end of
+# the observed kill window — and the "Resolve fuzz budget" step refuses any
+# `fuzztime` input above it rather than silently clamping it, because a
+# manual dispatch asking for a longer per-leg budget is exactly the mistake
+# that would reintroduce run 33514192612's failure.
+#
+# A `monthly-fuzz` leg only restores the shared corpus and uploads what it
+# found; it never touches the corpus cache directly, because six legs of the
+# same fuzzer writing to the same cache key would race each other the same
+# way two workflows racing that key already do (see the corpus-touching job's
+# concurrency group below). Instead each leg uploads its own fuzz cache
+# directory as a short-lived (1-day) artifact, and the `merge-corpus` job —
+# one instance per fuzzer, gated on the whole `monthly-fuzz` matrix via
+# `needs: monthly-fuzz` (which has no matrix granularity, so every
+# merge-corpus instance waits for all 60 legs across every fuzzer, not just
+# this one's own six) — downloads the six, folds them into one directory,
+# and is the only thing that calls `actions/cache/save`. Go's fuzz corpus
+# entries are named by the content hash of the encoded value, so a file with
+# the same name from two different legs is always the same bytes: copying
+# six overlapping directories into one and letting duplicate names collide
+# is exactly as correct as copying one.
+#
+# 1 hour per fuzzer × 8 fuzzers × matrix-parallel = ~10-12 minutes wall time
+# per leg, unchanged total CPU-minutes. Crashes upload with 180-day retention
+# so a failing input from an older monthly run stays recoverable long enough
+# to turn into a committed regression test.
+#
+# Only 8 of the repo's 10 fuzz targets appear in the matrix below (PW-7.37).
+# FuzzParseImageRef and FuzzParseLabels are saturated — 5.5M/6.8M executions
+# with zero new interesting inputs, and path derivation was verified correct
+# — so a monthly hour finds nothing for either. They still run every night in
+# quality-fuzz-nightly.yml's seed-replay tier (no -fuzz minutes there
+# either), which is the only tier that owns their regression detection now.
+# scripts/fuzz-tier-config-test.sh's `replay_tier_fuzzers` pins the exclusion
+# from this matrix explicitly, in both jobs below.
 
 on:
   workflow_dispatch:
     inputs:
       fuzztime:
-        description: "Per-fuzzer coverage budget (Go duration, e.g. 1h, 3h). Max ≈5h45m before the job timeout trims it."
+        description: "Per-LEG coverage budget (Go duration, e.g. 5m, 10m). Hard cap 12m — a leg above that risks the runner shutdown that killed run 33514192612. Total per fuzzer is this × 6 legs."
         required: false
-        default: "1h"
+        default: "10m"
   schedule:
     # Monthly on day 1 at 02:30 UTC. Nightly and monthly share the same
     # corpus cache prefix and each save wins on recency, so two writers for
@@ -47,25 +94,17 @@ concurrency:
 
 jobs:
   monthly-fuzz:
-    name: "Fuzz ${{ matrix.fuzzer.name }} (monthly)"
+    name: "Fuzz ${{ matrix.fuzzer.name }} chunk ${{ matrix.chunk }} (monthly)"
     runs-on: ubuntu-24.04
-    # 6-hour ceiling is the hard cap regardless of the fuzztime input.
-    # Anything longer should run on a dedicated box, not a shared runner.
-    timeout-minutes: 360
-
-    # Shared with quality-fuzz-nightly.yml's corpus-touching job, keyed on
-    # the same fuzzer name the cache key itself uses (runner.os isn't in
-    # this group — it isn't a valid context in a concurrency expression, and
-    # both workflows only ever run on ubuntu-24.04 anyway). Both workflows
-    # restore from and save to one cache-key prefix per fuzzer, so letting a
-    # manual dispatch of this workflow run alongside the nightly's scheduled
-    # job for the same fuzzer would race two save steps against each other —
-    # the one that finishes second silently overwrites the first's coverage.
-    # cancel-in-progress: false because the answer is to queue the second
-    # writer, not cancel either run.
-    concurrency:
-      group: quality-fuzz-corpus-${{ matrix.fuzzer.name }}
-      cancel-in-progress: false
+    # 15-minute ceiling per leg: one 12m fuzztime attempt (FUZZ_RETRIES=1,
+    # see the Fuzz step below — a retry would re-run the full fuzztime and
+    # blow this budget) plus ~2m of setup/checkout/cache overhead is ~14m,
+    # so 15m is a backstop above the legitimate maximum, not the number
+    # this job is expected to run into. Still comfortably under the ~14-19
+    # minute window where a CPU-saturating job risks the runner shutdown
+    # signal. This is the hard cap on THIS job; the fuzztime cap below is
+    # what keeps the CPU-saturating `go test` step itself well under it.
+    timeout-minutes: 15
 
     strategy:
       fail-fast: false
@@ -73,14 +112,20 @@ jobs:
         fuzzer:
           - { name: FuzzParsePHC,            pkg: ./internal/server/ }
           - { name: FuzzParseTrustedProxies, pkg: ./internal/server/ }
-          - { name: FuzzParseImageRef,       pkg: ./internal/adapter/ }
-          - { name: FuzzParseLabels,         pkg: ./internal/adapter/drydock/ }
           - { name: FuzzMCPHandler,          pkg: ./internal/mcp/ }
           - { name: FuzzEnvelope,            pkg: ./internal/protocol/ }
           - { name: FuzzVerifyRequest,       pkg: ./internal/auth/ }
           - { name: FuzzDecodeContainerLogStream, pkg: ./internal/docker/ }
           - { name: FuzzComposeRequestValidate,   pkg: ./internal/docker/ }
           - { name: FuzzParseKeyLine,        pkg: ./internal/auth/ }
+        # 6 legs × 10 minutes = the same 60 CPU-minute budget one 60-minute
+        # job used to spend, split so no single leg is a shutdown-signal
+        # candidate. No `matrix.fuzzer` × `matrix.chunk` combination writes
+        # to the corpus cache; only `merge-corpus` below does, which is why
+        # this job carries no corpus-writer concurrency group of its own —
+        # six legs of the same fuzzer only ever RESTORE the same cache key,
+        # and concurrent reads of one immutable cache entry don't race.
+        chunk: [1, 2, 3, 4, 5, 6]
 
     steps:
       - name: Harden Runner
@@ -135,27 +180,44 @@ jobs:
           # never lands in the seed dir, so persisting one and not the other
           # loses either every crasher or every hour of coverage.
           #
-          # Only `generated` is cached below. `seed` is git-tracked, and
-          # actions/cache restores by extracting `tar -xf -P -C
-          # $GITHUB_WORKSPACE` over the checkout without cleaning the
-          # destination first, so a stale cache entry silently outranks HEAD
-          # for that directory: a `git rm` of an obsolete seed would come
-          # back on every scheduled run and get re-saved by `always()`. Git
-          # stays authoritative for the seed corpus instead, and a crasher
-          # found mid-run is preserved by the run's own failure plus the
-          # "Upload fuzz corpus on failure or cancel" artifact below (180-day
-          # retention here), not by a cache entry silently outliving a commit.
+          # Only `generated` is cached (by merge-corpus below, not this job).
+          # `seed` is git-tracked, and actions/cache restores by extracting
+          # `tar -xf -P -C $GITHUB_WORKSPACE` over the checkout without
+          # cleaning the destination first, so a stale cache entry silently
+          # outranks HEAD for that directory: a `git rm` of an obsolete seed
+          # would come back on every scheduled run and get re-saved by
+          # `always()`. Git stays authoritative for the seed corpus instead,
+          # and a crasher found mid-run is preserved by the run's own failure
+          # plus the "Upload fuzz corpus on failure or cancel" artifact below
+          # (180-day retention here), not by a cache entry silently outliving
+          # a commit.
           #
           # The module path is read out of go.mod rather than `go list -m` so
           # this stays a pure file read with no module-graph load behind it.
           rel="${PKG#./}"
           rel="${rel%/}"
           module="$(awk '$1 == "module" { print $2; exit }' go.mod)"
+          # A wrong derivation here would still look fine: mkdir -p below
+          # creates whatever path was computed, actions/cache saves and
+          # restores it without complaint, and the corpus would silently
+          # persist against a path go itself never reads from — indefinitely,
+          # since nothing downstream ever notices. `go list` reports the
+          # toolchain's own import path for PKG, so a derivation that drifted
+          # from it (a module rename, a package moved between directories) is
+          # caught here instead of costing another investigation.
+          listed="$(go list -f '{{.ImportPath}}' "${PKG}" 2>/dev/null || true)"
+          if [ -z "${listed}" ]; then
+            echo "::warning::corpus path cross-check skipped: go list produced no import path for '${PKG}'"
+          elif [ "${listed}" != "${module}/${rel}" ]; then
+            echo "::error::corpus path derivation is wrong: go list says '${listed}', derived '${module}/${rel}'"
+            exit 1
+          fi
           generated="$(go env GOCACHE)/fuzz/${module}/${rel}/${FUZZER}"
           seed="${rel}/testdata/fuzz/${FUZZER}"
-          # Both have to exist before the save step runs: actions/cache treats
+          # Both have to exist before this leg fuzzes: actions/cache treats
           # "none of the paths exist" as a warning, not an error, so a missing
-          # directory would store nothing and still report success.
+          # directory would store nothing and still report success — and the
+          # upload-artifact step below needs `generated` to exist too.
           mkdir -p "${generated}" "${seed}"
           {
             echo "generated=${generated}"
@@ -169,12 +231,10 @@ jobs:
         # lane gets a corpus at all: GitHub deletes a cache entry after 7 days
         # without an access, so a monthly-private key would miss on every single
         # run, forever. The nightly touches this prefix daily, so the entry is
-        # always warm and this job starts from at most yesterday's corpus.
-        # `gh run download` of the last successful run's artifact would survive
-        # longer, but it needs `actions: read` on a job that has `contents:
-        # read` and nothing else, and it resolves the wrong corpus here anyway:
-        # with `fail-fast: false`, one permanently-crashing target marks every
-        # run a failure and "last successful run" stops advancing for all ten.
+        # always warm and every leg here starts from at most yesterday's corpus.
+        # All six legs of a given fuzzer restore the same key independently —
+        # concurrent reads of one immutable cache entry are safe, unlike the
+        # single SAVE that only merge-corpus performs once per fuzzer below.
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: |
@@ -188,10 +248,16 @@ jobs:
         env:
           INPUT_FUZZTIME: ${{ github.event.inputs.fuzztime }}
         run: |
-          FUZZTIME="${INPUT_FUZZTIME:-1h}"
-          echo "fuzztime=${FUZZTIME}" >> "$GITHUB_OUTPUT"
-          # Parse the trailing unit (h, m, or s) and convert to seconds, then add
-          # a 120-second cushion so the go test -timeout always outlasts -fuzztime.
+          set -euo pipefail
+          FUZZTIME="${INPUT_FUZZTIME:-10m}"
+          # Parse the trailing unit (h, m, or s) and convert to seconds. The
+          # 120-second cushion added to test_timeout below only bounds the
+          # post-fuzz corpus-verification phase: go test -fuzz ignores
+          # -timeout while fuzzing itself is running (measured:
+          # -fuzztime=60s -timeout=8s ran the full 61s at 963% CPU and
+          # PASSED), so this cushion does not bound the CPU-saturating fuzz
+          # loop — the 12-minute per-leg cap below and the leg job's own
+          # timeout-minutes are what bound that.
           if [[ "${FUZZTIME}" =~ ^([0-9]+)h$ ]]; then
             budget_s=$(( BASH_REMATCH[1] * 3600 ))
           elif [[ "${FUZZTIME}" =~ ^([0-9]+)m$ ]]; then
@@ -199,8 +265,23 @@ jobs:
           elif [[ "${FUZZTIME}" =~ ^([0-9]+)s$ ]]; then
             budget_s=${BASH_REMATCH[1]}
           else
-            budget_s=3600
+            echo "::error::fuzztime '${FUZZTIME}' is not a plain <integer><h|m|s> duration (e.g. 5m, 600s). go test -fuzz ignores -timeout during fuzzing, so an unrecognized value would be passed to -fuzztime unchecked and could run far past the 12-minute per-leg cap." >&2
+            exit 1
           fi
+          # Hard cap: 12 minutes (720s). This workflow now runs the fuzzer's
+          # hour as six PARALLEL legs instead of one long job specifically to
+          # stay under the ~14-19 minute window where a hosted ubuntu-24.04
+          # runner kills a CPU-saturating job with a shutdown signal (run
+          # 33514192612, 2026-09-01, died at 19m into what was then a single
+          # 60m job). A per-leg fuzztime above 12m would put a single leg
+          # right back in that window, so this refuses rather than silently
+          # clamping — a manual dispatch that asks for more than the cap is a
+          # mistake to surface, not to quietly downgrade.
+          if [ "${budget_s}" -gt 720 ]; then
+            echo "::error::fuzztime '${FUZZTIME}' resolves to ${budget_s}s, above the 12-minute (720s) per-leg cap. The monthly workflow runs 6 parallel 10-minute legs per fuzzer instead of one long job specifically to stay under the runner's CPU-saturation shutdown window (~14-19m); a longer per-leg fuzztime defeats that. Dispatch with a smaller fuzztime, or raise the total budget by adding legs instead." >&2
+            exit 1
+          fi
+          echo "fuzztime=${FUZZTIME}" >> "$GITHUB_OUTPUT"
           echo "test_timeout=$(( budget_s + 120 ))s" >> "$GITHUB_OUTPUT"
 
       # Retry-once-on-flake and crash classification live in
@@ -216,40 +297,348 @@ jobs:
       # "shutdown signal" line from a different runner after the fact and
       # decides whether to re-run — unaffected by anything in this step.
       # Neither classification subsumes the other. It writes this step's
-      # `kind`/`reason` outputs straight to $GITHUB_OUTPUT, which the
-      # Summarize step below still reads exactly as before.
-      - name: Fuzz ${{ matrix.fuzzer.name }}
+      # `kind`/`reason` outputs straight to $GITHUB_OUTPUT, which the leg
+      # status file below still reads exactly as before.
+      - name: Fuzz ${{ matrix.fuzzer.name }} chunk ${{ matrix.chunk }}
         id: fuzz
         env:
           FUZZER: ${{ matrix.fuzzer.name }}
           PKG: ${{ matrix.fuzzer.pkg }}
           FUZZTIME: ${{ steps.budget.outputs.fuzztime }}
           FUZZ_TIMEOUT: ${{ steps.budget.outputs.test_timeout }}
+          # FUZZ_PARALLEL=3 leaves the coordinator a core on a 4-core
+          # runner, matching scripts/ci/go-fuzz.sh: unset here, a leg runs
+          # one worker per core and starves the coordinator, which is what
+          # produces the "context deadline exceeded" boundary flake in the
+          # first place.
+          FUZZ_PARALLEL: 3
         run: |
-          FUZZ_RETRIES=2 FUZZ_OUTPUT_FILE="$GITHUB_OUTPUT" bash scripts/ci/fuzz-run.sh "${PKG}" "${FUZZER}" "${FUZZTIME}"
+          # FUZZ_RETRIES=1, not the shared default of 2: a retry re-runs the
+          # FULL -fuzztime on that flake, so two retries is two full legs —
+          # 10m + 10m + ~2m setup = ~22m, past this job's timeout-minutes and
+          # back inside the 14-19m runner-shutdown window this chunking exists
+          # to stay out of. One attempt plus setup is ~12m; see the
+          # timeout-minutes comment below for the arithmetic.
+          FUZZ_RETRIES=1 FUZZ_OUTPUT_FILE="$GITHUB_OUTPUT" FUZZ_LOG_FILE="fuzz-run-${FUZZER}-${{ matrix.chunk }}.log" bash scripts/ci/fuzz-run.sh "${PKG}" "${FUZZER}" "${FUZZTIME}"
 
       - name: Upload fuzz corpus on failure or cancel
         if: failure() || cancelled()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
-          name: fuzz-corpus-${{ matrix.fuzzer.name }}-${{ github.run_id }}
+          name: fuzz-corpus-${{ matrix.fuzzer.name }}-${{ matrix.chunk }}-${{ github.run_id }}
           path: "**/testdata/fuzz/${{ matrix.fuzzer.name }}/"
           retention-days: 180
           if-no-files-found: ignore
 
+      # Stages this leg's contribution for merge-corpus: a copy of the
+      # generated corpus dir, this leg's raw fuzz log (read for the
+      # aggregate execs/new-interesting totals below), and a small status
+      # record of this leg's own classification — kind/reason/status/
+      # restored-from — so the per-target summary the merge job writes can
+      # report "did any of this target's six legs crash", not just "did the
+      # leg the merge job happens to run alongside".
+      - name: Stage chunk artifact
+        if: always()
+        id: stage
+        env:
+          GENERATED: ${{ steps.corpus.outputs.generated }}
+          FUZZER: ${{ matrix.fuzzer.name }}
+          CHUNK: ${{ matrix.chunk }}
+          FUZZTIME: ${{ steps.budget.outputs.fuzztime }}
+          KIND: ${{ steps.fuzz.outputs.kind }}
+          REASON: ${{ steps.fuzz.outputs.reason }}
+          FUZZ_STATUS: ${{ steps.fuzz.outputs.status }}
+          MATCHED_KEY: ${{ steps.corpus-restore.outputs.cache-matched-key }}
+        run: |
+          set -euo pipefail
+          stage="${RUNNER_TEMP}/fuzz-chunk-stage"
+          mkdir -p "${stage}/corpus"
+          if [ -d "${GENERATED}" ]; then
+            find "${GENERATED}" -mindepth 1 -maxdepth 1 -exec cp -a -t "${stage}/corpus/" {} +
+          fi
+          if [ -f "fuzz-run-${FUZZER}-${CHUNK}.log" ]; then
+            cp "fuzz-run-${FUZZER}-${CHUNK}.log" "${stage}/fuzz-run.log"
+          fi
+          jq -cn \
+            --arg chunk "${CHUNK}" \
+            --arg fuzztime "${FUZZTIME}" \
+            --arg kind "${KIND}" \
+            --arg reason "${REASON}" \
+            --arg status "${FUZZ_STATUS}" \
+            --arg matched_key "${MATCHED_KEY}" \
+            '{chunk: ($chunk | tonumber), fuzztime: $fuzztime, kind: $kind, reason: $reason, status: $status, matched_key: $matched_key}' \
+            > "${stage}/leg-status.json"
+          echo "dir=${stage}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload fuzz corpus chunk
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: fuzz-corpus-chunk-${{ matrix.fuzzer.name }}-${{ matrix.chunk }}-${{ github.run_id }}
+          path: ${{ steps.stage.outputs.dir }}
+          retention-days: 1
+          if-no-files-found: warn
+
+  # One instance per fuzzer (not per leg): downloads that fuzzer's six chunk
+  # artifacts, folds their corpus files into one directory, and is the only
+  # job in this workflow that writes to the corpus cache — the same
+  # restore-then-fuzz-then-save shape quality-fuzz-nightly.yml's single job
+  # has, just with the fuzzing moved out to the six legs above it. Also
+  # writes the one step-summary section per target that monthly-fuzz's own
+  # Summarize step used to write, now aggregated across the six legs instead
+  # of duplicated six times.
+  merge-corpus:
+    name: "Merge fuzz corpus ${{ matrix.fuzzer.name }} (monthly)"
+    needs: monthly-fuzz
+    # !cancelled(), not always(): always() would also run this job — and its
+    # Save fuzz corpus step below — on a run that was CANCELLED, writing a
+    # near-empty corpus (download is continue-on-error, and legs_found only
+    # gates the merge step's own kind escalation below, not the save) under
+    # a fresh run_id/run_attempt key. restore-keys returns the newest
+    # matching entry, so the next scheduled run would restore that
+    # near-empty cache and months of corpus would be gone with a green job.
+    # !cancelled() still runs on a leg FAILURE (the case this job exists to
+    # salvage the other five legs' corpus for) but skips a cancelled run
+    # entirely.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    # Shared with quality-fuzz-nightly.yml's corpus-touching job and keyed on
+    # the same fuzzer name the cache key itself uses (runner.os isn't in
+    # this group — it isn't a valid context in a concurrency expression, and
+    # both workflows only ever run on ubuntu-24.04 anyway). Both workflows
+    # restore from and save to one cache-key prefix per fuzzer, so letting a
+    # manual dispatch of this workflow run alongside the nightly's scheduled
+    # job for the same fuzzer would race two save steps against each other —
+    # the one that finishes second silently overwrites the first's coverage.
+    # cancel-in-progress: false because the answer is to queue the second
+    # writer, not cancel either run. This lives on merge-corpus rather than
+    # on monthly-fuzz above because merge-corpus is the only job in this
+    # workflow that saves the cache; monthly-fuzz's six legs per fuzzer only
+    # ever restore it, and concurrent reads don't need serialising against
+    # each other or against this group.
+    concurrency:
+      group: quality-fuzz-corpus-${{ matrix.fuzzer.name }}
+      cancel-in-progress: false
+
+    strategy:
+      fail-fast: false
+      matrix:
+        fuzzer:
+          - { name: FuzzParsePHC,            pkg: ./internal/server/ }
+          - { name: FuzzParseTrustedProxies, pkg: ./internal/server/ }
+          - { name: FuzzMCPHandler,          pkg: ./internal/mcp/ }
+          - { name: FuzzEnvelope,            pkg: ./internal/protocol/ }
+          - { name: FuzzVerifyRequest,       pkg: ./internal/auth/ }
+          - { name: FuzzDecodeContainerLogStream, pkg: ./internal/docker/ }
+          - { name: FuzzComposeRequestValidate,   pkg: ./internal/docker/ }
+          - { name: FuzzParseKeyLine,        pkg: ./internal/auth/ }
+
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c  # v2.21.0
+        with:
+          egress-policy: block
+          # Same list as the monthly-fuzz leg job above (sibling job, same
+          # needs: setup-go for `go env GOCACHE`, the Actions artifact API to
+          # download the six chunks, and the Actions cache service to save
+          # the merged corpus).
+          allowed-endpoints: >
+            api.github.com:443
+            dl.google.com:443
+            github.com:443
+            go.dev:443
+            proxy.golang.org:443
+            release-assets.githubusercontent.com:443
+            *.actions.githubusercontent.com:443
+            *.blob.core.windows.net:443
+            results-receiver.actions.githubusercontent.com:443
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Resolve corpus paths
+        id: corpus
+        env:
+          FUZZER: ${{ matrix.fuzzer.name }}
+          PKG: ${{ matrix.fuzzer.pkg }}
+        run: |
+          set -euo pipefail
+          rel="${PKG#./}"
+          rel="${rel%/}"
+          module="$(awk '$1 == "module" { print $2; exit }' go.mod)"
+          # Same go-list cross-check as the leg job's "Resolve corpus paths"
+          # step above: this job derives the same cache path independently
+          # (it restores/merges/saves rather than fuzzing), so a drifted
+          # derivation here would silently save the merged corpus under a
+          # path go itself never reads from.
+          listed="$(go list -f '{{.ImportPath}}' "${PKG}" 2>/dev/null || true)"
+          if [ -z "${listed}" ]; then
+            echo "::warning::corpus path cross-check skipped: go list produced no import path for '${PKG}'"
+          elif [ "${listed}" != "${module}/${rel}" ]; then
+            echo "::error::corpus path derivation is wrong: go list says '${listed}', derived '${module}/${rel}'"
+            exit 1
+          fi
+          generated="$(go env GOCACHE)/fuzz/${module}/${rel}/${FUZZER}"
+          seed="${rel}/testdata/fuzz/${FUZZER}"
+          mkdir -p "${generated}" "${seed}"
+          {
+            echo "generated=${generated}"
+            echo "seed=${seed}"
+          } >> "$GITHUB_OUTPUT"
+
+      # Restore before merge, inside this job's quality-fuzz-corpus-<fuzzer>
+      # concurrency group, so restore -> merge -> save is one serialised
+      # read-modify-write against the nightly's own restore/fuzz/save for
+      # the same key. Before this job existed, one job did restore, fuzz,
+      # and save in sequence, so a lost update was impossible; splitting
+      # fuzzing out to the six leg jobs above moved the read to them (no
+      # concurrency group) and left only the write here, so a nightly run
+      # could restore, fuzz, and save entirely inside this job's window and
+      # have this job's save silently overwrite it with a union that never
+      # saw the nightly's contribution. Restoring here, under the same
+      # group the save below uses, closes that gap.
+      - name: Restore fuzz corpus
+        id: corpus-restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: |
+            ${{ steps.corpus.outputs.generated }}
+          key: fuzz-corpus-v1-${{ runner.os }}-${{ matrix.fuzzer.name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            fuzz-corpus-v1-${{ runner.os }}-${{ matrix.fuzzer.name }}-
+
+      # continue-on-error, not a hard failure: a leg that never reached its
+      # own upload step (killed before "Upload fuzz corpus chunk" ran) means
+      # one fewer chunk to merge, not nothing to merge — the other five
+      # legs' coverage is still worth saving.
+      - name: Download fuzz corpus chunks
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: fuzz-corpus-chunk-${{ matrix.fuzzer.name }}-*-${{ github.run_id }}
+          path: ${{ runner.temp }}/fuzz-chunks
+
+      # Folds every downloaded chunk's corpus files into the generated cache
+      # dir (content-addressed names make this idempotent — see the header
+      # comment) and sums each leg's own "fuzz: elapsed: ..., execs: N,
+      # new interesting: M" line for a whole-target total, the same line
+      # shape scripts/ci/fuzz-score.sh already parses from the nightly's
+      # single log. Also derives this target's overall kind from the six
+      # legs' own leg-status.json records: crash outranks everything (a
+      # crashing input is the one thing worth flagging loudest), then error,
+      # then infra (the exact failure mode this whole redesign exists to
+      # avoid — if it still shows up under a 10-minute leg, that is worth
+      # knowing), then flake, and pass only if every leg passed.
+      - name: Merge chunk corpus and aggregate leg stats
+        id: merge
+        env:
+          GENERATED: ${{ steps.corpus.outputs.generated }}
+          CHUNKS_DIR: ${{ runner.temp }}/fuzz-chunks
+        run: |
+          set -euo pipefail
+          mkdir -p "${GENERATED}"
+          total_execs=0
+          total_new=0
+          restored_from=""
+          kind="pass"
+          reason=""
+          legs_found=0
+          rank() {
+            case "$1" in
+            crash) echo 4 ;;
+            error) echo 3 ;;
+            infra) echo 2 ;;
+            flake) echo 1 ;;
+            *) echo 0 ;;
+            esac
+          }
+          if [ -d "${CHUNKS_DIR}" ]; then
+            for chunk_dir in "${CHUNKS_DIR}"/*/; do
+              [ -d "${chunk_dir}" ] || continue
+              legs_found=$((legs_found + 1))
+              if [ -d "${chunk_dir}corpus" ]; then
+                find "${chunk_dir}corpus" -mindepth 1 -maxdepth 1 -exec cp -n -t "${GENERATED}/" {} + 2>/dev/null || true
+              fi
+              if [ -f "${chunk_dir}fuzz-run.log" ]; then
+                line="$(grep -F 'fuzz: elapsed:' "${chunk_dir}fuzz-run.log" 2>/dev/null | tail -n 1 || true)"
+                if [ -n "${line}" ]; then
+                  v="$(printf '%s' "${line}" | grep -oE 'execs: [0-9]+' | grep -oE '[0-9]+' || true)"
+                  [ -n "${v}" ] && total_execs=$((total_execs + v))
+                  v="$(printf '%s' "${line}" | grep -oE 'new interesting: [0-9]+' | grep -oE '[0-9]+' || true)"
+                  [ -n "${v}" ] && total_new=$((total_new + v))
+                fi
+              fi
+              if [ -f "${chunk_dir}leg-status.json" ]; then
+                leg_kind="$(jq -r '.kind // ""' "${chunk_dir}leg-status.json" 2>/dev/null || true)"
+                leg_key="$(jq -r '.matched_key // ""' "${chunk_dir}leg-status.json" 2>/dev/null || true)"
+                leg_reason="$(jq -r '.reason // ""' "${chunk_dir}leg-status.json" 2>/dev/null || true)"
+                if [ -z "${restored_from}" ] && [ -n "${leg_key}" ]; then
+                  restored_from="${leg_key}"
+                fi
+                if [ -n "${leg_kind}" ] && [ "$(rank "${leg_kind}")" -gt "$(rank "${kind}")" ]; then
+                  kind="${leg_kind}"
+                  reason="${leg_reason}"
+                fi
+              fi
+            done
+          fi
+          expected_legs=6
+          if [ "${legs_found}" -lt "${expected_legs}" ]; then
+            echo "::warning::only ${legs_found} of ${expected_legs} legs reported a corpus chunk"
+          fi
+          # kind is seeded "pass" and only ratchets up from leg-status.json
+          # records that actually arrived: a leg torn down by the runner
+          # never runs its own always() upload and contributes nothing here,
+          # so a missing leg was previously indistinguishable from a leg
+          # that ran clean — a red job with a green-looking kind=pass
+          # summary, which is what the notification lane keys on. Escalate
+          # to infra whenever fewer than all six legs reported, unless some
+          # leg already reported something worse (a real crash or error
+          # outranks a missing leg).
+          if [ "${legs_found}" -lt "${expected_legs}" ] && [ "$(rank "${kind}")" -lt "$(rank infra)" ]; then
+            kind="infra"
+            reason="missing-legs"
+          fi
+          {
+            echo "execs=${total_execs}"
+            echo "new_interesting=${total_new}"
+            echo "restored_from=${restored_from}"
+            echo "kind=${kind}"
+            echo "reason=${reason}"
+            echo "legs_found=${legs_found}"
+            echo "expected_legs=${expected_legs}"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Save fuzz corpus
-        # always(), because the run that matters most for persistence is the
-        # one that failed: a crasher lives in the seed dir and has to come back
-        # on the next run, or the finding is thrown away exactly the way it is
-        # today. Guarded on the resolve step's output so a failure there cannot
-        # turn into a second red step over an empty `path`. On a full runner
-        # teardown this step is killed like every other one, which is what
-        # quality-fuzz-monthly-rerun.yml exists to catch.
-        if: always() && steps.corpus.outputs.generated != ''
+        # !cancelled(), because the run that matters most for persistence is
+        # the one that failed: a crasher lives in the seed dir and has to
+        # come back on the next run, or the finding is thrown away exactly
+        # the way it is today. Guarded on the resolve step's output so a
+        # failure there cannot turn into a second red step over an empty
+        # `path`, and on the merge step's own success so a cache-restore
+        # failure, a jq failure, or any other error inside Merge chunk
+        # corpus cannot save whatever partial `generated` dir it left
+        # behind. On a full runner teardown of one of the six legs the
+        # other five still land here. The saved dir is a superset of what
+        # Restore fuzz corpus above just pulled down — restore, then fold
+        # in the downloaded chunks, then save — so this write can only add
+        # entries, never drop ones a concurrent nightly run already wrote.
+        if: ${{ !cancelled() && steps.corpus.outputs.generated != '' && steps.merge.outcome == 'success' }}
         # The key carries run_id/run_attempt because cache keys are immutable —
         # writing the same key twice is a no-op, so a fixed key would freeze the
-        # corpus at whatever the first run stored. restore-keys above does the
-        # actual work of finding the newest entry for this fuzzer.
+        # corpus at whatever the first run stored. restore-keys (in the leg
+        # job above) does the actual work of finding the newest entry for
+        # this fuzzer.
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: |
@@ -261,14 +650,16 @@ jobs:
         env:
           FUZZER: ${{ matrix.fuzzer.name }}
           PKG: ${{ matrix.fuzzer.pkg }}
-          FUZZTIME: ${{ steps.budget.outputs.fuzztime }}
-          STATUS: ${{ job.status }}
-          KIND: ${{ steps.fuzz.outputs.kind }}
-          REASON: ${{ steps.fuzz.outputs.reason }}
           RUN_ID: ${{ github.run_id }}
-          MATCHED_KEY: ${{ steps.corpus-restore.outputs.cache-matched-key }}
           GENERATED: ${{ steps.corpus.outputs.generated }}
           SEED: ${{ steps.corpus.outputs.seed }}
+          LEGS_FOUND: ${{ steps.merge.outputs.legs_found }}
+          EXPECTED_LEGS: ${{ steps.merge.outputs.expected_legs }}
+          EXECS: ${{ steps.merge.outputs.execs }}
+          NEW_INTERESTING: ${{ steps.merge.outputs.new_interesting }}
+          RESTORED_FROM: ${{ steps.merge.outputs.restored_from }}
+          KIND: ${{ steps.merge.outputs.kind }}
+          REASON: ${{ steps.merge.outputs.reason }}
         run: |
           count_files() {
             [ -d "$1" ] || { echo 0; return; }
@@ -277,39 +668,46 @@ jobs:
           {
             echo "### ${FUZZER} (monthly deep)"
             echo ""
-            echo "- Package: \`${PKG}\`"
-            echo "- Budget:  ${FUZZTIME}"
-            echo "- Result:  ${STATUS}"
+            echo "- Package:  \`${PKG}\`"
+            echo "- Chunks:   ${LEGS_FOUND} of ${EXPECTED_LEGS} legs reported in"
+            echo "- Budget:   fuzztime_per_chunk × 6 legs (see the leg jobs for the per-leg fuzztime used)"
+            echo "- Execs:    ${EXECS} (summed across the 6 legs), new interesting: ${NEW_INTERESTING}"
             # These two counts are the acceptance signal for corpus
             # persistence: they have to climb across successive runs, and a
             # restored-from of "cold start" on a lane that has run before means
             # the cache is not being reached.
-            echo "- Corpus:  $(count_files "${GENERATED}") generated, $(count_files "${SEED}") seed"
-            echo "- Restored from: \`${MATCHED_KEY:-cold start (no cache entry)}\`"
+            echo "- Corpus:   $(count_files "${GENERATED}") generated, $(count_files "${SEED}") seed"
+            echo "- Restored from: \`${RESTORED_FROM:-cold start (no cache entry)}\`"
             # Rendered so a notification lane can key on the classification
             # rather than on the job status, which cannot tell a code
-            # regression apart from a lost runner. Empty when the fuzz step
-            # never set an output.
-            echo "- Kind:    \`kind=${KIND:-unknown}\`"
+            # regression apart from a lost runner. The worst-ranked kind
+            # across the target's 6 legs; empty when no leg reported one.
+            echo "- Kind:     \`kind=${KIND:-unknown}\`"
             if [ "${KIND}" = "crash" ]; then
               echo ""
               if [ "${REASON}" = "seed-regression" ]; then
-                echo "The committed seed corpus is failing (matched \`failure while testing seed corpus entry\`):"
+                echo "The committed seed corpus is failing (matched \`failure while testing seed corpus entry\`) on at least one leg:"
                 echo "a previously-fixed crash has regressed."
               else
-                echo "A crashing input was saved to \`testdata/fuzz/${FUZZER}/\` (matched \`Failing input written to testdata\`)."
+                echo "A crashing input was saved to \`testdata/fuzz/${FUZZER}/\` (matched \`Failing input written to testdata\`) by at least one leg."
               fi
-              echo "Download artifact \`fuzz-corpus-${FUZZER}-${RUN_ID}\`, commit the"
+              echo "Download the \`fuzz-corpus-${FUZZER}-*-${RUN_ID}\` artifact from the leg that found it, commit the"
               echo "minimized input to the seed corpus, fix the bug, and push."
             fi
             if [ "${KIND}" = "infra" ]; then
               echo ""
-              echo "\`go test\` was killed by SIGTERM (exit 143) rather than failing:"
-              echo "a lost runner, or the job hitting its own timeout. Either way this"
-              echo "is NOT a code regression and no fuzz finding is implied."
+              if [ "${REASON}" = "missing-legs" ]; then
+                echo "Only ${LEGS_FOUND} of ${EXPECTED_LEGS} legs reported a corpus chunk. A leg torn down by the"
+                echo "runner never runs its own always() upload, so it contributes nothing here — this is"
+                echo "reported as infra rather than pass so a red run can't summarize as kind=pass."
+              else
+                echo "At least one leg's \`go test\` was killed by SIGTERM (exit 143) rather than failing:"
+                echo "a lost runner, or that leg's own job hitting its own timeout. Either way this"
+                echo "is NOT a code regression and no fuzz finding is implied."
+              fi
               echo ""
-              echo "This line is best-effort. A full runner teardown kills this step"
-              echo "too, so \`Quality: Deep Fuzz Infra Rerun\` is the reliable place the"
+              echo "This line is best-effort. A full runner teardown kills the leg's own status-file"
+              echo "step too, so \`Quality: Deep Fuzz Infra Rerun\` is the reliable place the"
               echo "classification gets recorded, and the only thing that decides"
               echo "whether to re-run."
             fi

@@ -288,6 +288,9 @@ func TestValidateRequestRegistryServerForms(t *testing.T) {
 		{name: "empty port", server: "registry.example.com:", wantErr: true},
 		{name: "explicit empty port", server: "https://registry.example.com:", wantErr: true},
 		{name: "out of range port", server: "registry.example.com:65536", wantErr: true},
+		{name: "minimum valid port", server: "registry.example.com:1"},
+		{name: "maximum valid port", server: "registry.example.com:65535"},
+		{name: "port zero", server: "registry.example.com:0", wantErr: true},
 		{name: "unbracketed IPv6", server: "2001:db8::1", wantErr: true},
 	}
 
