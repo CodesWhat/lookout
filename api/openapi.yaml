@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Portwing Agent API
-  version: 0.9.14
+  version: 0.9.15
   description: |
     Portwing is a lightweight remote Docker agent for the Drydock container
     monitoring platform. This specification covers the **Standard Mode** HTTP API
@@ -124,7 +124,7 @@ components:
         version:
           type: string
           description: Portwing agent version.
-          example: "0.9.14"
+          example: "0.9.15"
         uptimeSeconds:
           type: number
           minimum: 0
@@ -145,7 +145,7 @@ components:
         version:
           type: string
           description: Portwing agent version
-          example: "0.9.14"
+          example: "0.9.15"
         dockerVersion:
           type: string
           description: Docker Engine version string
@@ -437,7 +437,7 @@ components:
       properties:
         agentVersion:
           type: string
-          example: "0.9.14"
+          example: "0.9.15"
         protocolName:
           type: string
           example: "portwing"
@@ -998,7 +998,7 @@ paths:
 
         **Example stream:**
         ```
-        data: {"type":"dd:ack","data":{"version":"0.9.14","os":"linux","arch":"amd64","cpus":4,"memoryGb":0,"uptimeSeconds":3600,"lastSeen":"2024-07-23T10:00:00Z","containers":{"total":5,"running":4,"stopped":1},"images":3}}
+        data: {"type":"dd:ack","data":{"version":"0.9.15","os":"linux","arch":"amd64","cpus":4,"memoryGb":0,"uptimeSeconds":3600,"lastSeen":"2024-07-23T10:00:00Z","containers":{"total":5,"running":4,"stopped":1},"images":3}}
 
         data: {"type":"dd:watcher-snapshot","data":{"watcher":{...WatcherComponent...},"containers":[{...Container...}]}}
 

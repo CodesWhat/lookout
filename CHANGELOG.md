@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v0.9.15] - 2026-09-07
+
+### Changed
+
+- **The competitive landscape lives only on the docs site now.** The root
+  `COMPETITIVE-LANDSCAPE.md` working file is no longer in the repository;
+  the published comparison at
+  [portwing.codeswhat.com/docs/competitive-landscape](https://portwing.codeswhat.com/docs/competitive-landscape)
+  is the one source, and README, ROADMAP and the design docs link there.
+  Docs-only release, no binary or protocol change since v0.9.14.
+
 ## [v0.9.14] - 2026-09-06
 
 ### Fixed

@@ -14,7 +14,7 @@ export const SITE_CONFIG = {
   /** Brand name shown in the header, footer, and metadata. */
   name: "Portwing",
   /** Current release version shown in the hero badge. */
-  version: "0.9.14",
+  version: "0.9.15",
   /** Short product tagline used in page titles and OG metadata. */
   tagline: "Security-first remote Docker agent",
   /**
