@@ -352,6 +352,16 @@ no `reason`.
 | `exec_resize` | Controller → Agent | TTY resize (`cols`, `rows`) for a live session |
 | `exec_end` | Either | Session ended, with an optional `reason` |
 
+`exec_output` always carries plain command output, whatever `exec_start` asked
+for. `tty: true` (the default when the field is absent) attaches a PTY and
+Docker's stream is already raw. `tty: false` gets Docker's stream multiplexing
+instead — 8-byte frame headers of `[stream type, 0, 0, 0, big-endian length]`
+around each chunk — and the agent strips those before sending, merging stdout
+and stderr in arrival order because `exec_output` has no stream field. A
+controller must not demultiplex the payload itself. If a non-TTY stream loses
+frame sync the agent ends the session with an `exec_end` whose `reason` names
+the desynchronization, rather than forwarding bytes it can no longer frame.
+
 If a session fails to start (for example, a sockguard exec-policy denial),
 the agent's failStart path sends `exec_end` immediately instead of
 `exec_ready`. Its `reason` field now carries the underlying Docker/sockguard
