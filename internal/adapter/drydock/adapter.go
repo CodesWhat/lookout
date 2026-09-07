@@ -1,9 +1,7 @@
 package drydock
 
 import (
-	"bufio"
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,7 +30,6 @@ const (
 
 	defaultMessageHandlerConcurrency = 32
 	maxContainerLogStreams           = 128
-	maxContainerLogStreamFrameBytes  = 256 << 10
 
 	// maxContainerLogBytes caps a single dd:container_log_response payload.
 	maxContainerLogBytes = 100 * 1024 * 1024 // 100 MiB
@@ -489,81 +486,30 @@ func (a *Adapter) runContainerLogStream(ctx context.Context, cancel context.Canc
 	a.sendContainerLogStreamEnd(sender, msg, "eof")
 }
 
+// forwardContainerLogStream pumps a container log response into
+// dd:container_log_chunk messages. Decoding is the shared
+// docker.DecodeContainerLogStream, which is what the HTTP log routes and the
+// MCP tool already use: it tells a multiplexed stream from a raw TTY one the
+// same way, and — the reason this stopped being a local copy — it emits the
+// bytes it did read from a truncated final frame before reporting the read
+// error, where the copy here dropped them.
 func (a *Adapter) forwardContainerLogStream(
 	ctx context.Context,
 	sender adapter.MessageSender,
 	msg protocol.DDContainerLogRequestMessage,
 	body io.Reader,
 ) error {
-	reader := bufio.NewReaderSize(body, 32<<10)
-	header, _ := reader.Peek(8)
-	if !looksLikeDockerLogFrame(header) {
-		return a.forwardRawContainerLogStream(ctx, sender, msg, reader)
+	err := docker.DecodeContainerLogStream(body, func(stream docker.ContainerLogStream, payload []byte) error {
+		name := "stdout"
+		if stream == docker.ContainerLogStderr {
+			name = "stderr"
+		}
+		return a.sendContainerLogStreamChunk(ctx, sender, msg, name, payload)
+	})
+	if err != nil {
+		return fmt.Errorf("forwarding container log stream: %w", err)
 	}
-
-	frameHeader := make([]byte, 8)
-	for {
-		if _, err := io.ReadFull(reader, frameHeader); err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				return nil
-			}
-			return fmt.Errorf("reading container log frame header: %w", err)
-		}
-
-		size := binary.BigEndian.Uint32(frameHeader[4:8])
-		if size == 0 {
-			continue
-		}
-		if size > maxContainerLogStreamFrameBytes {
-			if _, err := io.CopyN(io.Discard, reader, int64(size)); err != nil {
-				return fmt.Errorf("skipping oversized container log frame (%d bytes): %w", size, err)
-			}
-			continue
-		}
-
-		payload := make([]byte, size)
-		if _, err := io.ReadFull(reader, payload); err != nil {
-			return fmt.Errorf("reading container log frame payload: %w", err)
-		}
-		stream := "stdout"
-		if frameHeader[0] == 2 {
-			stream = "stderr"
-		}
-		if err := a.sendContainerLogStreamChunk(ctx, sender, msg, stream, payload); err != nil {
-			return err
-		}
-	}
-}
-
-func (a *Adapter) forwardRawContainerLogStream(
-	ctx context.Context,
-	sender adapter.MessageSender,
-	msg protocol.DDContainerLogRequestMessage,
-	reader io.Reader,
-) error {
-	buffer := make([]byte, 32<<10)
-	for {
-		n, err := reader.Read(buffer)
-		if n > 0 {
-			if sendErr := a.sendContainerLogStreamChunk(ctx, sender, msg, "stdout", buffer[:n]); sendErr != nil {
-				return sendErr
-			}
-		}
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
-			return fmt.Errorf("reading raw container log stream: %w", err)
-		}
-	}
-}
-
-func looksLikeDockerLogFrame(header []byte) bool {
-	return len(header) >= 8 &&
-		header[0] <= 2 &&
-		header[1] == 0 &&
-		header[2] == 0 &&
-		header[3] == 0
+	return nil
 }
 
 func (a *Adapter) sendContainerLogStreamChunk(
