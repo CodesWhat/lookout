@@ -160,6 +160,11 @@ type Server struct {
 	// can call signal.Stop on it.
 	hupCh chan os.Signal
 
+	// containerMetricsOnce guards containerCollector, the one collector every
+	// scrape shares so overlapping scrapes cost Docker a single stats pool.
+	containerMetricsOnce sync.Once
+	containerCollector   *metrics.ContainerCollector
+
 	shutdownOnce   sync.Once
 	auditCloseOnce sync.Once
 	handlerWG      sync.WaitGroup

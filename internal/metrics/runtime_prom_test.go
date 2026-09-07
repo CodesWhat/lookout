@@ -146,7 +146,7 @@ func TestWriteContainerPrometheus(t *testing.T) {
 	}
 
 	var b strings.Builder
-	metrics.WriteContainerPrometheus(context.Background(), &b, client, metrics.EscapeLabelValue)
+	metrics.WriteContainerPrometheus(context.Background(), &b, metrics.NewContainerCollector(client), metrics.EscapeLabelValue)
 	body := b.String()
 	for _, want := range []string{
 		`container_cpu_usage_seconds_total{id="one\"id",name="api\nworker",image="repo\\image:v1"} 2.5`,
@@ -172,18 +172,19 @@ func TestWriteContainerPrometheusNoData(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name   string
-		client metrics.DockerMetricsClient
+		name      string
+		collector *metrics.ContainerCollector
 	}{
-		{name: "nil client"},
+		{name: "nil collector"},
+		{name: "nil client", collector: metrics.NewContainerCollector(nil)},
 		{
 			name: "list error",
-			client: &dockerMetricsFake{
+			collector: metrics.NewContainerCollector(&dockerMetricsFake{
 				listErr: errors.New("list unavailable"),
-			},
+			}),
 		},
 		{
-			// Kills the INVERT_LOGICAL mutant at runtime_prom.go:95:16
+			// Kills the INVERT_LOGICAL mutant at runtime_prom.go:194:16
 			// (`err != nil || len(containers) == 0` turned into `&&`). A list
 			// error alongside a non-empty containers slice whose stats are
 			// fully populated is the case that discriminates AND from OR:
@@ -192,24 +193,24 @@ func TestWriteContainerPrometheusNoData(t *testing.T) {
 			// since it is not, the mutant proceeds to fetch stats and emit a
 			// clean, complete metrics line for c1 instead of nothing.
 			name: "list error with usable container data",
-			client: &dockerMetricsFake{
+			collector: metrics.NewContainerCollector(&dockerMetricsFake{
 				listErr:    errors.New("list unavailable"),
 				containers: []docker.ContainerJSON{{ID: "c1"}},
 				stats: map[string]*docker.ContainerStatsResponse{
 					"c1": mustContainerStats(t, `{"cpu_stats":{"cpu_usage":{"total_usage":1000000000}},"memory_stats":{"usage":100,"limit":200},"networks":{}}`),
 				},
-			},
+			}),
 		},
 		{
-			name:   "empty list",
-			client: &dockerMetricsFake{},
+			name:      "empty list",
+			collector: metrics.NewContainerCollector(&dockerMetricsFake{}),
 		},
 		{
 			name: "all stats fail",
-			client: &dockerMetricsFake{
+			collector: metrics.NewContainerCollector(&dockerMetricsFake{
 				containers: []docker.ContainerJSON{{ID: "failed"}},
 				statsErr:   map[string]error{"failed": errors.New("stats unavailable")},
-			},
+			}),
 		},
 	}
 
@@ -217,7 +218,7 @@ func TestWriteContainerPrometheusNoData(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			var b strings.Builder
-			metrics.WriteContainerPrometheus(context.Background(), &b, tt.client, noEscape)
+			metrics.WriteContainerPrometheus(context.Background(), &b, tt.collector, noEscape)
 			if b.Len() != 0 {
 				t.Fatalf("unexpected metrics without usable data:\n%s", b.String())
 			}
@@ -228,7 +229,7 @@ func TestWriteContainerPrometheusNoData(t *testing.T) {
 // TestWriteContainerPrometheusEmitsMemoryLimitAfterZeroLimit verifies the
 // container_spec_memory_limit_bytes emission loop keeps going past a
 // zero-limit result to emit a later, valid nonzero-limit result, killing the
-// INVERT_LOOPCTRL mutant at runtime_prom.go:182:4 (`continue` -> `break`).
+// INVERT_LOOPCTRL mutant at runtime_prom.go:287:4 (`continue` -> `break`).
 // The first container's memory_stats.limit is 0; the second's is nonzero.
 // `valid` preserves container/index order (results[idx] is written by
 // index, and valid iterates results in index order regardless of goroutine
@@ -262,7 +263,7 @@ func TestWriteContainerPrometheusEmitsMemoryLimitAfterZeroLimit(t *testing.T) {
 	}
 
 	var b strings.Builder
-	metrics.WriteContainerPrometheus(context.Background(), &b, client, noEscape)
+	metrics.WriteContainerPrometheus(context.Background(), &b, metrics.NewContainerCollector(client), noEscape)
 	body := b.String()
 
 	if !strings.Contains(body, `container_spec_memory_limit_bytes{id="has-limit",name="has-limit",image=""} 4096`) {
@@ -291,7 +292,7 @@ func TestWriteContainerPrometheusUsesFixedWorkerPool(t *testing.T) {
 	go func() {
 		defer close(done)
 		var b strings.Builder
-		metrics.WriteContainerPrometheus(context.Background(), &b, client, noEscape)
+		metrics.WriteContainerPrometheus(context.Background(), &b, metrics.NewContainerCollector(client), noEscape)
 	}()
 
 	for i := 0; i < 8; i++ {
@@ -315,5 +316,123 @@ func TestWriteContainerPrometheusUsesFixedWorkerPool(t *testing.T) {
 	}
 	if got := client.maximum.Load(); got > 8 {
 		t.Fatalf("maximum concurrent stats calls = %d, want at most 8", got)
+	}
+}
+
+// countingDockerMetricsFake counts the Docker calls a collection makes and
+// holds every stats call open until the test releases it, so a second scrape
+// can be shown to arrive while the first collection is still running.
+type countingDockerMetricsFake struct {
+	containers []docker.ContainerJSON
+	lists      atomic.Int64
+	statsCalls atomic.Int64
+	entered    chan struct{}
+	release    chan struct{}
+}
+
+func (f *countingDockerMetricsFake) ListContainers(context.Context, bool) ([]docker.ContainerJSON, error) {
+	f.lists.Add(1)
+	return f.containers, nil
+}
+
+func (f *countingDockerMetricsFake) ContainerStats(ctx context.Context, _ string) (*docker.ContainerStatsResponse, error) {
+	f.statsCalls.Add(1)
+	f.entered <- struct{}{}
+	select {
+	case <-f.release:
+		return &docker.ContainerStatsResponse{}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// TestWriteContainerPrometheusSharesOneCollection asserts that scrapes
+// overlapping in time cost Docker exactly one collection: one ListContainers
+// and one stats request per container between them, not one of each per
+// scrape. A second scrape is only released once it has provably joined the
+// collection already in flight, so the test cannot pass by accident on a
+// scheduling order where the scrapes never overlapped.
+func TestWriteContainerPrometheusSharesOneCollection(t *testing.T) {
+	t.Parallel()
+
+	const containerCount = 3
+	containers := make([]docker.ContainerJSON, containerCount)
+	for i := range containers {
+		containers[i].ID = "container-" + strconv.Itoa(i)
+	}
+	client := &countingDockerMetricsFake{
+		containers: containers,
+		entered:    make(chan struct{}, containerCount),
+		release:    make(chan struct{}),
+	}
+	collector := metrics.NewContainerCollector(client)
+
+	bodies := make(chan string, 2)
+	scrape := func() {
+		var b strings.Builder
+		metrics.WriteContainerPrometheus(context.Background(), &b, collector, noEscape)
+		bodies <- b.String()
+	}
+
+	go scrape()
+	// The first scrape's pool is now blocked inside ContainerStats, so its
+	// collection cannot finish before the second scrape arrives.
+	select {
+	case <-client.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the first scrape's stats call")
+	}
+
+	go scrape()
+	joined := collector.WaitForContainerWaiters(2, 5*time.Second)
+	close(client.release)
+	if !joined {
+		t.Fatal("second scrape did not join the collection already in flight")
+	}
+
+	first := <-bodies
+	second := <-bodies
+	if first != second {
+		t.Errorf("scrapes sharing a collection reported different metrics:\nfirst:\n%s\nsecond:\n%s", first, second)
+	}
+	if !strings.Contains(first, `container_cpu_usage_seconds_total{id="container-0"`) {
+		t.Errorf("missing container series in shared scrape output:\n%s", first)
+	}
+
+	if got := client.lists.Load(); got != 1 {
+		t.Errorf("ListContainers calls = %d, want 1", got)
+	}
+	if got := client.statsCalls.Load(); got != containerCount {
+		t.Errorf("ContainerStats calls = %d, want %d", got, containerCount)
+	}
+}
+
+// TestWriteContainerPrometheusCollectsAgainAfterFlight is the other half of
+// the sharing rule: sharing lasts only as long as a collection is in flight.
+// A scrape arriving after the previous one finished must sample Docker again
+// rather than replay the finished collection's results, which would turn the
+// deduplication into a cache with no expiry.
+func TestWriteContainerPrometheusCollectsAgainAfterFlight(t *testing.T) {
+	t.Parallel()
+
+	release := make(chan struct{})
+	close(release)
+	client := &countingDockerMetricsFake{
+		containers: []docker.ContainerJSON{{ID: "container-0"}},
+		entered:    make(chan struct{}, 2),
+		release:    release,
+	}
+	collector := metrics.NewContainerCollector(client)
+
+	for range 2 {
+		var b strings.Builder
+		metrics.WriteContainerPrometheus(context.Background(), &b, collector, noEscape)
+		if !strings.Contains(b.String(), `container_cpu_usage_seconds_total{id="container-0"`) {
+			t.Fatalf("missing container series:\n%s", b.String())
+		}
+	}
+
+	if got := client.lists.Load(); got != 2 {
+		t.Errorf("ListContainers calls = %d, want 2 across two sequential scrapes", got)
 	}
 }
