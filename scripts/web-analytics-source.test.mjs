@@ -23,7 +23,7 @@ function assertPostHogPackagesCurrent(lock) {
   );
   assert.ok(postHogPackages.length > 0);
   for (const [name, packageData] of postHogPackages) {
-    assert.equal(packageData.version, "1.422.5", name);
+    assert.equal(packageData.version, "1.427.0", name);
   }
 }
 
@@ -50,7 +50,7 @@ test("both web roots use the shared PostHog client and no Vercel analytics", () 
     paths: [path.join(ROOT, "analytics")],
   });
   const extensionBundleBytes = fs.statSync(extensionBundle).size;
-  assert.equal(extensionBundleBytes, 151_300);
+  assert.equal(extensionBundleBytes, 155_315);
   assert.notEqual(extensionBundleBytes, 148_886);
   assert.ok(extensionBundleBytes > 850_000 - 784_278);
 
