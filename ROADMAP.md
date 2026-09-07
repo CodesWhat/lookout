@@ -45,8 +45,8 @@ The path to `v1.0.0` is gated on concrete, verifiable items rather than a
 calendar date:
 
 - **Completed 2026-08-29 (re-verified 2026-09-02): Competitive review gate.**
-  The market audit is published in
-  [COMPETITIVE-LANDSCAPE.md](COMPETITIVE-LANDSCAPE.md). Comparison claims must
+  The market audit is published at
+  [portwing.codeswhat.com/docs/competitive-landscape](https://portwing.codeswhat.com/docs/competitive-landscape). Comparison claims must
   stay tied to primary sources. The audit found no missing container lifecycle,
   streaming, Compose, observability, or authentication primitive that requires
   new Portwing code for v1.0. A final re-verify against primary sources at the

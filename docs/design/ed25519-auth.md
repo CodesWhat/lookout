@@ -404,7 +404,7 @@ This means the authorized-keys file remains the single source of truth regardles
 ## 6. Current comparison
 
 This design is implemented as of Portwing v0.8.1. The canonical cross-product
-review now lives in [`COMPETITIVE-LANDSCAPE.md`](../../COMPETITIVE-LANDSCAPE.md);
+review now lives in the published [competitive landscape](https://portwing.codeswhat.com/docs/competitive-landscape);
 this table retains only the authentication-specific comparison.
 
 | Property | Portwing v0.8.1 | Komodo v2 Periphery | Arcane v2.9 Agent |

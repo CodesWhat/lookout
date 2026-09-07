@@ -95,7 +95,7 @@ flowchart LR
 | --- | --- |
 | Website | [portwing.codeswhat.com](https://portwing.codeswhat.com) |
 | Docs | [portwing.codeswhat.com/docs](https://portwing.codeswhat.com/docs) |
-| Competitive Landscape | [`COMPETITIVE-LANDSCAPE.md`](COMPETITIVE-LANDSCAPE.md) |
+| Competitive Landscape | [portwing.codeswhat.com/docs/competitive-landscape](https://portwing.codeswhat.com/docs/competitive-landscape) |
 | Security Model | [`docs/security-model.md`](docs/security-model.md) |
 | Ed25519 Auth Design | [`docs/design/ed25519-auth.md`](docs/design/ed25519-auth.md) |
 | Watchtower Migration | [`docs/migrating-from-watchtower.md`](docs/migrating-from-watchtower.md) |
@@ -836,7 +836,7 @@ sockguard versions tested together.
 
 <h2 align="center" id="competitive-landscape">Competitive Landscape</h2>
 
-The versioned [competitive landscape](COMPETITIVE-LANDSCAPE.md) compares
+The published [competitive landscape](https://portwing.codeswhat.com/docs/competitive-landscape) compares
 Portwing with Portainer Agent, Komodo Periphery, Arcane Agent, Hawser, Docker's
 native remote-access options, and adjacent agents. It records primary sources,
 feature ownership across Portwing/Drydock/Sockguard, pre-v1 gates, candidate
