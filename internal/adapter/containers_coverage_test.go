@@ -318,8 +318,11 @@ func TestRefreshListError(t *testing.T) {
 	}
 }
 
-// TestRefreshInspectError covers containers.go:123-125 — a container appears
-// in the list but InspectContainer fails; it must be silently skipped.
+// TestRefreshInspectError covers the inspect-failure path with nothing to
+// fall back on — a container appears in the list, its inspect fails, and
+// neither the inspect cache nor the previous snapshot has ever held a build
+// of it, so it is skipped. The fallback for a container the agent has seen
+// before is TestRefreshKeepsCachedContainerWhenInspectFails.
 func TestRefreshInspectError(t *testing.T) {
 	t.Parallel()
 
@@ -682,4 +685,138 @@ func TestBuildRuntimeDetailsOptionalFields(t *testing.T) {
 			t.Fatalf("expected EMPTY= to produce empty value, got %+v", d.Env[2])
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Refresh keeps a still-listed container whose inspect failed
+// ---------------------------------------------------------------------------
+
+// TestRefreshKeepsCachedContainerWhenInspectFails covers the inspect-failure
+// fallback in Refresh: the daemon still lists the container, so a failed
+// inspect means the agent could not re-read it, not that it is gone. Dropping
+// it would report it removed and take it out of the served inventory until a
+// later poll happened to succeed.
+//
+// It also pins the retry: the cache entry keeps its old signal through the
+// failure, so the next poll misses again and re-inspects instead of serving
+// the stale build forever.
+func TestRefreshKeepsCachedContainerWhenInspectFails(t *testing.T) {
+	t.Parallel()
+
+	client, fixture, shutdown := newDynamicDockerClient(t)
+	defer shutdown()
+
+	healthy := []fixtureContainer{
+		{id: "c1", image: "nginx:1.0", state: "running"},
+		{id: "c2", image: "redis:7", state: "running"},
+	}
+	fixture.Set(buildInventorySnapshot(healthy))
+
+	manager := NewContainerManager(client, "test-agent", nil)
+	if _, err := manager.BuildInventory(context.Background()); err != nil {
+		t.Fatalf("build inventory: %v", err)
+	}
+	// The first refresh is what populates the inspect cache.
+	if _, _, _, err := manager.Refresh(context.Background()); err != nil {
+		t.Fatalf("first refresh: %v", err)
+	}
+
+	manager.cacheMu.Lock()
+	cachedSignal := manager.inspectCache["c2"].signal
+	manager.cacheMu.Unlock()
+	if cachedSignal == "" {
+		t.Fatal("expected c2 to be cached after the first refresh")
+	}
+
+	// c2 stays listed but its status moves, so its cache signal no longer
+	// matches and Refresh has to re-inspect it — and that inspect now fails.
+	degraded := buildInventorySnapshot(healthy)
+	degraded.listed[1].Status = "Up 10 minutes"
+	delete(degraded.inspected, "c2")
+	fixture.Set(degraded)
+
+	added, updated, removed, err := manager.Refresh(context.Background())
+	if err != nil {
+		t.Fatalf("refresh with failing inspect: %v", err)
+	}
+	if len(added) != 0 || len(updated) != 0 || len(removed) != 0 {
+		t.Fatalf("failed inspect changed the diff: added=%d updated=%d removed=%d",
+			len(added), len(updated), len(removed))
+	}
+	assertContainerIDs(t, manager.GetContainers(), []string{"c1", "c2"})
+
+	c2, ok := manager.GetContainer("c2")
+	if !ok {
+		t.Fatal("c2 dropped out of the inventory after a failed inspect")
+	}
+	if c2.Name != "c2" || c2.Status != "running" {
+		t.Fatalf("c2 = {name:%q status:%q}, want the last known build {name:\"c2\" status:\"running\"}", c2.Name, c2.Status)
+	}
+
+	manager.cacheMu.Lock()
+	retainedSignal := manager.inspectCache["c2"].signal
+	manager.cacheMu.Unlock()
+	if retainedSignal != cachedSignal {
+		t.Fatalf("cached signal = %q, want the pre-failure %q so the next poll retries", retainedSignal, cachedSignal)
+	}
+
+	// The daemon recovers: the next poll must re-inspect rather than keep
+	// serving the stale build.
+	recovered := buildInventorySnapshot([]fixtureContainer{
+		{id: "c1", image: "nginx:1.0", state: "running"},
+		{id: "c2", image: "redis:7", state: "exited"},
+	})
+	recovered.listed[1].Status = "Up 10 minutes"
+	fixture.Set(recovered)
+
+	if _, updated, _, err = manager.Refresh(context.Background()); err != nil {
+		t.Fatalf("refresh after recovery: %v", err)
+	}
+	assertContainerIDs(t, updated, []string{"c2"})
+	if c2, _ = manager.GetContainer("c2"); c2.Status != "stopped" {
+		t.Fatalf("c2 status = %q after recovery, want stopped", c2.Status)
+	}
+}
+
+// TestRefreshKeepsBuiltContainerWhenFirstInspectFails covers the second half
+// of the same fallback. BuildInventory fills the container map but not the
+// inspect cache, so the first Refresh after startup has no cache entry to
+// fall back on and has to reach for the previous snapshot instead.
+func TestRefreshKeepsBuiltContainerWhenFirstInspectFails(t *testing.T) {
+	t.Parallel()
+
+	client, fixture, shutdown := newDynamicDockerClient(t)
+	defer shutdown()
+
+	healthy := []fixtureContainer{
+		{id: "c1", image: "nginx:1.0", state: "running"},
+		{id: "c2", image: "redis:7", state: "running"},
+	}
+	fixture.Set(buildInventorySnapshot(healthy))
+
+	manager := NewContainerManager(client, "test-agent", nil)
+	if _, err := manager.BuildInventory(context.Background()); err != nil {
+		t.Fatalf("build inventory: %v", err)
+	}
+
+	degraded := buildInventorySnapshot(healthy)
+	delete(degraded.inspected, "c2")
+	fixture.Set(degraded)
+
+	_, _, removed, err := manager.Refresh(context.Background())
+	if err != nil {
+		t.Fatalf("refresh with failing inspect: %v", err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("removed = %d, want 0; a failed inspect is not a removal", len(removed))
+	}
+	assertContainerIDs(t, manager.GetContainers(), []string{"c1", "c2"})
+
+	c2, ok := manager.GetContainer("c2")
+	if !ok {
+		t.Fatal("c2 dropped out of the inventory after a failed first inspect")
+	}
+	if c2.Name != "c2" {
+		t.Fatalf("c2 name = %q, want the build BuildInventory produced", c2.Name)
+	}
 }

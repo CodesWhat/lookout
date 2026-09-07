@@ -118,16 +118,35 @@ func (m *ContainerManager) Refresh(ctx context.Context) (added, updated, removed
 		if cached, hit := m.inspectCache[entry.ID]; hit && cached.signal == signal {
 			c := cached.container
 			newMap[c.ID] = c
-		} else {
-			inspect, err := m.dockerClient.InspectContainer(ctx, entry.ID)
-			if err != nil {
+			continue
+		}
+
+		inspect, err := m.dockerClient.InspectContainer(ctx, entry.ID)
+		if err != nil {
+			// The daemon still listed this container, so a failed inspect
+			// is a failure to re-read it, not evidence that it is gone.
+			// Dropping it here would report it removed and pull it out of
+			// the served inventory until some later poll happened to
+			// succeed, so serve the last known build instead. The cache
+			// entry is deliberately left holding its old signal: the next
+			// poll then misses again and retries the inspect.
+			last, known := m.lastKnownContainer(entry.ID, oldMap)
+			if !known {
 				slog.Warn("failed to inspect container during refresh", "id", entry.ID, "error", err)
 				continue
 			}
-			c := m.toContainer(inspect, &entry)
-			m.inspectCache[entry.ID] = cachedContainer{container: c, signal: signal}
-			newMap[c.ID] = c
+			slog.Warn(
+				"failed to inspect container during refresh, keeping last known entry",
+				"id", entry.ID,
+				"error", err,
+			)
+			newMap[last.ID] = last
+			continue
 		}
+
+		c := m.toContainer(inspect, &entry)
+		m.inspectCache[entry.ID] = cachedContainer{container: c, signal: signal}
+		newMap[c.ID] = c
 	}
 
 	// Evict stale cache entries.
@@ -158,6 +177,19 @@ func (m *ContainerManager) Refresh(ctx context.Context) (added, updated, removed
 	m.containers = newMap
 	m.containersMu.Unlock()
 	return added, updated, removed, nil
+}
+
+// lastKnownContainer returns the most recent successful build of a container:
+// its inspect-cache entry if one survives, otherwise its entry in the previous
+// inventory snapshot. The cache is empty until the first Refresh populates it,
+// so the snapshot covers containers that BuildInventory produced. Callers must
+// hold cacheMu.
+func (m *ContainerManager) lastKnownContainer(id string, previous map[string]Container) (Container, bool) {
+	if cached, ok := m.inspectCache[id]; ok {
+		return cached.container, true
+	}
+	c, ok := previous[id]
+	return c, ok
 }
 
 func containerHealth(container Container) string {
