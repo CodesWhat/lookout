@@ -2,12 +2,10 @@ package generic
 
 import (
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"net/http"
-	"strconv"
 
-	"github.com/codeswhat/portwing/internal/docker"
+	"github.com/codeswhat/portwing/internal/adapter"
 )
 
 func (a *Adapter) handleContainers(w http.ResponseWriter, _ *http.Request) {
@@ -18,61 +16,13 @@ func (a *Adapter) handleContainers(w http.ResponseWriter, _ *http.Request) {
 	}
 }
 
+// handleContainerLogs serves the generic container log route. The generic REST
+// surface has no `timestamps` parameter, so lines are always served as the
+// daemon wrote them; the rest of the lifecycle is
+// adapter.ServeContainerLogs, shared with the Drydock adapter.
 func (a *Adapter) handleContainerLogs(w http.ResponseWriter, r *http.Request) {
-	containerID := r.PathValue("id")
-	tail := r.URL.Query().Get("tail")
-	since := r.URL.Query().Get("since")
-	until := r.URL.Query().Get("until")
-	follow := r.URL.Query().Get("follow") == "1" || r.URL.Query().Get("follow") == "true"
-
-	if tail != "" {
-		n, err := strconv.Atoi(tail)
-		if err != nil || n <= 0 {
-			http.Error(w, "invalid tail: must be a positive integer", http.StatusBadRequest)
-			return
-		}
-		tail = strconv.Itoa(n)
-	}
-
-	// Bound concurrent follow-mode log streams against the shared stream
-	// limit (SPEC 7.3), before the daemon call so a rejected follow request
-	// costs nothing. Non-follow requests are a single bounded read and are
-	// never gated.
-	var release func()
-	if follow {
-		var ok bool
-		release, ok = a.admit.Admit()
-		if !ok {
-			slog.Warn("concurrent stream limit reached, rejecting log follow", "containerId", containerID)
-			http.Error(w, streamLimitRejectionMessage, http.StatusServiceUnavailable)
-			return
-		}
-		defer release()
-	}
-
-	body, err := a.dockerClient.GetContainerLogs(r.Context(), containerID, tail, since, until, follow, false)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("getting logs: %v", err), docker.StatusCodeForError(err))
-		return
-	}
-	defer body.Close()
-
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	if follow {
-		w.Header().Set("Transfer-Encoding", "chunked")
-	}
-
-	flusher, canFlush := w.(http.Flusher)
-	err = docker.DecodeContainerLogStream(body, func(_ docker.ContainerLogStream, payload []byte) error {
-		if _, writeErr := w.Write(payload); writeErr != nil {
-			return writeErr
-		}
-		if canFlush {
-			flusher.Flush()
-		}
-		return nil
+	adapter.ServeContainerLogs(w, r, adapter.ContainerLogOptions{
+		Client: a.dockerClient,
+		Admit:  a.admit,
 	})
-	if err != nil {
-		slog.Debug("log stream ended", "error", err)
-	}
 }
