@@ -317,6 +317,13 @@ components:
           example: "docker"
         agent:
           type: string
+        health:
+          type: string
+          description: >
+            Docker health-check state, present only when the container
+            declares a health check.
+          enum: [starting, healthy, unhealthy]
+          example: "healthy"
         image:
           $ref: '#/components/schemas/ContainerImage'
         result:
@@ -326,8 +333,7 @@ components:
         updateAvailable:
           type: boolean
         updateKind:
-          type: string
-          example: "tag"
+          $ref: '#/components/schemas/ContainerUpdateKind'
         includeTags:
           type: string
         excludeTags:
@@ -343,13 +349,93 @@ components:
 
     ContainerImage:
       type: object
+      description: >
+        Drydock's image model. `registry`, `tag` and `digest` are objects, not
+        strings: Drydock's AgentClient stores this shape verbatim, so the
+        nesting is the wire contract rather than an encoding detail.
+      required: [id, registry, name, tag, digest, architecture, os]
       properties:
         id:
           type: string
+          example: "sha256:0f2c1a2f"
+        registry:
+          $ref: '#/components/schemas/ContainerImageRegistry'
         name:
           type: string
+          example: "library/nginx"
         tag:
+          $ref: '#/components/schemas/ContainerImageTag'
+        digest:
+          $ref: '#/components/schemas/ContainerImageDigest'
+        architecture:
           type: string
+          description: Image architecture, falling back to the agent's own.
+          example: "arm64"
+        os:
+          type: string
+          description: Image OS, falling back to the agent's own.
+          example: "linux"
+        created:
+          type: string
+          description: Image creation timestamp, when the daemon reports one.
+
+    ContainerImageRegistry:
+      type: object
+      description: >
+        Registry component assignment. Portwing reports the URL it parsed from
+        the image reference and leaves `name` as `unknown`, because the
+        registry component is named by the Drydock controller's own config.
+      required: [name, url]
+      properties:
+        name:
+          type: string
+          example: "unknown"
+        url:
+          type: string
+          example: "docker.io"
+
+    ContainerImageTag:
+      type: object
+      required: [value, semver]
+      properties:
+        value:
+          type: string
+          example: "1.27.0"
+        semver:
+          type: boolean
+          description: >
+            Whether Drydock should treat `value` as a semver range. Portwing
+            reports false; semver classification is controller-owned.
+          example: false
+
+    ContainerImageDigest:
+      type: object
+      required: [watch]
+      properties:
+        watch:
+          type: boolean
+          description: >
+            Whether Drydock should watch the digest for changes. Portwing
+            reports false; digest watching is controller-owned.
+          example: false
+        value:
+          type: string
+          description: Image digest (`sha256:...`) when the daemon reports one.
+        repo:
+          type: string
+          description: Digest repository, set by the Drydock controller.
+
+    ContainerUpdateKind:
+      type: object
+      description: >
+        Update classification. Portwing's raw inventory always reports
+        `{"kind":"unknown"}`; the Drydock controller fills in the real kind
+        from its own watcher result.
+      required: [kind]
+      properties:
+        kind:
+          type: string
+          example: "unknown"
 
     ContainerResult:
       type: object
