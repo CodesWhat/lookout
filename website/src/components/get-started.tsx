@@ -165,10 +165,10 @@ export function GetStarted() {
 brew install --cask codeswhat/tap/portwing
 
 # Debian / Ubuntu
-sudo apt install ./portwing_0.9.15_linux_amd64.deb
+sudo apt install ./portwing_0.9.16_linux_amd64.deb
 
 # Fedora / RHEL
-sudo rpm --install ./portwing_0.9.15_linux_amd64.rpm`}</code>
+sudo rpm --install ./portwing_0.9.16_linux_amd64.rpm`}</code>
               </pre>
             </div>
           )}

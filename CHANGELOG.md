@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v0.9.16] - 2026-09-07
+
+### Changed
+
+- **Web dependency refresh.** The website, docs and analytics packages move to
+  Next.js 16.3.4, posthog-js 1.427.0, Biome 2.5.12, PostCSS 8.5.28 and the
+  current `@types/node` and `@types/react-dom` pins, with `package-lock.json`
+  and the analytics source test (posthog-js version and extension bundle size)
+  synced to match. No Go, protocol or workflow changes.
+
 ## [v0.9.15] - 2026-09-07
 
 ### Changed
