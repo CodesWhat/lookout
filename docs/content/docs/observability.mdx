@@ -139,7 +139,7 @@ that remains at capacity while the exporter error counter rises.
 ```text
 # HELP portwing_build_info Portwing agent build metadata.
 # TYPE portwing_build_info gauge
-portwing_build_info{version="0.9.15"} 1
+portwing_build_info{version="0.9.16"} 1
 # HELP portwing_uptime_seconds Seconds since the agent started.
 # TYPE portwing_uptime_seconds gauge
 portwing_uptime_seconds 3842.7
@@ -193,7 +193,7 @@ curl http://your-host:3000/health
 Returns HTTP 200 with the full operational shape:
 
 ```json
-{"status":"ok","live":true,"ready":false,"mode":"standard","version":"0.9.15","uptimeSeconds":3842.7,"docker":"unknown","controller":"not_applicable"}
+{"status":"ok","live":true,"ready":false,"mode":"standard","version":"0.9.16","uptimeSeconds":3842.7,"docker":"unknown","controller":"not_applicable"}
 ```
 
 ### GET /ready
@@ -209,13 +209,13 @@ curl http://your-host:3000/ready
 Standard-mode ready response:
 
 ```json
-{"status":"healthy","live":true,"ready":true,"mode":"standard","version":"0.9.15","uptimeSeconds":3842.7,"docker":"connected","controller":"not_applicable"}
+{"status":"healthy","live":true,"ready":true,"mode":"standard","version":"0.9.16","uptimeSeconds":3842.7,"docker":"connected","controller":"not_applicable"}
 ```
 
 Edge-mode not-ready response:
 
 ```json
-{"status":"unhealthy","live":true,"ready":false,"mode":"edge","version":"0.9.15","uptimeSeconds":42.1,"docker":"connected","controller":"disconnected"}
+{"status":"unhealthy","live":true,"ready":false,"mode":"edge","version":"0.9.16","uptimeSeconds":42.1,"docker":"connected","controller":"disconnected"}
 ```
 
 `GET /_portwing/health` remains as a compatibility alias for `/ready`.
