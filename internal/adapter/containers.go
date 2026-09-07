@@ -113,7 +113,7 @@ func (m *ContainerManager) Refresh(ctx context.Context) (added, updated, removed
 
 	m.cacheMu.Lock()
 	for _, entry := range listed {
-		signal := entry.State + "|" + entry.Status + "|" + entry.ImageID
+		signal := containerChangeSignal(&entry)
 
 		if cached, hit := m.inspectCache[entry.ID]; hit && cached.signal == signal {
 			c := cached.container
@@ -177,6 +177,21 @@ func (m *ContainerManager) Refresh(ctx context.Context) (added, updated, removed
 	m.containers = newMap
 	m.containersMu.Unlock()
 	return added, updated, removed, nil
+}
+
+// containerChangeSignal fingerprints a listed container so Refresh can tell
+// whether its cached inspect result is still current. It covers every mutable
+// field the list endpoint reports that the built Container depends on.
+//
+// Names is in there because `docker rename` changes nothing else: State and
+// ImageID are untouched and Status is a humanised age ("Exited (0) 2 months
+// ago"), which for a stopped container can go a month without ticking over.
+// A rename would otherwise keep serving the old name until something
+// unrelated happened to invalidate the entry. Container names cannot contain
+// "|" or ",", so joining them can't collide with a different name set.
+func containerChangeSignal(entry *docker.ContainerJSON) string {
+	return entry.State + "|" + entry.Status + "|" + entry.ImageID + "|" +
+		strings.Join(entry.Names, ",")
 }
 
 // lastKnownContainer returns the most recent successful build of a container:

@@ -102,11 +102,12 @@ func TestContainerManagerRefreshDiffsAddedUpdatedRemoved(t *testing.T) {
 }
 
 // containerSignalSnapshot builds a one-container inventory snapshot with the
-// *listed* entry's State/Status/ImageID set explicitly — these three fields
-// are what Refresh hashes into the inspect-cache signal (containers.go:116),
-// distinct from the nested inspect State used by buildInventorySnapshot's
-// fixtureContainer helper. Varying them across two fixture.Set calls is what
-// lets a test force a signal change between two Refresh calls.
+// *listed* entry's State/Status/ImageID set explicitly — three of the four
+// fields Refresh hashes into the inspect-cache signal (containerChangeSignal;
+// the fourth is Names), distinct from the nested inspect State used by
+// buildInventorySnapshot's fixtureContainer helper. Varying them across two
+// fixture.Set calls is what lets a test force a signal change between two
+// Refresh calls.
 func containerSignalSnapshot(id, listState, listStatus, imageID, inspectStatus string, running bool) dockerInventorySnapshot {
 	return dockerInventorySnapshot{
 		listed: []docker.ContainerJSON{
@@ -141,10 +142,10 @@ func containerSignalSnapshot(id, listState, listStatus, imageID, inspectStatus s
 	}
 }
 
-// TestRefreshBypassesStaleCacheWhenContainerSignalChanges covers
-// containers.go:118 — the inspect-cache hit is only used when the cached
-// entry's signal (state|status|imageID) still matches the freshly listed
-// entry. A cache hit whose signal has drifted must fall through to a fresh
+// TestRefreshBypassesStaleCacheWhenContainerSignalChanges covers the
+// inspect-cache hit in Refresh — it is only used when the cached entry's
+// signal (containerChangeSignal) still matches the freshly listed entry. A
+// cache hit whose signal has drifted must fall through to a fresh
 // InspectContainer call, not serve the stale cached container.
 func TestRefreshBypassesStaleCacheWhenContainerSignalChanges(t *testing.T) {
 	t.Parallel()
@@ -187,6 +188,95 @@ func TestRefreshBypassesStaleCacheWhenContainerSignalChanges(t *testing.T) {
 	c1, ok = manager.GetContainer("c1")
 	if !ok || c1.Status != "stopped" {
 		t.Fatalf("expected c1 status stopped after signal change, got %+v ok=%v", c1, ok)
+	}
+}
+
+// renamedContainerSnapshot builds a one-container inventory for a stopped
+// container whose only difference across two calls is its name. State,
+// Status and ImageID are held fixed, which is exactly what `docker rename`
+// leaves alone on a stopped container.
+func renamedContainerSnapshot(id, name string) dockerInventorySnapshot {
+	return dockerInventorySnapshot{
+		listed: []docker.ContainerJSON{
+			{
+				ID:      id,
+				Names:   []string{"/" + name},
+				Image:   "nginx:1.0",
+				ImageID: "sha256:v1",
+				State:   "exited",
+				Status:  "Exited (0) 2 months ago",
+				Labels:  map[string]string{"test.id": id},
+			},
+		},
+		inspected: map[string]docker.ContainerInspect{
+			id: {
+				ID:      id,
+				Name:    "/" + name,
+				Created: "2026-01-01T00:00:00Z",
+				State: docker.ContainerState{
+					Status:     "exited",
+					StartedAt:  "2026-01-01T00:00:00Z",
+					FinishedAt: "2026-01-01T01:00:00Z",
+				},
+				Config: docker.ContainerConfig{
+					Image:  "nginx:1.0",
+					Labels: map[string]string{"test.id": id},
+				},
+				NetworkSettings: &docker.NetworkSettings{
+					Networks: map[string]docker.NetworkEndpoint{},
+				},
+			},
+		},
+	}
+}
+
+// TestRefreshServesTheNewNameAfterARename pins the Names half of
+// containerChangeSignal. `docker rename` on a stopped container touches
+// nothing else the list endpoint reports: State and ImageID are unchanged and
+// Status is a humanised age that can go a month without ticking over, so a
+// signal built from those three alone stays a cache hit and the agent keeps
+// serving the old name.
+func TestRefreshServesTheNewNameAfterARename(t *testing.T) {
+	t.Parallel()
+
+	client, fixture, shutdown := newDynamicDockerClient(t)
+	defer shutdown()
+
+	fixture.Set(renamedContainerSnapshot("c1", "old-name"))
+
+	manager := NewContainerManager(client, "test-agent", nil)
+	if _, err := manager.BuildInventory(context.Background()); err != nil {
+		t.Fatalf("build inventory: %v", err)
+	}
+	// The first refresh caches the inspect result under the old name.
+	if _, _, _, err := manager.Refresh(context.Background()); err != nil {
+		t.Fatalf("first refresh: %v", err)
+	}
+	c1, ok := manager.GetContainer("c1")
+	if !ok || c1.Name != "old-name" {
+		t.Fatalf("c1 = %+v ok=%v, want name old-name before the rename", c1, ok)
+	}
+
+	before := renamedContainerSnapshot("c1", "old-name").listed[0]
+	after := renamedContainerSnapshot("c1", "new-name").listed[0]
+	if before.State != after.State || before.Status != after.Status || before.ImageID != after.ImageID {
+		t.Fatal("fixture changed more than the name; the rename is no longer the only signal difference")
+	}
+	fixture.Set(renamedContainerSnapshot("c1", "new-name"))
+
+	if _, _, _, err := manager.Refresh(context.Background()); err != nil {
+		t.Fatalf("second refresh: %v", err)
+	}
+
+	c1, ok = manager.GetContainer("c1")
+	if !ok {
+		t.Fatal("c1 missing from the inventory after the rename")
+	}
+	if c1.Name != "new-name" {
+		t.Fatalf("name = %q, want new-name", c1.Name)
+	}
+	if c1.DisplayName != "new-name" {
+		t.Fatalf("displayName = %q, want new-name", c1.DisplayName)
 	}
 }
 
