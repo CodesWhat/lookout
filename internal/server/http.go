@@ -297,7 +297,7 @@ func NewServer(cfg *config.Config, dockerClient *docker.Client, a adapter.Server
 	handler := RecoveryMiddleware(http.Handler(mux))
 
 	s.httpServer = &http.Server{
-		Addr:    cfg.BindAddress + ":" + cfg.Port,
+		Addr:    config.ListenAddress(cfg.BindAddress, cfg.Port),
 		Handler: s.trackActiveHandler(handler),
 		// Bound the request-header read to mitigate slow-header (Slowloris)
 		// attacks. ReadTimeout/WriteTimeout are deliberately left zero so the

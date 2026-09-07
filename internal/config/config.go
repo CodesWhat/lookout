@@ -258,6 +258,23 @@ func Load() (*Config, error) {
 	return cfg, nil
 }
 
+// ListenAddress joins a configured BIND_ADDRESS and PORT into an address
+// net.Listen accepts. Concatenating them with a colon is wrong for IPv6: the
+// documented unbracketed form ("::1", "::") produces "::1:3000", which
+// net.SplitHostPort reads as host "::1:3000" with no port and the listen
+// fails. net.JoinHostPort adds the brackets, but it adds them to any host
+// containing a colon, so an already-bracketed "[::1]" would come back as
+// "[[::1]]:3000" — strip one layer first. Shared by standard mode's
+// Docker-proxy listener, edge mode's operations listener, and the startup log
+// line, so all three agree on the address that is actually bound.
+func ListenAddress(bindAddress, port string) string {
+	host := bindAddress
+	if len(host) >= 2 && strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = host[1 : len(host)-1]
+	}
+	return net.JoinHostPort(host, port)
+}
+
 // IsLoopbackBind reports whether address is a loopback bind (127.0.0.1,
 // ::1, or "localhost"). Shared by standard mode's Docker-proxy listener and
 // edge mode's operations listener, both of which fail closed on an

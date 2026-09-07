@@ -1937,7 +1937,7 @@ func (c *Client) startHealthServer() {
 		_, _ = io.WriteString(w, b.String())
 	})
 	c.healthServer = &http.Server{
-		Addr:              c.cfg.BindAddress + ":" + c.cfg.Port,
+		Addr:              config.ListenAddress(c.cfg.BindAddress, c.cfg.Port),
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 		// BaseContext runs once, right after the listener binds, which is
