@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A truncated Docker response stream no longer reports itself as complete.**
+  The edge agent's response relay ended every stream with `reason: "complete"`,
+  including the ones that ended on `io.ErrUnexpectedEOF`, a dockerd that died
+  mid-pull, or a declared `Content-Length` the body never reached. A controller
+  had no way to tell a finished image pull, build, `logs?follow`, export or
+  event stream from a truncated one, so a half-written layer or tar looked like
+  the whole payload. `io.EOF` is now the only end that sends `complete`;
+  anything else sends `reason: "error"` and logs the underlying read error. The
+  two-value vocabulary is documented in the Drydock integration reference.
+
 ## [v0.9.16] - 2026-09-07
 
 ### Changed
