@@ -157,8 +157,12 @@ type ComposeManager struct {
 	apiVersion   string
 	dockerSocket string
 
-	// stackLocks holds one reference-counted mutex per active StackName. Entries
-	// are removed after the final owner or waiter releases them.
+	// stackLocks holds one reference-counted mutex per active stack directory
+	// (canonical, cleaned, absolute path), not per StackName: file and
+	// process operations are keyed by directory, so the lock must be too, or
+	// two requests naming the same directory under different StackNames can
+	// interleave. Entries are removed after the final owner or waiter
+	// releases them.
 	stackLocksMu sync.Mutex
 	stackLocks   map[string]*stackLockEntry
 }
@@ -201,18 +205,19 @@ func (cm *ComposeManager) detectCompose() {
 	cm.isV2 = true
 }
 
-// lockStack acquires the per-StackName mutex, creating it on first use, and
-// returns a func that releases it. Two requests for different stack names
-// get independent mutexes and never block each other.
-func (cm *ComposeManager) lockStack(stackName string) func() {
+// lockStack acquires the per-stack-directory mutex, creating it on first
+// use, and returns a func that releases it. The key must be a canonical
+// (cleaned, absolute) directory path: requests for different directories get
+// independent mutexes and never block each other.
+func (cm *ComposeManager) lockStack(stackDirKey string) func() {
 	cm.stackLocksMu.Lock()
 	if cm.stackLocks == nil {
 		cm.stackLocks = make(map[string]*stackLockEntry)
 	}
-	entry := cm.stackLocks[stackName]
+	entry := cm.stackLocks[stackDirKey]
 	if entry == nil {
 		entry = &stackLockEntry{}
-		cm.stackLocks[stackName] = entry
+		cm.stackLocks[stackDirKey] = entry
 	}
 	entry.refs++
 	cm.stackLocksMu.Unlock()
@@ -223,11 +228,21 @@ func (cm *ComposeManager) lockStack(stackName string) func() {
 
 		cm.stackLocksMu.Lock()
 		entry.refs--
-		if entry.refs == 0 && cm.stackLocks[stackName] == entry {
-			delete(cm.stackLocks, stackName)
+		if entry.refs == 0 && cm.stackLocks[stackDirKey] == entry {
+			delete(cm.stackLocks, stackDirKey)
 		}
 		cm.stackLocksMu.Unlock()
 	}
+}
+
+// effectiveStackDir returns the stack directory a request operates on: the
+// explicit StackDir if set, else StackName (matching validateRequest,
+// writeStackFiles, and buildCommand).
+func effectiveStackDir(req ComposeRequest) string {
+	if req.StackDir != "" {
+		return req.StackDir
+	}
+	return req.StackName
 }
 
 // Execute dispatches a compose operation and returns the result.
@@ -239,14 +254,22 @@ func (cm *ComposeManager) Execute(ctx context.Context, req ComposeRequest) (*Com
 		return &ComposeResponse{Success: false, Error: err.Error()}, nil
 	}
 
-	// Serialize the write-then-exec sequence below per stack: without this,
-	// two concurrent "up" requests for the same StackName can interleave —
-	// request A writes its compose files, request B overwrites them before A
-	// runs "docker compose", and A deploys B's configuration while reporting
-	// success for A's request. Both requests are already authenticated with
-	// full compose control over this stack, so the lock is about correctness
-	// (deploying the config you asked for) rather than access control.
-	unlock := cm.lockStack(req.StackName)
+	// Serialize the write-then-exec sequence below per stack directory:
+	// without this, two concurrent "up" requests for the same directory can
+	// interleave — request A writes its compose files, request B overwrites
+	// them before A runs "docker compose", and A deploys B's configuration
+	// while reporting success for A's request. This is keyed by the
+	// canonical stack directory rather than StackName because file and
+	// process operations below are keyed by directory: two requests with
+	// different StackNames but the same StackDir must still serialize. Both
+	// requests are already authenticated with full compose control over this
+	// stack, so the lock is about correctness (deploying the config you
+	// asked for) rather than access control.
+	stackDirKey, err := cm.resolveStackRoot(effectiveStackDir(req))
+	if err != nil {
+		return &ComposeResponse{Success: false, Error: fmt.Sprintf("invalid stack path: %v", err)}, nil
+	}
+	unlock := cm.lockStack(stackDirKey)
 	defer unlock()
 
 	if req.Files != nil {
