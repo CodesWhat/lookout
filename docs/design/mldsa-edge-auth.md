@@ -4,7 +4,7 @@
 **Author:** PW-5.13a evaluation  
 **Branch:** `docs/pqc-edge-auth-design`  
 **Date:** 2026-09-03  
-**Related:** `docs/design/ed25519-auth.md`, `docs/security-model.md`, `COMPETITIVE-LANDSCAPE.md`
+**Related:** `docs/design/ed25519-auth.md`, `docs/security-model.md`, the published [competitive landscape](https://portwing.codeswhat.com/docs/competitive-landscape)
 
 **Revised twice on 2026-09-03 after review. The decision is unchanged.**
 Corrections are marked in place rather than quietly rewritten, because most were
