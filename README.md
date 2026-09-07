@@ -32,7 +32,7 @@
 <hr>
 
 > [!WARNING]
-> **Pre-1.0 software — APIs may still change.** Portwing is pre-`v1.0.0` (currently `v0.9.14`). The compatibility guarantees that already apply are published in [STABILITY.md](STABILITY.md); other surfaces may still change between minor releases. Pin to an exact version and review the [CHANGELOG](CHANGELOG.md) before upgrading.
+> **Pre-1.0 software — APIs may still change.** Portwing is pre-`v1.0.0` (currently `v0.9.15`). The compatibility guarantees that already apply are published in [STABILITY.md](STABILITY.md); other surfaces may still change between minor releases. Pin to an exact version and review the [CHANGELOG](CHANGELOG.md) before upgrading.
 
 <h2 align="center">Contents</h2>
 
@@ -59,7 +59,7 @@
 <hr>
 
 > [!NOTE]
-> **v0.9.14 is the current release.** Edge-agent fixes: SIGTERM now stops the agent promptly against a quiet controller (shutdown closes the controller connection instead of waiting out the 60-second read deadline, so `docker stop` and Kubernetes rollouts get a clean exit), a dropped tunnel no longer wedges a streamed request's `requestId` for 30 seconds when the controller reconnects and retries, and a failed host-metrics collection now emits an `error` frame carrying `host-metrics-unavailable` instead of silence. No protocol changes since v0.9.13. Full watcher/update feature compatibility requires Drydock `v1.6.0-rc.11+`; the stable wire contract remains `DrydockCompat` 1.4.0. See [CHANGELOG.md](CHANGELOG.md) for the full itemized history.
+> **v0.9.15 is the current release.** Docs-only patch: the competitive landscape is now maintained solely as the published docs page, and the root `COMPETITIVE-LANDSCAPE.md` working file is gone from the repository; README, ROADMAP and the design docs link to the page. No binary or protocol changes since v0.9.14; binaries are still rebuilt reproducibly. Full watcher/update feature compatibility requires Drydock `v1.6.0-rc.11+`; the stable wire contract remains `DrydockCompat` 1.4.0. See [CHANGELOG.md](CHANGELOG.md) for the full itemized history.
 
 ```mermaid
 flowchart LR
@@ -148,10 +148,10 @@ Stable releases also ship a Homebrew cask plus signed/checksummed `deb` and
 brew install --cask codeswhat/tap/portwing
 
 # Debian/Ubuntu (after downloading the matching release asset)
-sudo apt install ./portwing_0.9.14_linux_amd64.deb
+sudo apt install ./portwing_0.9.15_linux_amd64.deb
 
 # Fedora/RHEL (after downloading the matching release asset)
-sudo rpm --install ./portwing_0.9.14_linux_amd64.rpm
+sudo rpm --install ./portwing_0.9.15_linux_amd64.rpm
 ```
 
 Packages install the command and, on Linux, a hardened `portwing.service`; they
@@ -203,7 +203,7 @@ services:
       - SOCKGUARD_LISTEN_SOCKET=/var/run/sockguard/sockguard.sock
 
   portwing:
-    image: ghcr.io/codeswhat/portwing:0.9.14
+    image: ghcr.io/codeswhat/portwing:0.9.15
     restart: unless-stopped
     depends_on:
       - sockguard
@@ -256,7 +256,7 @@ sudo chown 65532:65532 portwing_ed25519.pem && sudo chmod 0400 portwing_ed25519.
 ```yaml
 services:
   portwing:
-    image: ghcr.io/codeswhat/portwing:0.9.14
+    image: ghcr.io/codeswhat/portwing:0.9.15
     restart: unless-stopped
     read_only: true
     cap_drop:
@@ -297,7 +297,7 @@ docker run -d \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -p 127.0.0.1:3000:3000 \
   -e TOKEN=$(openssl rand -hex 24) \
-  ghcr.io/codeswhat/portwing:0.9.14
+  ghcr.io/codeswhat/portwing:0.9.15
 ```
 
 Portwing now fails closed: Standard mode refuses to start without `TOKEN`,
@@ -331,7 +331,7 @@ changing the bind for remote access.
 <details>
 <summary><strong>Early release highlights (v0.1.0 – v0.3.0)</strong></summary>
 
-For v0.4.0 and later — including v0.9.14, the current release — see [CHANGELOG.md](CHANGELOG.md) for the full itemized history.
+For v0.4.0 and later — including v0.9.15, the current release — see [CHANGELOG.md](CHANGELOG.md) for the full itemized history.
 
 - **v0.3.0** — startup banner, Lookout→Portwing rename completed, GoReleaser `dockers_v2` migration, and two edge-mode bug fixes (reconnect backoff reset, steady-state read deadline).
 - **v0.2.0** — the security & observability release. Ed25519 per-request authentication with signed requests via `X-Portwing-Key-ID` / `X-Portwing-Timestamp` / `X-Portwing-Nonce` / `X-Portwing-Signature` headers, verified against an `authorized_keys` file. Replay protection via nonce LRU and timestamp window, SIGHUP hot-reload of the key file, `portwing keygen` CLI subcommand, and `X-Portwing-Reason` diagnostic header on 401s. Signed edge-mode hello via `PRIVATE_KEY_FILE`. Also shipped in v0.2.0:
@@ -388,7 +388,7 @@ docker run -d --name portwing \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -e TOKEN="$TOKEN" \
   -p 127.0.0.1:3000:3000 \
-  ghcr.io/codeswhat/portwing:0.9.14
+  ghcr.io/codeswhat/portwing:0.9.15
 ```
 
 </details>
@@ -423,7 +423,7 @@ docker run -d --name portwing \
   -v /etc/portwing/authorized_keys:/etc/portwing/authorized_keys:ro \
   -e AUTHORIZED_KEYS=/etc/portwing/authorized_keys \
   -p 127.0.0.1:3000:3000 \
-  ghcr.io/codeswhat/portwing:0.9.14
+  ghcr.io/codeswhat/portwing:0.9.15
 ```
 
 **Key rotation (zero-downtime):**
@@ -510,7 +510,7 @@ docker run -d \
   -e ADAPTER=generic \
   -e TOKEN=my-secret \
   -p 127.0.0.1:3000:3000 \
-  ghcr.io/codeswhat/portwing:0.9.14
+  ghcr.io/codeswhat/portwing:0.9.15
 ```
 
 ### Endpoints
@@ -859,7 +859,7 @@ documented,” not guessed as absent.
 ```bash
 # Generate a strong token
 TOKEN=$(openssl rand -hex 32)
-docker run -e TOKEN="$TOKEN" ... ghcr.io/codeswhat/portwing:0.9.14
+docker run -e TOKEN="$TOKEN" ... ghcr.io/codeswhat/portwing:0.9.15
 ```
 
 ### File-based token (production)
@@ -870,7 +870,7 @@ printf '%s' "$TOKEN" > /run/secrets/portwing-token
 chown 65532:65532 /run/secrets/portwing-token && chmod 0400 /run/secrets/portwing-token
 docker run -e TOKEN_FILE=/run/secrets/portwing-token \
   -v /run/secrets/portwing-token:/run/secrets/portwing-token:ro \
-  ... ghcr.io/codeswhat/portwing:0.9.14
+  ... ghcr.io/codeswhat/portwing:0.9.15
 ```
 
 ### Hash-at-rest with TOKEN_HASH
@@ -884,7 +884,7 @@ HASH=$(printf '%s' "$TOKEN" | portwing hash-token)
 # $argon2id$v=19$m=19456,t=2,p=1$<salt>$<hash>
 
 # Use the hash instead of the plaintext
-docker run -e TOKEN_HASH="$HASH" ... ghcr.io/codeswhat/portwing:0.9.14
+docker run -e TOKEN_HASH="$HASH" ... ghcr.io/codeswhat/portwing:0.9.15
 ```
 
 Or write the hash to a file and use `TOKEN_HASH_FILE`:
@@ -910,7 +910,7 @@ verified without managing signing keys.
 ### Verify the checksums file
 
 ```bash
-VERSION=0.9.14
+VERSION=0.9.15
 
 cosign verify-blob \
   --certificate-identity "https://github.com/CodesWhat/portwing/.github/workflows/release.yml@refs/tags/v${VERSION}" \
@@ -922,7 +922,7 @@ cosign verify-blob \
 ### Verify the container image
 
 ```bash
-VERSION=0.9.14
+VERSION=0.9.15
 
 cosign verify \
   --certificate-identity "https://github.com/CodesWhat/portwing/.github/workflows/release.yml@refs/tags/v${VERSION}" \
@@ -933,7 +933,7 @@ cosign verify \
 ### SBOM
 
 Each binary archive has a matching CycloneDX release asset, for example
-`portwing_0.9.14_linux_amd64.tar.gz.cyclonedx.json`. The SBOM has no standalone
+`portwing_0.9.15_linux_amd64.tar.gz.cyclonedx.json`. The SBOM has no standalone
 cosign bundle; verify the signed `checksums.txt`, then verify the SBOM's digest
 against that manifest. Public releases also give every checksummed asset its
 own GitHub build-provenance attestation. The container image carries a separate
