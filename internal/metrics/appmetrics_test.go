@@ -2,6 +2,7 @@ package metrics_test
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -335,5 +336,65 @@ func TestRegistryConcurrency(t *testing.T) {
 	// in-flight must be back to 0 after all goroutines balanced Inc/Dec.
 	if !strings.Contains(body, "portwing_http_requests_in_flight 0") {
 		t.Errorf("expected in_flight 0 after balanced inc/dec; output:\n%s", body)
+	}
+}
+
+// TestRegistryBoundsRequestMethodLabels hammers IncRequest with the methods an
+// unauthenticated caller can put on the request line and asserts the method
+// label set stays bounded. net/http hands any RFC 9110 token to the handler
+// verbatim, so labelling by the raw method would grow the counter map — and
+// the sort every later scrape pays for — once per distinct method sent.
+func TestRegistryBoundsRequestMethodLabels(t *testing.T) {
+	t.Parallel()
+
+	standard := []string{"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "CONNECT", "TRACE"}
+
+	reg := metrics.NewRegistry()
+	for _, method := range standard {
+		reg.IncRequest(method, 200)
+	}
+	const hammered = 5000
+	for i := range hammered {
+		reg.IncRequest("ZORKMID"+strconv.Itoa(i), 200)
+	}
+	// Case variants and near-misses are distinct methods to net/http, not
+	// spellings of the standard ones, so they collapse rather than merging
+	// into GET's series.
+	other := []string{"get", "Get", "GETX", "", "PROPFIND", "!#$%&'*+-.^_`|~9Az"}
+	for _, method := range other {
+		reg.IncRequest(method, 200)
+	}
+
+	body := output(reg)
+	seen := make(map[string]struct{})
+	for _, line := range strings.Split(body, "\n") {
+		rest, ok := strings.CutPrefix(line, `portwing_http_requests_total{method="`)
+		if !ok {
+			continue
+		}
+		method, _, ok := strings.Cut(rest, `"`)
+		if !ok {
+			t.Fatalf("malformed requests_total line %q; output:\n%s", line, body)
+		}
+		seen[method] = struct{}{}
+	}
+
+	want := append(append([]string{}, standard...), "OTHER")
+	if len(seen) != len(want) {
+		t.Errorf("method label set has %d values %v, want %d", len(seen), seen, len(want))
+	}
+	for _, method := range want {
+		if _, ok := seen[method]; !ok {
+			t.Errorf("missing method label %q; output:\n%s", method, body)
+		}
+	}
+
+	// Every unrecognised method must land on the one shared series.
+	wantOther := fmt.Sprintf(`portwing_http_requests_total{method="OTHER",code="200"} %d`, hammered+len(other))
+	if !strings.Contains(body, wantOther) {
+		t.Errorf("expected %q; output:\n%s", wantOther, body)
+	}
+	if !strings.Contains(body, `portwing_http_requests_total{method="GET",code="200"} 1`) {
+		t.Errorf("GET must keep its own series; output:\n%s", body)
 	}
 }
