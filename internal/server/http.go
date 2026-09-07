@@ -120,6 +120,78 @@ func (l *concurrencyLimiter) limit() int {
 	return cap(l.slots)
 }
 
+// readinessPingTimeout bounds one Docker ping made on behalf of a readiness
+// request, and readinessPingTTL is how long that ping's result is reused.
+// /ready and /_portwing/health are unauthenticated, so without both bounds a
+// slow daemon lets remote callers pile up handlers and Docker connections at
+// whatever rate they can open them.
+//
+// Vars, not consts, so tests can shrink them instead of waiting out the real
+// budget. Any test that reassigns one must not call t.Parallel: every
+// readiness handler reads them.
+var (
+	readinessPingTimeout = 2 * time.Second
+	readinessPingTTL     = time.Second
+)
+
+// healthProbe collapses concurrent readiness checks onto a single bounded
+// Docker ping and reuses its result for readinessPingTTL. N simultaneous
+// readiness requests therefore cost one ping and one Docker connection, not N,
+// and a caller never waits longer than readinessPingTimeout for one.
+type healthProbe struct {
+	mu sync.Mutex
+	// inflight is non-nil while a ping is running and is closed when it
+	// finishes, so late arrivals wait for that ping's result instead of
+	// starting their own.
+	inflight chan struct{}
+	at       time.Time
+	err      error
+	valid    bool
+}
+
+// check returns the Docker reachability result, pinging at most once per
+// readinessPingTTL across all concurrent callers. ping is called with a
+// context bounded by readinessPingTimeout.
+func (p *healthProbe) check(ctx context.Context, ping func(context.Context) error) error {
+	p.mu.Lock()
+	if p.valid && time.Since(p.at) < readinessPingTTL {
+		err := p.err
+		p.mu.Unlock()
+		return err
+	}
+	if wait := p.inflight; wait != nil {
+		p.mu.Unlock()
+		select {
+		case <-wait:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		p.mu.Lock()
+		err := p.err
+		p.mu.Unlock()
+		return err
+	}
+	done := make(chan struct{})
+	p.inflight = done
+	p.mu.Unlock()
+
+	// Detached from the caller's context: everyone waiting on this ping would
+	// otherwise be cancelled by whichever client happened to start it hanging
+	// up first. The timeout is what bounds it.
+	pingCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), readinessPingTimeout)
+	err := ping(pingCtx)
+	cancel()
+
+	p.mu.Lock()
+	p.err = err
+	p.at = time.Now()
+	p.valid = true
+	p.inflight = nil
+	p.mu.Unlock()
+	close(done)
+	return err
+}
+
 // Server is the standard-mode HTTP server that exposes Docker API proxy
 // endpoints, adapter-specific routes, and health checks.
 type Server struct {
@@ -137,6 +209,11 @@ type Server struct {
 	auditor      *audit.Logger
 	httpServer   *http.Server
 	startTime    time.Time
+
+	// readiness bounds the Docker ping the unauthenticated readiness routes
+	// perform. Its zero value is a working, empty cache, so Servers built as
+	// struct literals rather than through NewServer get the bound too.
+	readiness healthProbe
 
 	// listenAddr holds the net.Addr ListenAndServe bound, set once the
 	// listener is up and before Serve/ServeTLS starts blocking. It lets
@@ -400,8 +477,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 // handleHealth returns readiness including Docker connectivity. It is exposed
 // at both the compatibility path /_portwing/health and the explicit /ready.
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	err := s.dockerClient.Ping(ctx)
+	err := s.readiness.check(r.Context(), s.dockerClient.Ping)
 
 	status := "healthy"
 	dockerStatus := "connected"
