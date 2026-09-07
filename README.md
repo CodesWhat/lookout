@@ -7,6 +7,7 @@ append-only JSONL file per lane, one record per lane run:
 |---|---|---|
 | `soak.jsonl` | `quality-soak-weekly.yml` | weekly |
 | `mutation.jsonl` | `quality-mutation-monthly.yml` | monthly, one record per matrix package |
+| `mutation-survivors.jsonl` | `quality-mutation-monthly.yml` | monthly, one record per run, capped to the newest 12 |
 | `fuzz-nightly.jsonl` | `quality-fuzz-nightly.yml` | nightly |
 | `bench.jsonl` | `quality-bench-monthly.yml` | monthly |
 
