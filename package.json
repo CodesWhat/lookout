@@ -21,7 +21,7 @@
     "check:web": "node scripts/node-version-contract.mjs && npm run test:web && npm run lint && npm run knip && npm run build && npm run budget:web && npm run lighthouse"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.5.11",
+    "@biomejs/biome": "2.5.12",
     "chrome-launcher": "1.2.1",
     "knip": "6.34.0",
     "lighthouse": "13.4.1",
