@@ -3,12 +3,145 @@ package edge
 import (
 	"context"
 	"encoding/json"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gorilla/websocket"
 
+	"github.com/codeswhat/portwing/internal/adapter/drydock"
+	"github.com/codeswhat/portwing/internal/docker"
 	"github.com/codeswhat/portwing/internal/protocol"
 )
+
+type completedDeleteSender chan struct{}
+
+func (s completedDeleteSender) SendTypedMessage(string, any) error {
+	s <- struct{}{}
+	return nil
+}
+
+func TestReadPumpControlsContinueWhenAdapterPoolFull(t *testing.T) {
+	t.Parallel()
+	dir, err := os.MkdirTemp("", "lk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	socket := filepath.Join(dir, "docker.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{}, 33)
+	release := make(chan struct{})
+	var requests atomic.Int32
+	var handlers sync.WaitGroup
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/version" {
+			_, _ = w.Write([]byte(`{"ApiVersion":"1.44"}`))
+			return
+		}
+		if r.Method != http.MethodDelete {
+			t.Errorf("unexpected fake Docker request: %s %s", r.Method, r.URL.Path)
+		}
+		handlers.Add(1)
+		defer handlers.Done()
+		requests.Add(1)
+		started <- struct{}{}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	_ = srv.Listener.Close()
+	srv.Listener = listener
+	srv.Start()
+	t.Cleanup(srv.Close)
+	dc, err := docker.NewClient(socket, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := drydock.NewAdapter(dc, "test-agent", drydock.AgentInfo{})
+	ctx, cancel := context.WithCancel(context.Background())
+	completed := make(completedDeleteSender, 32)
+	admitted := 0
+	defer func() {
+		cancel()
+		close(release)
+		for i := 0; i < admitted; i++ {
+			select {
+			case <-completed:
+			case <-time.After(2 * time.Second):
+				t.Error("adapter worker did not finish")
+				return
+			}
+		}
+		handlers.Wait()
+	}()
+	for i := 0; i < 32; i++ {
+		if !a.HandleMessage(ctx, completed, protocol.TypeDDContainerDeleteRequest, json.RawMessage(`{"requestId":"occupied","containerId":"container"}`)) {
+			t.Fatal("delete not recognized")
+		}
+		admitted++
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("fake delete did not start")
+		}
+	}
+	c, ctrl := newTestClient(t)
+	c.adapter = a
+	pipe, peer := net.Pipe()
+	defer peer.Close()
+	session := newExecSession(c, "active-exec", pipe)
+	defer session.Close()
+	readDone := make(chan struct{})
+	go func() { defer close(readDone); _ = c.readPump(ctx) }()
+	defer func() {
+		cancel()
+		_ = ctrl.Close()
+		select {
+		case <-readDone:
+		case <-time.After(2 * time.Second):
+			t.Error("read pump did not stop")
+		}
+	}()
+	sendEnvelope(t, ctrl, protocol.TypeDDContainerDeleteRequest, protocol.DDContainerDeleteRequestMessage{RequestID: "overloaded", ContainerID: "container"})
+	sendEnvelope(t, ctrl, protocol.TypeExecEnd, protocol.ExecEndMessage{ExecID: "active-exec"})
+	sendEnvelope(t, ctrl, protocol.TypePing, protocol.PingMessage{Timestamp: 456})
+	var reply protocol.DDContainerDeleteResponseMessage
+	decodeData(t, expectType(t, ctrl, protocol.TypeDDContainerDeleteResponse), &reply)
+	if reply.RequestID != "overloaded" || reply.ContainerID != "container" || reply.Success || reply.Error == "" {
+		t.Fatalf("overload response=%+v", reply)
+	}
+	var pong protocol.PongMessage
+	decodeData(t, expectType(t, ctrl, protocol.TypePong), &pong)
+	if pong.Timestamp != 456 {
+		t.Fatalf("pong=%+v", pong)
+	}
+	select {
+	case <-session.done:
+	default:
+		t.Fatal("exec-end was not processed")
+	}
+	if requests.Load() != 32 {
+		t.Fatalf("Docker requests=%d, want 32", requests.Load())
+	}
+	_ = ctrl.Close()
+	select {
+	case <-readDone:
+	case <-time.After(time.Second):
+		t.Fatal("peer closure did not stop read pump while pool full")
+	}
+}
 
 // runReadPump starts the read pump against the test client and returns a cancel
 // func. The pump exits when the context is cancelled or the conn closes (test

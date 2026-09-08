@@ -104,7 +104,7 @@ These metrics track HTTP request activity and are the most operationally relevan
 | `portwing_http_requests_total` | counter | `method`, `code` | Total HTTP requests completed, by method and response status code. |
 | `portwing_http_request_duration_seconds` | histogram | — | HTTP request latency in seconds. Exposes `_bucket`, `_sum`, and `_count` series. |
 | `portwing_http_requests_in_flight` | gauge | — | Number of HTTP requests currently being processed. |
-| `portwing_auth_failures_total` | counter | `reason` | Total authentication failures, labelled by failure reason: `bad_token`, `no_credentials`, or (for Ed25519 signature failures) `timestamp-skew`, `replay`, `unknown-key`, `invalid-signature`. |
+| `portwing_auth_failures_total` | counter | `reason` | Total authentication failures, labelled by failure reason: `bad_token`, `no_credentials`, or (for rejected Ed25519 requests) `timestamp-skew`, `replay`, `unknown-key`, `invalid-signature`, `nonce-capacity`. `nonce-capacity` indicates a full cache of unexpired nonces, distinct from replay. |
 | `portwing_rate_limited_total` | counter | — | Total requests blocked by the IP rate limiter. |
 
 Sample lines:

@@ -127,13 +127,17 @@ func TestEnrollerBodyReadDeadline(t *testing.T) {
 
 			calls := writer.recordedDeadlineCalls()
 			if len(calls) < 2 {
-				t.Fatalf("expected enrollment deadline to be set and cleared, got %v", calls)
+				t.Fatalf("expected enrollment deadline to be set and expired, got %v", calls)
 			}
 			if got := calls[0].deadline.Sub(calls[0].at); got < testDeadline-50*time.Millisecond || got > testDeadline+50*time.Millisecond {
 				t.Fatalf("body read deadline offset = %v, want approximately %v", got, testDeadline)
 			}
-			if clearedAt := calls[len(calls)-1].deadline; !clearedAt.IsZero() {
-				t.Fatalf("body read deadline was not cleared after decode: %v", clearedAt)
+			last := calls[len(calls)-1]
+			if last.deadline.IsZero() || last.deadline.After(last.at) {
+				t.Fatalf("failed decode must expire the body read deadline, got %v", last.deadline)
+			}
+			if writer.Header().Get("Connection") != "close" {
+				t.Fatal("failed decode must close the connection")
 			}
 		})
 	}

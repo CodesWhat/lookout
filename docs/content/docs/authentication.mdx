@@ -164,10 +164,12 @@ Signature version 2 clients must send five headers on every request:
 | `X-Portwing-Signature` | Base64url (no padding) Ed25519 signature over the canonical message |
 | `X-Portwing-Signature-Version` | Must be `2` for the full request-target format |
 
-On a rejected signature, the agent returns `401` with an `X-Portwing-Reason`
-response header set to one of `timestamp-skew`, `replay`, `unknown-key`, or
-`invalid-signature` (the catch-all for a missing header, malformed nonce,
-malformed signature, or a signature that fails verification).
+Rejected Ed25519 requests return `401` with an `X-Portwing-Reason` response
+header set to `timestamp-skew`, `replay`, `unknown-key`, `invalid-signature`,
+or `nonce-capacity`. `nonce-capacity` means the agent could not record a fresh
+nonce because the cache contained only unexpired entries; it is distinct from
+replay. `invalid-signature` also covers missing headers, malformed nonces,
+malformed signatures, and signatures that fail verification.
 
 The canonical message is a newline-separated UTF-8 string:
 

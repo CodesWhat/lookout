@@ -536,6 +536,7 @@ func (c *Client) connect(ctx context.Context) (bool, error) {
 	// controller (or one with a parse failure below) doesn't inherit
 	// capabilities advertised by a previous connection.
 	c.controllerCaps = nil
+	c.welcomePollInterval = 0
 
 	var welcome protocol.WelcomeMessage
 	if err := json.Unmarshal(env.Data, &welcome); err != nil {
@@ -1343,9 +1344,17 @@ func (c *Client) handleRequestTo(ctx context.Context, req protocol.RequestMessag
 			Reason:    reason,
 		})
 	} else {
-		c.auditor.APIRequest(c.cfg.DrydockURL, req.Method, req.Path, audit.OutcomeAllowed, resp.StatusCode, msEdge(start))
 		// Read body (capped).
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
+		if err != nil {
+			c.auditor.APIRequest(c.cfg.DrydockURL, req.Method, req.Path, audit.OutcomeError, resp.StatusCode, msEdge(start))
+			_ = c.sendTypedMessageTo(target, protocol.TypeError, protocol.ErrorMessage{
+				Message:   fmt.Sprintf("reading Docker response: %v", err),
+				RequestID: req.RequestID,
+			})
+			return
+		}
+		c.auditor.APIRequest(c.cfg.DrydockURL, req.Method, req.Path, audit.OutcomeAllowed, resp.StatusCode, msEdge(start))
 
 		respMsg := protocol.ResponseMessage{
 			RequestID:   req.RequestID,
@@ -1491,10 +1500,35 @@ func (c *Client) writePump(ctx context.Context) {
 	heartbeatTicker := time.NewTicker(heartbeat)
 	defer heartbeatTicker.Stop()
 
-	pollTicker := time.NewTicker(pollDuration)
-	defer pollTicker.Stop()
-
 	sender := c.currentMessageSender()
+	pollDone := make(chan struct{})
+	go func() {
+		defer close(pollDone)
+		pollTicker := time.NewTicker(pollDuration)
+		defer pollTicker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-pollTicker.C:
+				if ctx.Err() != nil {
+					return
+				}
+				added, updated, removed, err := c.adapter.RefreshContainers(ctx)
+				if ctx.Err() != nil {
+					return
+				}
+				if err != nil {
+					slog.Warn("container refresh failed", "error", err)
+					continue
+				}
+				if err := c.adapter.OnContainerRefresh(ctx, sender, added, updated, removed); err != nil {
+					slog.Warn("container refresh notify failed", "error", err)
+				}
+			}
+		}
+	}()
+	defer func() { <-pollDone }()
 
 	for {
 		select {
@@ -1509,17 +1543,6 @@ func (c *Client) writePump(ctx context.Context) {
 			_ = c.sendTypedMessage(protocol.TypePing, protocol.PingMessage{
 				Timestamp: time.Now().UnixMilli(),
 			})
-
-		case <-pollTicker.C:
-			// Refresh container inventory via adapter.
-			added, updated, removed, err := c.adapter.RefreshContainers(ctx)
-			if err != nil {
-				slog.Warn("container refresh failed", "error", err)
-				continue
-			}
-			if err := c.adapter.OnContainerRefresh(ctx, sender, added, updated, removed); err != nil {
-				slog.Warn("container refresh notify failed", "error", err)
-			}
 		}
 	}
 }

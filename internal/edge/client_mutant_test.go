@@ -240,40 +240,44 @@ func TestFinishPendingBodyReservationIncrementsSequence(t *testing.T) {
 // connect — welcome.PollInterval boundary at zero (client.go:458)
 // ---------------------------------------------------------------------------
 
-// TestConnectWelcomePollIntervalZeroDoesNotResetExisting covers the exact
-// boundary of `welcome.PollInterval > 0`: with an existing non-zero
-// c.welcomePollInterval and a welcome carrying PollInterval == 0, the field
-// must be left untouched. CONDITIONALS_BOUNDARY (`>` -> `>=`) would make
-// `0 >= 0` true and incorrectly reset it to 0.
-func TestConnectWelcomePollIntervalZeroDoesNotResetExisting(t *testing.T) {
+func TestConnectWelcomePollIntervalResetsAcrossConnections(t *testing.T) {
 	t.Parallel()
-
-	srv := newControllerServer(t, func(ctrl *websocket.Conn) {
-		readAndAckHello(t, ctrl)
-		sendWelcomeMsg(t, ctrl, protocol.WelcomeMessage{PollInterval: 0})
-		// Close immediately: the pumps finish as soon as the read errors,
-		// instead of idling until a hardcoded server-side deadline.
-	})
-
-	cfg := &config.Config{
-		DrydockURL:        srv,
-		HeartbeatInterval: 30,
-		WelcomeTimeout:    5,
-		DDPollInterval:    300,
-		SkipDFCollection:  true,
-	}
-	c := newWireClient(t, cfg)
-	c.welcomePollInterval = 77 // sentinel: must survive a PollInterval==0 welcome
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	established, _ := c.connect(ctx)
-	if !established {
-		t.Fatal("established = false, want true")
-	}
-	if c.welcomePollInterval != 77 {
-		t.Errorf("welcomePollInterval = %d, want 77 (unchanged by a zero welcome value)", c.welcomePollInterval)
+	for _, tc := range []struct {
+		name, payload string
+		want          int
+	}{
+		{"omitted", `{}`, 0},
+		{"zero", `{"pollInterval":0}`, 0},
+		{"negative", `{"pollInterval":-1}`, 0},
+		{"overflow", `{"pollInterval":9223372036854775807}`, 0},
+		{"unparseable", `{"pollInterval":"invalid"}`, 0},
+		{"replacement", `{"pollInterval":42}`, 42},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := newWireClient(t, &config.Config{HeartbeatInterval: 30, WelcomeTimeout: 5, DDPollInterval: 300, SkipDFCollection: true})
+			for i, payload := range []string{`{"pollInterval":77}`, tc.payload} {
+				c.cfg.DrydockURL = newControllerServer(t, func(ctrl *websocket.Conn) {
+					readAndAckHello(t, ctrl)
+					if err := ctrl.WriteJSON(protocol.Envelope{Type: protocol.TypeWelcome, Data: json.RawMessage(payload)}); err != nil {
+						t.Error(err)
+					}
+				})
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				established, _ := c.connect(ctx)
+				cancel()
+				if !established {
+					t.Fatal("connection was not established")
+				}
+				want := tc.want
+				if i == 0 {
+					want = 77
+				}
+				if c.welcomePollInterval != want {
+					t.Fatalf("connection %d poll interval = %d, want %d", i+1, c.welcomePollInterval, want)
+				}
+			}
+		})
 	}
 }
 
