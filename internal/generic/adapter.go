@@ -76,10 +76,8 @@ func (a *Adapter) RegisterRoutes(mux *http.ServeMux, auth func(http.HandlerFunc)
 }
 
 // streamLimitRejectionMessage is the body returned when a long-lived adapter
-// stream is rejected for want of a free concurrency slot. Matches the
-// Docker-proxy stream rejection in internal/server/http.go so a client (or a
-// test) can't tell the two rejection paths apart.
-const streamLimitRejectionMessage = "agent busy: too many concurrent streams"
+// stream is rejected for want of a free concurrency slot.
+const streamLimitRejectionMessage = adapter.StreamLimitRejectionMessage
 
 // serveEvents wraps the SSE broadcaster with the shared stream-concurrency
 // gate. The admission check happens before the broadcaster registers the
