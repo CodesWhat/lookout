@@ -38,12 +38,16 @@ docker run -e TOKEN=mysecrettoken -p 3000:3000 ghcr.io/codeswhat/portwing:latest
 
 ---
 
-## Read-only by design
+## Read-only tools, not a read-only credential
 
 <Callout type="info">
-The MCP server is strictly read-only. It can observe containers and host state, but it cannot start, stop, restart, remove, or mutate any container or resource. There is no write tool, and none will be added to this endpoint. Destructive operations must go through the authenticated REST API directly.
+The MCP tools themselves are strictly read-only. None of the five tools listed below can start, stop, restart, remove, or mutate any container or resource. There is no write tool, and none is planned. Destructive operations must go through the authenticated REST API directly.
+</Callout>
 
-This boundary is intentional: AI agents operate with broad autonomy, and a read-only observation channel limits the blast radius of a compromised or misbehaving agent to information disclosure rather than infrastructure change.
+<Callout type="warn">
+That boundary is at the protocol level, not the credential level. `/_portwing/mcp` is authenticated by the same middleware, and the same shared token or Ed25519 key, as every other Portwing route, including the Docker proxy catch-all at `/`. See [Authentication](/authentication) and [Security Model](/security-model). Whatever credential can call `tools/call` can also call the full Docker Engine API through the proxy: start, stop, remove containers, mount host paths, and anything else that API exposes. Portwing has no read-only role, scope, or permission tier for tokens or keys today, so every credential is all-or-nothing. A compromised MCP credential is a compromised Portwing credential, not a compromised read-only viewer.
+
+If you want the AI agent on a credential you can reason about independently, generate it its own [Ed25519 keypair](/authentication#4-ed25519-per-client-keys) instead of handing it an operator's shared token. Token-based auth (`TOKEN`, `TOKEN_HASH`) is a single shared secret for the whole agent, so it can't be split this way. A dedicated Ed25519 key does not narrow what the key can do; it still has full proxy access. But it lets you revoke that one key without affecting other integrations, and its calls appear under their own key ID in the audit log (see [Audit Logging](/audit-logging)).
 </Callout>
 
 Additionally, `inspect_container` returns only the *count* of environment variables — values are never transmitted. This prevents accidental leakage of secrets, API keys, or credentials that are commonly passed to containers via environment variables. See [Security Model](/security-model) for more detail.

@@ -2,10 +2,18 @@ package edge
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -215,65 +223,171 @@ func TestConnectCACertBadPEM(t *testing.T) {
 	}
 }
 
-// TestConnectCACertValid covers line 223 (tlsConfig.RootCAs = pool): when the CA
-// cert file contains valid PEM, the pool is accepted. The subsequent dial fails
-// for a different reason (bad handshake), but the CA cert path is exercised.
+// generateTestCA creates a self-signed CA certificate for the TLS-handshake
+// tests below, returning its PEM encoding (suitable for cfg.CACert) plus the
+// parsed certificate and key needed to sign a leaf certificate.
+func generateTestCA(t *testing.T) (caPEM []byte, caCert *x509.Certificate, caKey *ecdsa.PrivateKey) {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate CA key: %v", err)
+	}
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "portwing-test-ca"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create CA cert: %v", err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("parse CA cert: %v", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), cert, key
+}
+
+// generateTestLeafCert issues a server certificate for 127.0.0.1, signed by
+// caCert/caKey, for use as an httptest TLS server's certificate.
+func generateTestLeafCert(t *testing.T, caCert *x509.Certificate, caKey *ecdsa.PrivateKey) tls.Certificate {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate leaf key: %v", err)
+	}
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "127.0.0.1"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, caCert, &key.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("create leaf cert: %v", err)
+	}
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
+}
+
+// newTLSControllerServer is the TLS counterpart to newControllerServer: it
+// presents leaf as its server certificate instead of httptest's own
+// self-signed default, so the caller controls exactly which CA the client
+// must trust.
+func newTLSControllerServer(t *testing.T, leaf tls.Certificate, onUpgrade func(ctrl *websocket.Conn)) string {
+	t.Helper()
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		onUpgrade(conn)
+	}))
+	srv.TLS = &tls.Config{Certificates: []tls.Certificate{leaf}}
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+
+	return srv.URL
+}
+
+// TestConnectCACertValid covers tlsConfig.RootCAs = pool with a real TLS
+// handshake, not just a parse: connect dials an httptest TLS server whose
+// certificate is signed by a CA generated in this test, cfg.CACert points at
+// that CA's PEM, and the full connect flow (dial, hello, welcome) must
+// succeed. Previously this test used a self-signed cert alongside a plain
+// HTTP (not HTTPS) DrydockURL, so no TLS handshake ever happened and
+// RootCAs was never consulted — deleting the assignment would have left the
+// suite green. See TestConnectWithoutCACertRejectsUntrustedServer for the
+// failure companion that proves the CA is actually required.
 func TestConnectCACertValid(t *testing.T) {
 	t.Parallel()
 
-	// Valid self-signed CA certificate — just needs to parse successfully.
-	// Generated with: openssl req -x509 -newkey rsa:2048 -keyout /dev/null
-	//   -out /dev/stdout -days 3650 -nodes -subj "/CN=test"
-	const testCACert = `-----BEGIN CERTIFICATE-----
-MIIC/zCCAeegAwIBAgIUK520GOBwcfjs/k1R8beZZ8vG4CAwDQYJKoZIhvcNAQEL
-BQAwDzENMAsGA1UEAwwEdGVzdDAeFw0yNjA2MjMxNjE0MTVaFw0zNjA2MjAxNjE0
-MTVaMA8xDTALBgNVBAMMBHRlc3QwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEK
-AoIBAQCW0AOl8KwCXkDkEARt0WUcZF7II/is9kGQfFVlQ8HKudiceS+BY/aneAMd
-3jwtZQMLWXOaDWrCTndbxMbRS4PCweP9pQc+MKro5nlP2p/4u7SlXoXcrC0diq7G
-zLri9mKa0vzgiXIX174Ycw8zXa5dWzT9NVpoJHLD/1SYgYGrawj9ywltL9PUDuCd
-37mzh1WcEmlSnIogf1YJ2tNxD/mA5nuItZfXIS868dIQfp3gPleVCxKEOCr0fD4O
-5Q37DSvrjSPaXpljm8R98rPt+Oy1/ZKYtYwax2BOUvJ30sT1kw6NYoI7jOJQMwv5
-uJOAevCfSyDulP7bXQ1HLayJ7rypAgMBAAGjUzBRMB0GA1UdDgQWBBQtFLXFQG4Y
-4oOUXaM24rgZGYeIKzAfBgNVHSMEGDAWgBQtFLXFQG4Y4oOUXaM24rgZGYeIKzAP
-BgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQAiNGcKrAbAGU+Wb/hi
-IMcaaGWjbKF7smStSo756LVFSaPcH/e/yP1VCZPOKqNypIligFPqW1uyEK4Fr+lC
-idbp1SpLvVvg22MnaEUvDxk9NDhP2IXux82htk8oCPbcTmq165pQZ6lIO+p8wYiZ
-dA+zx/3nyq0u1hKJsUZIq4IyI3tyqZyBcSiyD1KqDAjBV7A/QgtDs4Xpxl8kGoEW
-bglUORJj9Dw8+QyAfnTnmn6Zw2IWJTfrIbcNOy5+kAJPiStv/vQt/ti7AISP0+Y/
-oQOMD1RdrfX7bTuqErGI0kwsbmoCaSVV78kYYTe871CpCNLWlAX9DoZG3pxcSTrg
-Yofu
------END CERTIFICATE-----
-`
+	caPEM, caCert, caKey := generateTestCA(t)
+	leaf := generateTestLeafCert(t, caCert, caKey)
+
+	srvURL := newTLSControllerServer(t, leaf, func(ctrl *websocket.Conn) {
+		readAndAckHello(t, ctrl)
+		sendWelcomeMsg(t, ctrl, protocol.WelcomeMessage{PollInterval: 0})
+		_ = ctrl.SetReadDeadline(time.Now().Add(3 * time.Second))
+		_, _, _ = ctrl.ReadMessage()
+	})
 
 	certFile := filepath.Join(t.TempDir(), "ca.pem")
-	if err := os.WriteFile(certFile, []byte(testCACert), 0o600); err != nil {
-		t.Fatalf("write cert: %v", err)
+	if err := os.WriteFile(certFile, caPEM, 0o600); err != nil {
+		t.Fatalf("write CA cert: %v", err)
 	}
 
-	// Use a 503 server so the dial completes quickly with a non-fatal error.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "unavailable", http.StatusServiceUnavailable)
-	}))
-	t.Cleanup(srv.Close)
+	cfg := &config.Config{
+		DrydockURL:        srvURL,
+		CACert:            certFile,
+		HeartbeatInterval: 30,
+		WelcomeTimeout:    5,
+		DDPollInterval:    300,
+		SkipDFCollection:  true,
+	}
+	c := newWireClient(t, cfg)
+
+	// connect blocks running the connection's read/write pumps until ctx is
+	// done, so a short timeout is what ends the (successful) connection; a
+	// non-nil err here is the expected ctx-cancellation teardown error, not a
+	// handshake failure (see TestConnectWelcomeCompatMatch for the same
+	// pattern). What proves the TLS handshake succeeded is established=true.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	established, err := c.connect(ctx)
+	if !established {
+		t.Fatalf("connect: established = false, want true (TLS handshake against the configured CA should succeed): %v", err)
+	}
+}
+
+// TestConnectWithoutCACertRejectsUntrustedServer is the failure companion to
+// TestConnectCACertValid: same TLS server and leaf certificate, signed by a
+// CA that is not in the system trust store, but connect is not given that
+// CA. The handshake must fail with a certificate-trust error. Without this
+// case, TestConnectCACertValid alone couldn't tell "the CA is required" from
+// "any TLS server would have worked".
+func TestConnectWithoutCACertRejectsUntrustedServer(t *testing.T) {
+	t.Parallel()
+
+	_, caCert, caKey := generateTestCA(t)
+	leaf := generateTestLeafCert(t, caCert, caKey)
+
+	srvURL := newTLSControllerServer(t, leaf, func(ctrl *websocket.Conn) {})
 
 	cfg := &config.Config{
-		DrydockURL:        srv.URL,
-		CACert:            certFile,
+		DrydockURL: srvURL,
+		// No CACert: leaf is signed by a CA absent from the system trust
+		// store, so the TLS handshake itself must fail.
 		HeartbeatInterval: 30,
 		WelcomeTimeout:    5,
 	}
 	c := newWireClient(t, cfg)
 
-	_, err := c.connect(context.Background())
-	// Expect a non-fatal dial error (not a CA cert error).
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	established, err := c.connect(ctx)
+	if established {
+		t.Fatal("connect: established = true, want false (an untrusted CA should fail the TLS handshake)")
+	}
 	if err == nil {
-		t.Fatal("connect succeeded unexpectedly")
+		t.Fatal("connect: err = nil, want a certificate-trust error")
 	}
-	if strings.Contains(err.Error(), "CA cert") {
-		t.Errorf("error mentions CA cert: %v (want dial error)", err)
-	}
-	if errors.Is(err, errFatal) {
-		t.Errorf("should be non-fatal dial error: %v", err)
+	if !strings.Contains(err.Error(), "certificate") {
+		t.Errorf("error = %q, want it to mention a certificate-trust failure", err)
 	}
 }
 

@@ -61,6 +61,12 @@ type EventBroadcaster struct {
 	// error branch in pumpUpstream, which genericEvent's plain string/map
 	// fields can't trigger in practice.
 	marshalEvent func(v any) ([]byte, error)
+
+	// heartbeatInterval controls how often ServeHTTP writes the SSE
+	// keepalive comment. Defaults to 30s; overridable per-instance in tests
+	// so a heartbeat test can observe one firing without waiting out the
+	// production interval.
+	heartbeatInterval time.Duration
 }
 
 // NewEventBroadcaster creates an EventBroadcaster.
@@ -71,7 +77,8 @@ func NewEventBroadcaster(dockerClient *docker.Client) *EventBroadcaster {
 		newEventStream: func(client *docker.Client) eventSubscriber {
 			return docker.NewEventStream(client)
 		},
-		marshalEvent: json.Marshal,
+		marshalEvent:      json.Marshal,
+		heartbeatInterval: 30 * time.Second,
 	}
 }
 
@@ -99,7 +106,7 @@ func (b *EventBroadcaster) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	slog.Info("generic SSE client connected", "clientId", client.id)
 
 	ctx := r.Context()
-	heartbeat := time.NewTicker(30 * time.Second)
+	heartbeat := time.NewTicker(b.heartbeatInterval)
 	defer heartbeat.Stop()
 
 	for {

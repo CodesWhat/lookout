@@ -141,7 +141,7 @@ func TestExecuteRejectsUnsupportedOperationBeforeSideEffects(t *testing.T) {
 		},
 	}
 
-	if err := cm.validateRequest(req); err == nil {
+	if _, err := cm.validateRequest(req); err == nil {
 		t.Error("validateRequest accepted an unsupported compose operation")
 	}
 	resp, err := cm.Execute(t.Context(), req)
@@ -161,6 +161,53 @@ func TestExecuteRejectsUnsupportedOperationBeforeSideEffects(t *testing.T) {
 		t.Errorf("read preexisting compose file: %v", err)
 	} else if string(got) != original {
 		t.Errorf("preexisting compose file was mutated before rejection: got %q", got)
+	}
+	if calls, err := os.ReadFile(callsPath); err == nil {
+		t.Errorf("Docker was invoked before rejection: %q", calls)
+	} else if !os.IsNotExist(err) {
+		t.Errorf("read Docker invocation record: %v", err)
+	}
+}
+
+// ---- Execute: invalid stack path rejected before side effects ----
+
+// TestExecuteRejectsInvalidStackPathBeforeSideEffects exercises Execute's use
+// of the (stackDirKey, error) validateRequest now returns: a StackDir that
+// escapes stacksDir must be rejected by validateRequest itself, before
+// Execute ever calls lockStack or touches the filesystem or Docker. This is
+// the end-to-end counterpart to TestValidateRequest_StackPathTraversal, which
+// only exercises validateRequest directly.
+func TestExecuteRejectsInvalidStackPathBeforeSideEffects(t *testing.T) {
+	binDir := t.TempDir()
+	callsPath := filepath.Join(binDir, "calls")
+	fakeDocker := filepath.Join(binDir, "docker")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$PORTWING_TEST_CALLS\"\n"
+	if err := os.WriteFile(fakeDocker, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PORTWING_TEST_CALLS", callsPath)
+	t.Setenv("PATH", binDir+string(filepath.ListSeparator)+os.Getenv("PATH"))
+
+	cm := &ComposeManager{stacksDir: t.TempDir(), composeBin: fakeDocker}
+	req := ComposeRequest{
+		StackName: "app",
+		StackDir:  "../escape",
+		Operation: "up",
+	}
+
+	resp, err := cm.Execute(t.Context(), req)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if resp.Success || !strings.Contains(resp.Error, "invalid stack path") {
+		t.Errorf("response = %+v, want an invalid-stack-path error", resp)
+	}
+
+	cm.stackLocksMu.Lock()
+	locks := len(cm.stackLocks)
+	cm.stackLocksMu.Unlock()
+	if locks != 0 {
+		t.Errorf("stack locks = %d, want 0 (an escaping StackDir must not have taken a lock)", locks)
 	}
 	if calls, err := os.ReadFile(callsPath); err == nil {
 		t.Errorf("Docker was invoked before rejection: %q", calls)
@@ -530,6 +577,72 @@ func TestComposeManagerExecute_ConcurrentSameStackSerializes(t *testing.T) {
 	}
 }
 
+// TestComposeManagerExecute_ConcurrentSameStackDirDifferentNamesSerializes
+// exercises RV-9: the per-stack lock used to be keyed by StackName while
+// file and project-directory operations are keyed by StackDir, so two
+// requests with different StackNames but the same StackDir got independent
+// mutexes and could interleave exactly like the unserialized same-StackName
+// case above. This drives two concurrent Execute calls with distinct
+// StackNames but one shared StackDir through the same sleeping fake compose
+// binary; each call must still observe only the content it wrote itself,
+// which only holds if the lock is keyed by the shared directory.
+//
+// Note: not parallel, same ETXTBSY reason as the test above.
+func TestComposeManagerExecute_ConcurrentSameStackDirDifferentNamesSerializes(t *testing.T) {
+	dir := t.TempDir()
+
+	scriptPath := filepath.Join(dir, "compose-lock-test.sh")
+	script := "#!/usr/bin/env sh\nsleep 0.1\ncat docker-compose.yml\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cm := &ComposeManager{stacksDir: dir, composeBin: scriptPath, isV2: false}
+
+	const runs = 5
+	names := []string{"app-a", "app-b"}
+	contents := []string{"content-A", "content-B"}
+	for i := 0; i < runs; i++ {
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		results := make([]*ComposeResponse, len(contents))
+		errs := make([]error, len(contents))
+
+		for idx, content := range contents {
+			wg.Add(1)
+			go func(idx int, name, content string) {
+				defer wg.Done()
+				<-start
+				resp, err := cm.Execute(t.Context(), ComposeRequest{
+					StackName: name,
+					StackDir:  "shared",
+					Operation: "up",
+					Files: map[string]string{
+						"docker-compose.yml": content,
+					},
+				})
+				results[idx] = resp
+				errs[idx] = err
+			}(idx, names[idx], content)
+		}
+
+		close(start)
+		wg.Wait()
+
+		for idx, resp := range results {
+			if errs[idx] != nil {
+				t.Fatalf("run %d: Execute: unexpected error %v", i, errs[idx])
+			}
+			if !resp.Success {
+				t.Fatalf("run %d: Execute: expected Success=true, got Error=%q", i, resp.Error)
+			}
+			if got, want := strings.TrimSpace(resp.Output), contents[idx]; got != want {
+				t.Fatalf("run %d: Execute observed %q, want its own content %q (different StackNames sharing a StackDir interleaved, so the lock is not keyed by directory)", i, got, want)
+			}
+		}
+	}
+}
+
 // ---- Execute: registryLogin failure path ----
 
 func TestExecute_RegistryLoginFailure(t *testing.T) {
@@ -658,7 +771,7 @@ func TestValidateRequest_FilePathTraversal(t *testing.T) {
 			"../evil/compose.yml": "services: {}\n",
 		},
 	}
-	if err := cm.validateRequest(req); err == nil {
+	if _, err := cm.validateRequest(req); err == nil {
 		t.Fatal("expected error for file path traversal, got nil")
 	}
 }
@@ -673,7 +786,7 @@ func TestValidateRequest_StackPathTraversal(t *testing.T) {
 	req := ComposeRequest{
 		StackName: "../outside",
 	}
-	if err := cm.validateRequest(req); err == nil {
+	if _, err := cm.validateRequest(req); err == nil {
 		t.Fatal("expected error for stack path traversal, got nil")
 	}
 }

@@ -246,7 +246,7 @@ func TestValidateRequest(t *testing.T) {
 			t.Parallel()
 
 			cm := newTestComposeManager(t)
-			err := cm.validateRequest(tc.req)
+			_, err := cm.validateRequest(tc.req)
 
 			if tc.wantErr && err == nil {
 				t.Errorf("validateRequest(): expected error, got nil")
@@ -299,7 +299,7 @@ func TestValidateRequestRegistryServerForms(t *testing.T) {
 			t.Parallel()
 
 			cm := newTestComposeManager(t)
-			err := cm.validateRequest(ComposeRequest{
+			_, err := cm.validateRequest(ComposeRequest{
 				StackName: "app",
 				Operation: "up",
 				RegistryAuth: &RegistryAuth{
