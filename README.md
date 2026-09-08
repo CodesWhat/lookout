@@ -59,7 +59,7 @@
 <hr>
 
 > [!NOTE]
-> **v0.9.17 is the current release.** Fix release for the 2026-09-07 review batch: nonces are never accepted unrecorded at cache capacity, Ed25519 admission is enforced before the body is read, readiness pings are bounded, unbracketed IPv6 bind addresses work, bad interval settings fail at startup instead of panicking, a transient inspect failure no longer drops a container from the inventory, truncated edge streams report `reason: "error"`, non-TTY exec output is demultiplexed, and `api/openapi.yaml` now matches what `/api/containers` serves. No wire-contract changes since v0.9.16 beyond the additive `stream_end` reason; binaries are still rebuilt reproducibly. Full watcher/update feature compatibility requires Drydock `v1.6.0-rc.11+`; the stable wire contract remains `DrydockCompat` 1.4.0. See [CHANGELOG.md](CHANGELOG.md) for the full itemized history.
+> **v0.9.17 is the current release.** This patch hardens authentication and resource limits and fixes Docker streaming, container inventory, Compose operations and Edge connection handling. Interrupted transfers report failure, long-lived stats and image pushes use streaming transport, and slow inventory refreshes or a full Drydock worker pool no longer stall Edge keepalives and control messages. It also fixes environment-only Compose updates, canceled stack-lock waits, OpenRC configuration export and invalid duration settings. Wire compatibility remains `portwing/1.0` and `DrydockCompat` 1.4.0; full watcher/update feature compatibility requires Drydock `v1.6.0-rc.11+`. See [CHANGELOG.md](CHANGELOG.md) for the full itemized history.
 
 ```mermaid
 flowchart LR

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -164,46 +165,47 @@ func TestSendTypedMessage_LogsNilSender(t *testing.T) {
 	}
 }
 
-func TestHandleMessage_UsesSemaphoreToLimitConcurrency(t *testing.T) {
-	a := &Adapter{
-		messageSem: make(chan struct{}, 1),
-	}
-
+func TestMessageHandlerRejectsWhenConcurrencyLimitReached(t *testing.T) {
+	a := &Adapter{}
 	release := make(chan struct{})
-	sender := &blockingSender{
-		started: make(chan struct{}, 4),
-		release: release,
+	sender := &blockingSender{started: make(chan struct{}, defaultMessageHandlerConcurrency), release: release}
+	var workers sync.WaitGroup
+	defer func() { close(release); workers.Wait() }()
+	for i := 0; i < defaultMessageHandlerConcurrency; i++ {
+		workers.Add(1)
+		if !a.spawnMessageHandler(context.Background(), "test", func() {
+			defer workers.Done()
+			_ = sender.SendTypedMessage("test", nil)
+		}) {
+			workers.Done()
+			t.Fatal("handler rejected below limit")
+		}
 	}
-	payload := json.RawMessage(`{"watcherType":"docker","watcherName":"main"}`)
-
-	if handled := a.HandleMessage(context.Background(), sender, protocol.TypeDDWatchRequest, payload); !handled {
-		t.Fatalf("expected watch request to be handled")
+	for i := 0; i < defaultMessageHandlerConcurrency; i++ {
+		select {
+		case <-sender.started:
+		case <-time.After(time.Second):
+			t.Fatal("admitted handler did not start")
+		}
 	}
-
-	select {
-	case <-sender.started:
-	case <-time.After(time.Second):
-		t.Fatalf("timed out waiting for first handler start")
-	}
-
-	secondDone := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan bool, 1)
 	go func() {
-		_ = a.HandleMessage(context.Background(), sender, protocol.TypeDDWatchRequest, payload)
-		close(secondDone)
+		result <- a.spawnMessageHandler(ctx, "overload", func() { t.Error("overloaded handler started") })
 	}()
-
 	select {
-	case <-secondDone:
-		t.Fatalf("expected second HandleMessage call to block on semaphore")
-	case <-time.After(100 * time.Millisecond):
+	case admitted := <-result:
+		if admitted {
+			t.Fatal("handler admitted beyond limit")
+		}
+	case <-time.After(250 * time.Millisecond):
+		cancel()
+		<-result
+		t.Fatal("full handler pool blocked admission")
 	}
-
-	close(release)
-
-	select {
-	case <-secondDone:
-	case <-time.After(time.Second):
-		t.Fatalf("timed out waiting for second HandleMessage to complete")
+	if got := len(a.getMessageSemaphore()); got != defaultMessageHandlerConcurrency {
+		t.Fatalf("occupied slots=%d", got)
 	}
 }
 

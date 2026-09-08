@@ -75,15 +75,19 @@ func NewEnroller(token, authorizedFile string, registry *KeyRegistry) *Enroller 
 // reachable without a prior credential.
 func (e *Enroller) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		rejectEnrollmentBody(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
+	bodyConsumed := false
 	rc := http.NewResponseController(w)
 	if err := rc.SetReadDeadline(time.Now().Add(enrollmentBodyReadDeadline)); err != nil {
 		slog.Warn("setting enrollment body read deadline", "error", err)
 	} else {
 		defer func() {
+			if !bodyConsumed {
+				return
+			}
 			if err := rc.SetReadDeadline(time.Time{}); err != nil {
 				slog.Warn("clearing enrollment body read deadline", "error", err)
 			}
@@ -101,6 +105,7 @@ func (e *Enroller) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeEnrollmentDecodeError(w, err)
 		return
 	}
+	bodyConsumed = true
 
 	actor := remoteHost(r)
 	if e.ActorResolver != nil {
@@ -174,15 +179,22 @@ func (e *Enroller) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func writeEnrollmentDecodeError(w http.ResponseWriter, err error) {
 	if errors.Is(err, os.ErrDeadlineExceeded) {
-		http.Error(w, "request body read timed out", http.StatusRequestTimeout)
+		rejectEnrollmentBody(w, "request body read timed out", http.StatusRequestTimeout)
 		return
 	}
 	var tooLarge *http.MaxBytesError
 	if errors.As(err, &tooLarge) {
-		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+		rejectEnrollmentBody(w, "request body too large", http.StatusRequestEntityTooLarge)
 		return
 	}
-	http.Error(w, "invalid JSON", http.StatusBadRequest)
+	rejectEnrollmentBody(w, "invalid JSON", http.StatusBadRequest)
+}
+
+func rejectEnrollmentBody(w http.ResponseWriter, message string, status int) {
+	// Bound net/http's final unread-body drain before writing the rejection.
+	_ = http.NewResponseController(w).SetReadDeadline(time.Now())
+	w.Header().Set("Connection", "close")
+	http.Error(w, message, status)
 }
 
 // notify invokes the OnResult callback if configured.

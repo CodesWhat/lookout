@@ -502,40 +502,42 @@ func TestLegacyContainerLogRequestStopsWhileWaitingForAdmission(t *testing.T) {
 	}
 }
 
-func TestLegacyContainerLogAdmissionReleasedWhenHandlerPoolCanceled(t *testing.T) {
+func TestLegacyContainerLogAdmissionReleasedWhenHandlerPoolFull(t *testing.T) {
 	t.Parallel()
-
 	a := NewAdapter(nil, "test-agent", AgentInfo{})
 	for i := 0; i < cap(a.messageSem); i++ {
 		a.messageSem <- struct{}{}
 	}
-
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sender := newLogStreamTestSender()
 	returned := make(chan bool, 1)
 	go func() {
-		returned <- a.HandleMessage(
-			ctx,
-			newLogStreamTestSender(),
-			protocol.TypeDDContainerLogRequest,
-			json.RawMessage(`{"requestId":"handler-wait","containerId":"container-1"}`),
-		)
+		returned <- a.HandleMessage(ctx, sender, protocol.TypeDDContainerLogRequest, json.RawMessage(`{"requestId":"handler-full","containerId":"container-1"}`))
 	}()
-
-	waitForLogCondition(t, "legacy log admission", func() bool {
-		return len(a.getLegacyLogSemaphore()) == 1
-	})
-	cancel()
-
 	select {
 	case handled := <-returned:
 		if !handled {
-			t.Fatal("canceled legacy log request was not recognized")
+			t.Fatal("log request not recognized")
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("legacy log request did not stop after handler-pool cancellation")
+	case <-time.After(250 * time.Millisecond):
+		cancel()
+		<-returned
+		t.Fatal("full pool blocked log rejection")
+	}
+	event := waitForLogStreamEvent(t, sender)
+	var reply protocol.DDContainerLogResponseMessage
+	if err := json.Unmarshal(event.data, &reply); err != nil {
+		t.Fatal(err)
+	}
+	if event.msgType != protocol.TypeDDContainerLogResponse || reply.RequestID != "handler-full" || reply.ContainerID != "container-1" || !strings.HasPrefix(reply.Logs, "error:") {
+		t.Fatalf("reply=%+v", event)
 	}
 	if got := len(a.getLegacyLogSemaphore()); got != 0 {
-		t.Fatalf("legacy admission reservations = %d after cancellation, want 0", got)
+		t.Fatalf("legacy slots=%d, want 0", got)
+	}
+	if got := len(a.getMessageSemaphore()); got != defaultMessageHandlerConcurrency {
+		t.Fatalf("shared slots=%d", got)
 	}
 }
 

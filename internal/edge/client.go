@@ -180,6 +180,7 @@ func (c *Client) currentMessageSender() *edgeMessageSender {
 type Client struct {
 	cfg          *config.Config
 	dockerClient dockerAPI
+	readiness    docker.HealthProbe
 	adapter      adapter.EdgeAdapter
 	compose      *docker.ComposeManager
 	collector    hostCollector
@@ -535,6 +536,7 @@ func (c *Client) connect(ctx context.Context) (bool, error) {
 	// controller (or one with a parse failure below) doesn't inherit
 	// capabilities advertised by a previous connection.
 	c.controllerCaps = nil
+	c.welcomePollInterval = 0
 
 	var welcome protocol.WelcomeMessage
 	if err := json.Unmarshal(env.Data, &welcome); err != nil {
@@ -1279,7 +1281,6 @@ func (c *Client) handleRequestTo(ctx context.Context, req protocol.RequestMessag
 		return
 	}
 	defer resp.Body.Close()
-	c.auditor.APIRequest(c.cfg.DrydockURL, req.Method, req.Path, audit.OutcomeAllowed, resp.StatusCode, msEdge(start))
 
 	// Build response headers.
 	headers := make(map[string]string)
@@ -1327,21 +1328,33 @@ func (c *Client) handleRequestTo(ctx context.Context, req protocol.RequestMessag
 		// finished stream from a truncated one and would treat a half-written
 		// image or tar as the whole thing.
 		reason := "complete"
+		outcome := audit.OutcomeAllowed
 		if streamErr != nil {
 			reason = "error"
+			outcome = audit.OutcomeError
 			slog.Warn("docker response stream ended early",
 				"requestId", applog.Sanitize(req.RequestID),
 				"path", applog.Sanitize(req.Path),
 				"error", applog.Sanitize(streamErr.Error()))
 		}
 
+		c.auditor.APIRequest(c.cfg.DrydockURL, req.Method, req.Path, outcome, resp.StatusCode, msEdge(start))
 		_ = c.sendTypedMessageTo(target, protocol.TypeStreamEnd, protocol.StreamEndMessage{
 			RequestID: req.RequestID,
 			Reason:    reason,
 		})
 	} else {
 		// Read body (capped).
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
+		if err != nil {
+			c.auditor.APIRequest(c.cfg.DrydockURL, req.Method, req.Path, audit.OutcomeError, resp.StatusCode, msEdge(start))
+			_ = c.sendTypedMessageTo(target, protocol.TypeError, protocol.ErrorMessage{
+				Message:   fmt.Sprintf("reading Docker response: %v", err),
+				RequestID: req.RequestID,
+			})
+			return
+		}
+		c.auditor.APIRequest(c.cfg.DrydockURL, req.Method, req.Path, audit.OutcomeAllowed, resp.StatusCode, msEdge(start))
 
 		respMsg := protocol.ResponseMessage{
 			RequestID:   req.RequestID,
@@ -1487,10 +1500,35 @@ func (c *Client) writePump(ctx context.Context) {
 	heartbeatTicker := time.NewTicker(heartbeat)
 	defer heartbeatTicker.Stop()
 
-	pollTicker := time.NewTicker(pollDuration)
-	defer pollTicker.Stop()
-
 	sender := c.currentMessageSender()
+	pollDone := make(chan struct{})
+	go func() {
+		defer close(pollDone)
+		pollTicker := time.NewTicker(pollDuration)
+		defer pollTicker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-pollTicker.C:
+				if ctx.Err() != nil {
+					return
+				}
+				added, updated, removed, err := c.adapter.RefreshContainers(ctx)
+				if ctx.Err() != nil {
+					return
+				}
+				if err != nil {
+					slog.Warn("container refresh failed", "error", err)
+					continue
+				}
+				if err := c.adapter.OnContainerRefresh(ctx, sender, added, updated, removed); err != nil {
+					slog.Warn("container refresh notify failed", "error", err)
+				}
+			}
+		}
+	}()
+	defer func() { <-pollDone }()
 
 	for {
 		select {
@@ -1505,17 +1543,6 @@ func (c *Client) writePump(ctx context.Context) {
 			_ = c.sendTypedMessage(protocol.TypePing, protocol.PingMessage{
 				Timestamp: time.Now().UnixMilli(),
 			})
-
-		case <-pollTicker.C:
-			// Refresh container inventory via adapter.
-			added, updated, removed, err := c.adapter.RefreshContainers(ctx)
-			if err != nil {
-				slog.Warn("container refresh failed", "error", err)
-				continue
-			}
-			if err := c.adapter.OnContainerRefresh(ctx, sender, added, updated, removed); err != nil {
-				slog.Warn("container refresh notify failed", "error", err)
-			}
 		}
 	}
 }
@@ -2003,16 +2030,22 @@ func (c *Client) dockerReady(ctx context.Context) bool {
 	if c.dockerClient == nil {
 		return false
 	}
-	pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	response, err := c.dockerClient.Do(pingCtx, http.MethodGet, "/_ping", nil)
-	if err != nil || response == nil {
-		return false
-	}
-	if response.Body != nil {
-		_ = response.Body.Close()
-	}
-	return response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices
+	return c.readiness.Check(ctx, func(pingCtx context.Context) error {
+		response, err := c.dockerClient.Do(pingCtx, http.MethodGet, "/_ping", nil)
+		if err != nil {
+			return err
+		}
+		if response == nil {
+			return errors.New("docker ping returned no response")
+		}
+		if response.Body != nil {
+			_ = response.Body.Close()
+		}
+		if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+			return fmt.Errorf("docker ping returned status %d", response.StatusCode)
+		}
+		return nil
+	}) == nil
 }
 
 func currentDockerState(connected bool) string {

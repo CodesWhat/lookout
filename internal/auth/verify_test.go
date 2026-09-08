@@ -498,7 +498,7 @@ func TestVerifyRequest_NonceRecordedAtCapacity(t *testing.T) {
 	// Fill to capacity with entries that are past their TTL, the state a
 	// busy agent sits in between cleanup ticks.
 	for i := 0; i < capacity; i++ {
-		if !lru.Add(fmt.Sprintf("filler%d", i)) {
+		if err := lru.Add(fmt.Sprintf("filler%d", i)); err != nil {
 			t.Fatalf("filler %d refused while filling the cache", i)
 		}
 	}
@@ -526,6 +526,20 @@ func TestVerifyRequest_NonceRecordedAtCapacity(t *testing.T) {
 	signRequest(t, replay, nil, priv, pub, tsUnix, nonce)
 	if _, err := VerifyRequest(replay, nil, reg, lru, 60); !errors.Is(err, ErrNonceReplay) {
 		t.Fatalf("replay of a request accepted at cache capacity returned %v, want ErrNonceReplay", err)
+	}
+}
+
+func TestVerifyRequestNonceCapacityReason(t *testing.T) {
+	t.Parallel()
+	reg, _, pub, priv := testSetup(t)
+	lru := NewNonceLRU(1, 60)
+	t.Cleanup(lru.Close)
+	_ = lru.Add("filler")
+	req := httptest.NewRequest(http.MethodGet, "/ready", nil)
+	signRequest(t, req, nil, priv, pub, time.Now().Unix(), randomNonce(t))
+	_, err := VerifyRequest(req, nil, reg, lru, 60)
+	if err == nil || ReasonFor(err) != "nonce-capacity" {
+		t.Fatalf("full cache reason = %q (%v), want nonce-capacity", ReasonFor(err), err)
 	}
 }
 

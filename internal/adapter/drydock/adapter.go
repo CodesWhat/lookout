@@ -174,9 +174,9 @@ func (a *Adapter) HandleMessage(ctx context.Context, sender adapter.MessageSende
 			slog.Warn("invalid watch_request message", "error", err)
 			return true
 		}
-		a.spawnMessageHandler(ctx, msgType, func() {
+		if ctx.Err() == nil {
 			a.handleWatchRequest(sender, msg)
-		})
+		}
 		return true
 
 	case protocol.TypeDDWatchContainerRequest:
@@ -185,9 +185,9 @@ func (a *Adapter) HandleMessage(ctx context.Context, sender adapter.MessageSende
 			slog.Warn("invalid watch_container_request message", "error", err)
 			return true
 		}
-		a.spawnMessageHandler(ctx, msgType, func() {
+		if ctx.Err() == nil {
 			a.handleWatchContainerRequest(sender, msg)
-		})
+		}
 		return true
 
 	case protocol.TypeDDTriggerRequest:
@@ -196,9 +196,9 @@ func (a *Adapter) HandleMessage(ctx context.Context, sender adapter.MessageSende
 			slog.Warn("invalid trigger_request message", "error", err)
 			return true
 		}
-		a.spawnMessageHandler(ctx, msgType, func() {
+		if ctx.Err() == nil {
 			a.handleTriggerRequest(sender, msg)
-		})
+		}
 		return true
 
 	case protocol.TypeDDContainerLogRequest:
@@ -232,6 +232,13 @@ func (a *Adapter) HandleMessage(ctx context.Context, sender adapter.MessageSende
 			a.handleContainerLogRequest(ctx, sender, msg)
 		}, func() { <-legacyLogSem }) {
 			<-legacyLogSem
+			if ctx.Err() == nil {
+				a.sendTypedMessage(sender, protocol.TypeDDContainerLogResponse, protocol.DDContainerLogResponseMessage{
+					RequestID:   msg.RequestID,
+					ContainerID: msg.ContainerID,
+					Logs:        "error: agent busy: too many active requests",
+				})
+			}
 		}
 		return true
 
@@ -250,9 +257,16 @@ func (a *Adapter) HandleMessage(ctx context.Context, sender adapter.MessageSende
 			slog.Warn("invalid container_delete_request message", "error", err)
 			return true
 		}
-		a.spawnMessageHandler(ctx, msgType, func() {
+		if !a.spawnMessageHandler(ctx, msgType, func() {
 			a.handleContainerDeleteRequest(ctx, sender, msg)
-		})
+		}) && ctx.Err() == nil {
+			a.sendTypedMessage(sender, protocol.TypeDDContainerDeleteResponse, protocol.DDContainerDeleteResponseMessage{
+				RequestID:   msg.RequestID,
+				ContainerID: msg.ContainerID,
+				Success:     false,
+				Error:       "agent busy: too many active requests",
+			})
+		}
 		return true
 	}
 
@@ -648,6 +662,8 @@ func (a *Adapter) spawnMessageHandlerWithCancelCleanup(ctx context.Context, msgT
 	case sem <- struct{}{}:
 	case <-ctx.Done():
 		slog.Debug("skipping message handler due to canceled context", "type", applog.Sanitize(msgType), "error", applog.Sanitize(ctx.Err().Error()))
+		return false
+	default:
 		return false
 	}
 

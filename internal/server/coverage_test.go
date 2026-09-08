@@ -283,7 +283,9 @@ func TestStreamResponseCopiesBody(t *testing.T) {
 	payload := "hello streaming world\n"
 	rec := httptest.NewRecorder()
 	s := &Server{}
-	s.streamResponse(rec, strings.NewReader(payload))
+	if err := s.streamResponse(rec, strings.NewReader(payload)); err != nil {
+		t.Fatal(err)
+	}
 
 	if got := rec.Body.String(); got != payload {
 		t.Errorf("got %q, want %q", got, payload)
@@ -301,7 +303,9 @@ func TestStreamResponseMultipleChunks(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	s := &Server{}
-	s.streamResponse(rec, &buf)
+	if err := s.streamResponse(rec, &buf); err != nil {
+		t.Fatal(err)
+	}
 
 	want := strings.Join(chunks, "")
 	if got := rec.Body.String(); got != want {
