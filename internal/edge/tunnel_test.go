@@ -253,6 +253,42 @@ func TestExecDemuxerDecodeRejectsMalformedHeader(t *testing.T) {
 	}
 }
 
+// A frame header may claim up to execMaxFrameBytes. One byte more is corrupt:
+// honouring it would let a bad header swallow the rest of the stream as a
+// single frame's payload, and the length is a uint32, so it cannot be narrowed
+// to an int index until it has been bounded. Both sides of the boundary are
+// asserted so the comparison can't drift to >=.
+func TestExecDemuxerDecodeBoundsFrameLength(t *testing.T) {
+	t.Parallel()
+
+	header := func(size uint32) []byte {
+		h := make([]byte, execFrameHeaderLen)
+		h[0] = 1
+		binary.BigEndian.PutUint32(h[4:], size)
+		return h
+	}
+
+	var atCap execDemuxer
+	if _, err := atCap.decode(header(execMaxFrameBytes)); err != nil {
+		t.Errorf("decode of a header at the cap: %v, want it accepted", err)
+	}
+	if atCap.remaining != execMaxFrameBytes {
+		t.Errorf("remaining = %d, want %d outstanding payload bytes", atCap.remaining, execMaxFrameBytes)
+	}
+
+	var over execDemuxer
+	payload, err := over.decode(append(mkExecFrame(1, "before"), header(execMaxFrameBytes+1)...))
+	if err == nil {
+		t.Fatal("decode error = nil, want an oversized-length failure")
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Errorf("error = %v, want it to name the length bound", err)
+	}
+	if string(payload) != "before" {
+		t.Errorf("decoded %q, want the payload that preceded the oversized header", payload)
+	}
+}
+
 // Close must be idempotent (sync.Once), close the done channel exactly once,
 // shut the underlying conn, and deregister the session.
 func TestCloseIsIdempotent(t *testing.T) {

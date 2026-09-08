@@ -454,6 +454,14 @@ const execFrameHeaderLen = 8
 // stdin, stdout and stderr; 3 carries a daemon-side error.
 const execStreamSystemErr = 3
 
+// execMaxFrameBytes bounds the payload length a single frame header may claim.
+// The daemon copies an attached exec through a 32 KiB buffer, so a real frame
+// never approaches this; a header claiming more is corrupt or hostile, and
+// honouring it would make the demuxer swallow up to 4 GiB of the stream as one
+// frame's payload. It matches the cap the container-log decoders already use
+// (internal/docker's maxLogFrameSize).
+const execMaxFrameBytes = 256 << 10 // 256 KiB
+
 // execDemuxer strips those headers off a non-TTY exec stream. It keeps the
 // header bytes seen so far and the payload bytes still outstanding across
 // calls because the hijacked connection is read into a 4 KiB pooled buffer
@@ -462,7 +470,11 @@ const execStreamSystemErr = 3
 type execDemuxer struct {
 	header    [execFrameHeaderLen]byte
 	headerLen int
-	remaining uint32
+	// remaining is an int, not the uint32 the header carries, because it is
+	// only ever compared and decremented against slice lengths. The width
+	// conversion happens once, after the header's length has been bounded by
+	// execMaxFrameBytes, instead of on every payload chunk.
+	remaining int
 }
 
 // decode compacts chunk in place and returns the prefix holding only payload
@@ -484,17 +496,23 @@ func (d *execDemuxer) decode(chunk []byte) ([]byte, error) {
 			if d.header[0] > execStreamSystemErr || d.header[1] != 0 || d.header[2] != 0 || d.header[3] != 0 {
 				return chunk[:w], fmt.Errorf("exec stream desynchronized: bad frame header %x", d.header[:4])
 			}
-			d.remaining = binary.BigEndian.Uint32(d.header[4:])
+			size := binary.BigEndian.Uint32(d.header[4:])
+			if size > execMaxFrameBytes {
+				return chunk[:w], fmt.Errorf("exec stream desynchronized: frame length %d exceeds %d bytes", size, execMaxFrameBytes)
+			}
+			// Narrowed only after the bound above, so the conversion cannot
+			// overflow int on any platform Go builds for.
+			d.remaining = int(size)
 			d.headerLen = 0
 			continue
 		}
 
 		n := len(chunk) - r
-		if uint64(n) > uint64(d.remaining) {
-			n = int(d.remaining)
+		if n > d.remaining {
+			n = d.remaining
 		}
 		w += copy(chunk[w:w+n], chunk[r:r+n])
-		d.remaining -= uint32(n)
+		d.remaining -= n
 		r += n
 	}
 	return chunk[:w], nil
