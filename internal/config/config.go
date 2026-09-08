@@ -258,7 +258,7 @@ func Load() (*Config, error) {
 		{name: "HEARTBEAT_INTERVAL", seconds: cfg.HeartbeatInterval},
 		{name: "DD_POLL_INTERVAL", seconds: cfg.DDPollInterval},
 	} {
-		if err := validateIntervalSeconds(interval.name, interval.seconds); err != nil {
+		if err := ValidateIntervalSeconds(interval.name, interval.seconds); err != nil {
 			return nil, err
 		}
 	}
@@ -278,24 +278,28 @@ func Load() (*Config, error) {
 	return cfg, nil
 }
 
-// maxIntervalSeconds is the largest seconds value that survives every
-// time.Duration conversion applied to a configured interval. The tightest is
-// edge mode's read deadline, which doubles the heartbeat before scaling it to
-// nanoseconds (readDeadline in internal/edge/client.go), so the bound is
-// math.MaxInt64 divided by two seconds' worth of nanoseconds. That is roughly
-// 146 years, far past any real interval and short of the overflow.
-const maxIntervalSeconds = int64(math.MaxInt64) / (2 * int64(time.Second))
+// MaxIntervalSeconds is the largest seconds value that survives every
+// time.Duration conversion applied to an interval. The tightest is edge mode's
+// read deadline, which doubles the heartbeat before scaling it to nanoseconds
+// (readDeadline in internal/edge/client.go), so the bound is math.MaxInt64
+// divided by two seconds' worth of nanoseconds. That is roughly 146 years, far
+// past any real interval and short of the overflow.
+const MaxIntervalSeconds = int64(math.MaxInt64) / (2 * int64(time.Second))
 
-// validateIntervalSeconds rejects a seconds-valued interval that time.NewTicker
+// ValidateIntervalSeconds rejects a seconds-valued interval that time.NewTicker
 // would panic on: non-positive, or large enough that the conversion to a
-// time.Duration overflows and wraps negative.
-func validateIntervalSeconds(name string, seconds int) error {
+// time.Duration overflows and wraps negative. Exported because the same bound
+// has to hold for intervals that arrive off the wire rather than from the
+// environment — edge mode's welcome frame carries one (internal/edge/client.go).
+// name is whatever the caller should tell the operator to fix: an environment
+// variable here, a wire field there.
+func ValidateIntervalSeconds(name string, seconds int) error {
 	if seconds <= 0 {
 		return fmt.Errorf("%s must be a positive number of seconds, got %d", name, seconds)
 	}
-	if int64(seconds) > maxIntervalSeconds {
+	if int64(seconds) > MaxIntervalSeconds {
 		return fmt.Errorf("%s must be at most %d seconds (larger values overflow the conversion to a duration), got %d",
-			name, maxIntervalSeconds, seconds)
+			name, MaxIntervalSeconds, seconds)
 	}
 	return nil
 }

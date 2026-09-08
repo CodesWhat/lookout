@@ -495,7 +495,7 @@ func TestLoadRejectsNonPositiveOrOverflowingIntervals(t *testing.T) {
 // TestLoadAcceptsIntervalBoundary pins the accepted side of the bound so the
 // validation cannot drift into rejecting ordinary configuration.
 func TestLoadAcceptsIntervalBoundary(t *testing.T) {
-	for _, value := range []string{"1", "300", strconv.FormatInt(maxIntervalSeconds, 10)} {
+	for _, value := range []string{"1", "300", strconv.FormatInt(MaxIntervalSeconds, 10)} {
 		t.Run(value, func(t *testing.T) {
 			t.Setenv("HEARTBEAT_INTERVAL", value)
 			t.Setenv("DD_POLL_INTERVAL", value)

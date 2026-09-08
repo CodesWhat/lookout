@@ -541,8 +541,23 @@ func (c *Client) connect(ctx context.Context) (bool, error) {
 		slog.Warn("could not parse welcome payload", "error", err)
 	} else {
 		c.controllerCaps = welcome.Capabilities
-		if welcome.PollInterval > 0 {
-			c.welcomePollInterval = welcome.PollInterval
+		// A zero pollInterval means the controller did not supply one, so the
+		// configured default stands. A supplied value still has to be usable:
+		// writePump converts it to a time.Duration and hands it to
+		// time.NewTicker, which panics on a non-positive interval and on one
+		// large enough that the seconds-to-nanoseconds multiply wraps
+		// negative — a controller could otherwise crash the agent with a
+		// number. Falling back to the configured default matches how the rest
+		// of this welcome parse treats an unusable payload: warn and keep the
+		// connection. Closing instead would reconnect-loop against a
+		// controller the agent can serve perfectly well on its own default.
+		if welcome.PollInterval != 0 {
+			if err := config.ValidateIntervalSeconds("controller welcome pollInterval", welcome.PollInterval); err != nil {
+				slog.Warn("ignoring unusable poll interval from the controller, keeping the configured default",
+					"error", err, "configuredPollInterval", c.cfg.DDPollInterval)
+			} else {
+				c.welcomePollInterval = welcome.PollInterval
+			}
 		}
 		if compat, ok := welcome.Config["serverCompatLevel"]; ok {
 			// Compare major version only so patch-level bumps on either side
