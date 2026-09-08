@@ -3,11 +3,13 @@ package config
 import (
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -243,6 +245,24 @@ func Load() (*Config, error) {
 		PrivateKeyFile: getEnv("PRIVATE_KEY_FILE", ""),
 	}
 
+	// HEARTBEAT_INTERVAL and DD_POLL_INTERVAL are converted to a
+	// time.Duration and handed straight to time.NewTicker, which panics on a
+	// non-positive interval — so a zero or negative value crashed the agent at
+	// startup rather than being rejected. A value large enough to overflow the
+	// seconds-to-Duration multiply wraps negative and panics the same way, so
+	// both ends are checked here, once, instead of at each ticker.
+	for _, interval := range []struct {
+		name    string
+		seconds int
+	}{
+		{name: "HEARTBEAT_INTERVAL", seconds: cfg.HeartbeatInterval},
+		{name: "DD_POLL_INTERVAL", seconds: cfg.DDPollInterval},
+	} {
+		if err := validateIntervalSeconds(interval.name, interval.seconds); err != nil {
+			return nil, err
+		}
+	}
+
 	// Edge mode's operations listener (health, metrics, audit export) carries
 	// no authentication of its own — see the bindAddressDefault comment above.
 	// A non-loopback bind hands the full audit trail and metrics to anyone
@@ -256,6 +276,28 @@ func Load() (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// maxIntervalSeconds is the largest seconds value that survives every
+// time.Duration conversion applied to a configured interval. The tightest is
+// edge mode's read deadline, which doubles the heartbeat before scaling it to
+// nanoseconds (readDeadline in internal/edge/client.go), so the bound is
+// math.MaxInt64 divided by two seconds' worth of nanoseconds. That is roughly
+// 146 years, far past any real interval and short of the overflow.
+const maxIntervalSeconds = int64(math.MaxInt64) / (2 * int64(time.Second))
+
+// validateIntervalSeconds rejects a seconds-valued interval that time.NewTicker
+// would panic on: non-positive, or large enough that the conversion to a
+// time.Duration overflows and wraps negative.
+func validateIntervalSeconds(name string, seconds int) error {
+	if seconds <= 0 {
+		return fmt.Errorf("%s must be a positive number of seconds, got %d", name, seconds)
+	}
+	if int64(seconds) > maxIntervalSeconds {
+		return fmt.Errorf("%s must be at most %d seconds (larger values overflow the conversion to a duration), got %d",
+			name, maxIntervalSeconds, seconds)
+	}
+	return nil
 }
 
 // ListenAddress joins a configured BIND_ADDRESS and PORT into an address

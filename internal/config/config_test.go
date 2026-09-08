@@ -6,8 +6,10 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // setEnv sets environment variables for the duration of a test.
@@ -444,6 +446,70 @@ func TestListenAddressIsListenable(t *testing.T) {
 			}
 			if err := ln.Close(); err != nil {
 				t.Fatalf("close listener: %v", err)
+			}
+		})
+	}
+}
+
+// TestLoadRejectsNonPositiveOrOverflowingIntervals covers the values that used
+// to reach time.NewTicker and panic the agent at startup: NewTicker panics on a
+// non-positive interval, and a seconds value large enough to overflow the
+// conversion to a time.Duration wraps negative and panics the same way.
+func TestLoadRejectsNonPositiveOrOverflowingIntervals(t *testing.T) {
+	// A seconds count whose nanosecond conversion wraps past MaxInt64. Asserted
+	// rather than assumed, so the case still means something if the constant
+	// or the units ever move.
+	const overflowing = "9223372037"
+	overflowSeconds, err := strconv.Atoi(overflowing)
+	if err != nil {
+		t.Skipf("%s does not fit in an int on this platform: %v", overflowing, err)
+	}
+	if d := time.Duration(overflowSeconds) * time.Second; d > 0 {
+		t.Fatalf("%s seconds converts to %v, expected the multiply to overflow", overflowing, d)
+	}
+
+	for _, key := range []string{"HEARTBEAT_INTERVAL", "DD_POLL_INTERVAL"} {
+		for _, tc := range []struct {
+			name  string
+			value string
+			want  string
+		}{
+			{name: "zero", value: "0", want: "positive"},
+			{name: "negative", value: "-1", want: "positive"},
+			{name: "overflows a duration", value: overflowing, want: "at most"},
+		} {
+			t.Run(key+"/"+tc.name, func(t *testing.T) {
+				t.Setenv(key, tc.value)
+				_, err := Load()
+				if err == nil {
+					t.Fatalf("Load() accepted %s=%s; it reaches time.NewTicker and panics", key, tc.value)
+				}
+				if !strings.Contains(err.Error(), key) || !strings.Contains(err.Error(), tc.want) {
+					t.Fatalf("Load() error for %s=%s = %v, want it to name %s and say %q", key, tc.value, err, key, tc.want)
+				}
+			})
+		}
+	}
+}
+
+// TestLoadAcceptsIntervalBoundary pins the accepted side of the bound so the
+// validation cannot drift into rejecting ordinary configuration.
+func TestLoadAcceptsIntervalBoundary(t *testing.T) {
+	for _, value := range []string{"1", "300", strconv.FormatInt(maxIntervalSeconds, 10)} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("HEARTBEAT_INTERVAL", value)
+			t.Setenv("DD_POLL_INTERVAL", value)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() rejected valid intervals of %s seconds: %v", value, err)
+			}
+			for name, seconds := range map[string]int{
+				"HEARTBEAT_INTERVAL": cfg.HeartbeatInterval,
+				"DD_POLL_INTERVAL":   cfg.DDPollInterval,
+			} {
+				if d := time.Duration(seconds) * time.Second; d <= 0 {
+					t.Fatalf("%s=%s survived Load but converts to %v, which panics time.NewTicker", name, value, d)
+				}
 			}
 		})
 	}
