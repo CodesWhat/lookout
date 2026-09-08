@@ -2014,13 +2014,13 @@ func (c *Client) dockerReady(ctx context.Context) bool {
 			return err
 		}
 		if response == nil {
-			return errors.New("Docker ping returned no response")
+			return errors.New("docker ping returned no response")
 		}
 		if response.Body != nil {
 			_ = response.Body.Close()
 		}
 		if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-			return fmt.Errorf("Docker ping returned status %d", response.StatusCode)
+			return fmt.Errorf("docker ping returned status %d", response.StatusCode)
 		}
 		return nil
 	}) == nil
