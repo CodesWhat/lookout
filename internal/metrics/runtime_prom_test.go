@@ -326,6 +326,7 @@ type countingDockerMetricsFake struct {
 	containers []docker.ContainerJSON
 	lists      atomic.Int64
 	statsCalls atomic.Int64
+	cancelled  atomic.Int64
 	entered    chan struct{}
 	release    chan struct{}
 }
@@ -342,6 +343,7 @@ func (f *countingDockerMetricsFake) ContainerStats(ctx context.Context, _ string
 	case <-f.release:
 		return &docker.ContainerStatsResponse{}, nil
 	case <-ctx.Done():
+		f.cancelled.Add(1)
 		return nil, ctx.Err()
 	}
 }
@@ -434,5 +436,83 @@ func TestWriteContainerPrometheusCollectsAgainAfterFlight(t *testing.T) {
 
 	if got := client.lists.Load(); got != 2 {
 		t.Errorf("ListContainers calls = %d, want 2 across two sequential scrapes", got)
+	}
+}
+
+// TestWriteContainerPrometheusAbandonsACollectionNobodyWaitsOn covers the
+// other side of the sharing rule: the collection outlives the scrape that
+// started it only while some scrape is still waiting on it. When the last one
+// gives up — a scraper that hung up mid-scrape, so its request context is
+// cancelled — the collection is cancelled with it rather than left running
+// against Docker, and the next scrape samples fresh instead of joining the
+// abandoned collection.
+func TestWriteContainerPrometheusAbandonsACollectionNobodyWaitsOn(t *testing.T) {
+	t.Parallel()
+
+	client := &countingDockerMetricsFake{
+		containers: []docker.ContainerJSON{{ID: "container-0"}},
+		entered:    make(chan struct{}, 2),
+		release:    make(chan struct{}),
+	}
+	collector := metrics.NewContainerCollector(client)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	bodies := make(chan string, 1)
+	go func() {
+		var b strings.Builder
+		metrics.WriteContainerPrometheus(ctx, &b, collector, noEscape)
+		bodies <- b.String()
+	}()
+
+	// The collection is now blocked in ContainerStats, so cancelling here
+	// leaves it with no waiters while it is still the collector's current
+	// flight.
+	select {
+	case <-client.entered:
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("timed out waiting for the scrape's stats call")
+	}
+	cancel()
+
+	select {
+	case body := <-bodies:
+		if body != "" {
+			t.Errorf("abandoned scrape wrote metrics:\n%s", body)
+		}
+	case <-time.After(5 * time.Second):
+		close(client.release)
+		t.Fatal("cancelled scrape did not return")
+	}
+
+	// The collection must stop with its last waiter instead of running on
+	// against Docker: release is never closed, so only cancellation can end
+	// the blocked stats call.
+	waitFor(t, 5*time.Second, func() bool { return client.cancelled.Load() == 1 })
+
+	close(client.release)
+	var b strings.Builder
+	metrics.WriteContainerPrometheus(context.Background(), &b, collector, noEscape)
+	// The second scrape has to sample again; joining the abandoned flight
+	// would have handed it that collection's empty results.
+	if !strings.Contains(b.String(), `container_cpu_usage_seconds_total{id="container-0"`) {
+		t.Errorf("scrape after an abandoned collection returned no metrics:\n%s", b.String())
+	}
+	if got := client.lists.Load(); got != 2 {
+		t.Errorf("ListContainers calls = %d, want 2", got)
+	}
+}
+
+// waitFor blocks until cond holds or the timeout expires, failing the test in
+// the second case. It suits conditions a goroutine reaches on its own — a
+// cancelled Docker call unwinding, say — where there is nothing to receive on.
+func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for condition")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
