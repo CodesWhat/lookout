@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -149,15 +150,21 @@ type healthProbe struct {
 	valid    bool
 }
 
+// errReadinessPingIncomplete is cached when a ping did not return normally,
+// which today means it panicked. Recording it keeps a panic from being cached
+// as a healthy result by the deferred publish, whose err is still nil at that
+// point.
+var errReadinessPingIncomplete = errors.New("readiness ping did not complete")
+
 // check returns the Docker reachability result, pinging at most once per
 // readinessPingTTL across all concurrent callers. ping is called with a
 // context bounded by readinessPingTimeout.
-func (p *healthProbe) check(ctx context.Context, ping func(context.Context) error) error {
+func (p *healthProbe) check(ctx context.Context, ping func(context.Context) error) (err error) {
 	p.mu.Lock()
 	if p.valid && time.Since(p.at) < readinessPingTTL {
-		err := p.err
+		cached := p.err
 		p.mu.Unlock()
-		return err
+		return cached
 	}
 	if wait := p.inflight; wait != nil {
 		p.mu.Unlock()
@@ -167,28 +174,41 @@ func (p *healthProbe) check(ctx context.Context, ping func(context.Context) erro
 			return ctx.Err()
 		}
 		p.mu.Lock()
-		err := p.err
+		cached := p.err
 		p.mu.Unlock()
-		return err
+		return cached
 	}
 	done := make(chan struct{})
 	p.inflight = done
 	p.mu.Unlock()
 
+	// Publish and hand off from a defer so an unwinding ping cannot leave
+	// inflight set: every later readiness request would block on a channel
+	// nothing ever closes, turning one panicking request into a permanently
+	// wedged readiness endpoint. RecoveryMiddleware turns the panic itself
+	// into a 500 for the one request that caused it.
+	completed := false
+	defer func() {
+		p.mu.Lock()
+		if !completed {
+			err = errReadinessPingIncomplete
+		}
+		p.err = err
+		p.at = time.Now()
+		p.valid = true
+		p.inflight = nil
+		p.mu.Unlock()
+		close(done)
+	}()
+
 	// Detached from the caller's context: everyone waiting on this ping would
 	// otherwise be cancelled by whichever client happened to start it hanging
 	// up first. The timeout is what bounds it.
 	pingCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), readinessPingTimeout)
-	err := ping(pingCtx)
-	cancel()
+	defer cancel()
 
-	p.mu.Lock()
-	p.err = err
-	p.at = time.Now()
-	p.valid = true
-	p.inflight = nil
-	p.mu.Unlock()
-	close(done)
+	err = ping(pingCtx)
+	completed = true
 	return err
 }
 
