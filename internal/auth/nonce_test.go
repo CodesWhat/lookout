@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -10,17 +11,17 @@ import (
 func TestNonceLRU_FreshNonceAccepted(t *testing.T) {
 	t.Parallel()
 	lru := NewNonceLRU(100, 60)
-	if !lru.Add("abc123") {
-		t.Error("first Add should return true (fresh)")
+	if err := lru.Add("abc123"); err != nil {
+		t.Error("first Add should succeed")
 	}
 }
 
 func TestNonceLRU_ReplayDetected(t *testing.T) {
 	t.Parallel()
 	lru := NewNonceLRU(100, 60)
-	lru.Add("abc123")
-	if lru.Add("abc123") {
-		t.Error("second Add of same nonce should return false (replay)")
+	_ = lru.Add("abc123")
+	if err := lru.Add("abc123"); err == nil {
+		t.Error("second Add of same nonce should fail (replay)")
 	}
 }
 
@@ -30,7 +31,7 @@ func TestNonceLRU_Seen(t *testing.T) {
 	if lru.Seen("xyz") {
 		t.Error("Seen should return false for unknown nonce")
 	}
-	lru.Add("xyz")
+	_ = lru.Add("xyz")
 	if !lru.Seen("xyz") {
 		t.Error("Seen should return true after Add")
 	}
@@ -41,8 +42,8 @@ func TestNonceLRU_DifferentNoncesAccepted(t *testing.T) {
 	lru := NewNonceLRU(100, 60)
 	for i := 0; i < 10; i++ {
 		n := fmt.Sprintf("nonce%04d", i)
-		if !lru.Add(n) {
-			t.Errorf("Add(%q) returned false on first use", n)
+		if err := lru.Add(n); err != nil {
+			t.Errorf("Add(%q) failed on first use", n)
 		}
 	}
 	if lru.Len() != 10 {
@@ -56,7 +57,7 @@ func fillNonceLRU(t *testing.T, lru *NonceLRU, n int) []string {
 	added := make([]string, n)
 	for i := 0; i < n; i++ {
 		added[i] = fmt.Sprintf("n%d", i)
-		if !lru.Add(added[i]) {
+		if err := lru.Add(added[i]); err != nil {
 			t.Fatalf("Add(%q) refused while filling to %d", added[i], n)
 		}
 	}
@@ -89,13 +90,13 @@ func TestNonceLRU_AtCapacityEvictsExpiredThenRecords(t *testing.T) {
 	fillNonceLRU(t, lru, capacity)
 	backdateNonces(t, lru)
 
-	if !lru.Add("overflow") {
+	if err := lru.Add("overflow"); err != nil {
 		t.Fatal("Add at capacity refused a nonce with only expired entries to evict")
 	}
 	if !lru.Seen("overflow") {
-		t.Fatal("Add returned true without recording the nonce: the request stays replayable")
+		t.Fatal("Add succeeded without recording the nonce: the request stays replayable")
 	}
-	if lru.Add("overflow") {
+	if err := lru.Add("overflow"); err == nil {
 		t.Fatal("replay of the nonce accepted at capacity was not refused")
 	}
 }
@@ -112,14 +113,41 @@ func TestNonceLRU_AtCapacityRejectsWhenNothingExpired(t *testing.T) {
 
 	fillNonceLRU(t, lru, capacity)
 
-	if lru.Add("overflow") {
-		t.Fatal("Add accepted a nonce it had no room to record")
+	if err := lru.Add("overflow"); !errors.Is(err, ErrNonceCapacity) {
+		t.Fatalf("Add at capacity = %v, want ErrNonceCapacity", err)
 	}
 	if lru.Seen("overflow") {
 		t.Fatal("rejected nonce was recorded anyway")
 	}
 	if lru.Len() != capacity {
 		t.Fatalf("len = %d after a rejected Add, want %d", lru.Len(), capacity)
+	}
+}
+
+func TestNonceExpiryRetainsFreshRequests(t *testing.T) {
+	t.Parallel()
+	lru := NewNonceLRU(3, 60)
+	t.Cleanup(lru.Close)
+	nonces := fillNonceLRU(t, lru, 3)
+	lru.mu.Lock()
+	for _, nonce := range nonces[:2] {
+		lru.seen[nonce] = time.Now().Add(-2 * lru.ttl)
+	}
+	lru.mu.Unlock()
+	if err := lru.Add("replacement"); err != nil {
+		t.Fatalf("expired entries did not free capacity: %v", err)
+	}
+	if err := lru.Add(nonces[2]); !errors.Is(err, ErrNonceReplay) {
+		t.Fatalf("fresh request replay = %v", err)
+	}
+	if lru.Seen(nonces[0]) || lru.Seen(nonces[1]) {
+		t.Fatal("expired nonces were retained")
+	}
+	if err := lru.Add("last-slot"); err != nil {
+		t.Fatal(err)
+	}
+	if err := lru.Add("overflow"); !errors.Is(err, ErrNonceCapacity) {
+		t.Fatalf("full cache = %v", err)
 	}
 }
 
@@ -138,7 +166,7 @@ func TestNonceLRU_ConcurrentAccess(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < perGoroutine; i++ {
 				n := fmt.Sprintf("g%d-n%d", g, i)
-				lru.Add(n)
+				_ = lru.Add(n)
 				lru.Seen(n)
 			}
 		}()
@@ -161,7 +189,7 @@ func TestNonceLRU_ReplayConcurrent(t *testing.T) {
 		i := i
 		go func() {
 			defer wg.Done()
-			wins[i] = lru.Add(nonce)
+			wins[i] = lru.Add(nonce) == nil
 		}()
 	}
 	wg.Wait()
@@ -172,9 +200,25 @@ func TestNonceLRU_ReplayConcurrent(t *testing.T) {
 			count++
 		}
 	}
-	// Exactly one goroutine should win (first Add returns true, all subsequent
-	// see the nonce already and return false).
+	// Exactly one goroutine should win (first Add succeeds, all subsequent
+	// see the nonce already and fail).
 	if count != 1 {
 		t.Errorf("expected exactly one goroutine to win the nonce Add race, got %d", count)
+	}
+}
+
+func BenchmarkNonceCapacityRefusal(b *testing.B) {
+	for _, size := range []int{100, 10000} {
+		b.Run(fmt.Sprint(size), func(b *testing.B) {
+			lru := NewNonceLRU(size, 60)
+			b.Cleanup(lru.Close)
+			for i := range size {
+				_ = lru.Add(fmt.Sprint(i))
+			}
+			b.ResetTimer()
+			for range b.N {
+				_ = lru.Add("overflow")
+			}
+		})
 	}
 }

@@ -71,6 +71,13 @@ Portwing implements the following:
 
 ### Nonce cache capacity
 
+Capacity rejection returns HTTP 401 with `X-Portwing-Reason: nonce-capacity`
+and increments `portwing_auth_failures_total{reason="nonce-capacity"}`. It is
+distinct from `replay`, `timestamp-skew`, `unknown-key`, and `invalid-signature`.
+Expiry follows insertion order because all entries share one retention TTL;
+refusing a full cache of fresh nonces takes constant time, and each expired
+entry is removed once.
+
 The nonce LRU cache (capacity controlled by `NONCE_LRU_SIZE`, default 10,000) tracks nonces within the ±60 s timestamp window to block replayed Ed25519-signed requests. At capacity the cache first evicts every entry past its retention TTL — those nonces can no longer pass the timestamp check, so dropping them opens nothing — and records the new nonce in the space that frees. If nothing has expired, the request is refused instead of being admitted unrecorded: accepting a nonce the cache cannot store would leave that exact request replayable for the rest of its timestamp window. Nonces are only recorded *after* a valid Ed25519 signature has been verified, so an unauthenticated attacker cannot fill the cache; the default 10,000 entries exceeds expected request volume for a single-host agent, and an operator driving more can raise `NONCE_LRU_SIZE`.
 
 - **Minimal attack surface**: static binary, three direct dependencies, stdlib crypto only, Wolfi OS base image with no package manager.

@@ -216,7 +216,9 @@ signatures are accepted only for query-free requests. No new dependencies.
    (default 60 s) are rejected with `X-Portwing-Reason: timestamp-skew`.
 2. **Nonce LRU:** An in-memory nonce cache (capacity `NONCE_LRU_SIZE`, default
    10,000 entries) tracks nonces within the timestamp window. Repeated nonces
-   return `X-Portwing-Reason: replay`. The LRU is preserved across SIGHUP reloads.
+   return `X-Portwing-Reason: replay`. A full cache with no expired entries
+   returns HTTP 401 with `X-Portwing-Reason: nonce-capacity`; it never accepts
+   a request without recording its nonce. The LRU is preserved across SIGHUP reloads.
 
 **Verification order in middleware:** If `X-Portwing-Signature` is present, Ed25519
 verification runs; if absent, the request falls through to the existing token

@@ -43,6 +43,7 @@ var (
 	ErrMissingHeaders = errors.New("ed25519: missing required signature headers")
 	ErrUnknownKey     = errors.New("ed25519: unknown key ID")
 	ErrTimestampSkew  = errors.New("ed25519: timestamp outside allowed window")
+	ErrNonceCapacity  = errors.New("ed25519: nonce cache at capacity")
 	ErrNonceReplay    = errors.New("ed25519: nonce already seen (replay)")
 	ErrBadSignature   = errors.New("ed25519: signature verification failed")
 	ErrInvalidNonce   = errors.New("ed25519: nonce must be 32 hex characters")
@@ -55,6 +56,8 @@ func ReasonFor(err error) string {
 	switch {
 	case errors.Is(err, ErrTimestampSkew):
 		return "timestamp-skew"
+	case errors.Is(err, ErrNonceCapacity):
+		return "nonce-capacity"
 	case errors.Is(err, ErrNonceReplay):
 		return "replay"
 	case errors.Is(err, ErrUnknownKey):
@@ -218,8 +221,8 @@ func VerifyRequest(
 	// Record the nonce after successful verification. Add is the
 	// authoritative atomic check-and-set: if two copies of the same request
 	// race past the Seen() pre-check above, only one wins here.
-	if !lru.Add(nonceHeader) {
-		return "", ErrNonceReplay
+	if err := lru.Add(nonceHeader); err != nil {
+		return "", err
 	}
 
 	return kidHeader, nil

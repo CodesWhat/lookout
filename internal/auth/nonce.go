@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"container/list"
 	"sync"
 	"time"
 )
@@ -19,6 +20,7 @@ type NonceLRU struct {
 	mu      sync.Mutex
 	seen    map[string]time.Time // nonce → time first seen
 	maxSize int
+	order   list.List // oldest insertion first; all entries have the same TTL
 	// ttl is how long a nonce must be retained before it is safe to evict.
 	// Invariant: ttl must be >= the widest span a signed timestamp can stay
 	// valid for, measured from when the nonce was first recorded, or an
@@ -62,33 +64,26 @@ func (l *NonceLRU) Close() {
 	}
 }
 
-// Add records the nonce if it has not been seen before and there is room for
-// it. Returns true if the nonce was freshly added (not a replay), false if it
-// has been seen before or could not be recorded.
-//
-// A false return at capacity is a rejection, not a replay verdict, and the
-// caller must treat it as one: admitting a nonce without recording it leaves
-// that exact request replayable until its timestamp falls out of the window.
-// Only entries past their TTL are evicted to make room — every other tracked
-// nonce is still inside its own replay window, so evicting one would hand
-// back the same hole from the other end.
-func (l *NonceLRU) Add(nonce string) bool {
+// Add atomically records a fresh nonce, or returns ErrNonceReplay or
+// ErrNonceCapacity. Only expired entries may be evicted to make room.
+func (l *NonceLRU) Add(nonce string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	if _, exists := l.seen[nonce]; exists {
-		return false
+		return ErrNonceReplay
 	}
 
 	if len(l.seen) >= l.maxSize {
 		l.evictExpiredLocked(time.Now())
 	}
 	if len(l.seen) >= l.maxSize {
-		return false
+		return ErrNonceCapacity
 	}
 
 	l.seen[nonce] = time.Now()
-	return true
+	l.order.PushBack(nonce)
+	return nil
 }
 
 // Seen reports whether the nonce has been recorded in the cache.
@@ -140,9 +135,12 @@ func (l *NonceLRU) evictExpired() {
 // waiting for the cleanup ticker.
 func (l *NonceLRU) evictExpiredLocked(now time.Time) {
 	cutoff := now.Add(-l.ttl)
-	for nonce, t := range l.seen {
-		if t.Before(cutoff) {
-			delete(l.seen, nonce)
+	for entry := l.order.Front(); entry != nil; entry = l.order.Front() {
+		nonce := entry.Value.(string)
+		if !l.seen[nonce].Before(cutoff) {
+			break
 		}
+		delete(l.seen, nonce)
+		l.order.Remove(entry)
 	}
 }

@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A full nonce cache reports `nonce-capacity` in auth response headers and
+  metrics, distinguishing capacity pressure from replays. Expiry uses insertion
+  order, avoiding a full-cache scan for each rejected request.
 - Edge readiness checks share the bounded, cached Docker probe used by Standard
   mode, preventing concurrent operations requests from opening one ping each.
 - Duration environment variables reject malformed, negative, and overflowing
