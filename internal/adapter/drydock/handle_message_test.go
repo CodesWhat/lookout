@@ -213,3 +213,61 @@ func TestHandleMessage_ContainerDeleteRequestRecognized(t *testing.T) {
 		t.Fatal("HandleMessage(dd:container_delete_request): expected true (handled), got false")
 	}
 }
+
+func TestHandleMessageRespondsWhileHandlerPoolFull(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ name, request, response string }{
+		{"delete", protocol.TypeDDContainerDeleteRequest, protocol.TypeDDContainerDeleteResponse},
+		{"watch", protocol.TypeDDWatchRequest, protocol.TypeDDWatchResponse},
+		{"watch container", protocol.TypeDDWatchContainerRequest, protocol.TypeDDWatchContainerResponse},
+		{"trigger", protocol.TypeDDTriggerRequest, protocol.TypeDDTriggerResponse},
+		{"cancel logs", protocol.TypeDDContainerLogCancel, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			a := NewAdapter(nil, "test-agent", AgentInfo{})
+			for i := 0; i < cap(a.messageSem); i++ {
+				a.messageSem <- struct{}{}
+			}
+			canceled := make(chan struct{})
+			a.logStreams["request"] = activeContainerLogStream{containerID: "container", cancel: func() { close(canceled) }}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			sender := newSyncCaptureSender()
+			returned := make(chan bool, 1)
+			go func() {
+				returned <- a.HandleMessage(ctx, sender, tc.request, json.RawMessage(`{"requestId":"request","containerId":"container","watcherType":"docker","watcherName":"main","triggerType":"restart","triggerName":"web"}`))
+			}()
+			select {
+			case handled := <-returned:
+				if !handled {
+					t.Fatal("request not recognized")
+				}
+			case <-time.After(250 * time.Millisecond):
+				cancel()
+				<-returned
+				t.Fatal("full pool blocked control or overload response")
+			}
+			if tc.response != "" {
+				if sender.MsgType() != tc.response {
+					t.Fatalf("response type=%q", sender.MsgType())
+				}
+			} else {
+				select {
+				case <-canceled:
+				default:
+					t.Fatal("log stream was not canceled")
+				}
+			}
+			if tc.request == protocol.TypeDDContainerDeleteRequest {
+				reply, ok := sender.Data().(protocol.DDContainerDeleteResponseMessage)
+				if !ok || reply.RequestID != "request" || reply.ContainerID != "container" || reply.Success || reply.Error == "" {
+					t.Fatalf("delete response=%+v", sender.Data())
+				}
+			}
+			if len(a.messageSem) != defaultMessageHandlerConcurrency {
+				t.Fatal("shared slot count changed")
+			}
+		})
+	}
+}

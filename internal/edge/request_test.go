@@ -667,3 +667,98 @@ func TestHandleRequestNonStreamWithBody(t *testing.T) {
 		t.Errorf("StatusCode = %d, want 200", resp.StatusCode)
 	}
 }
+
+func TestHandleRequestUnaryReadFailure(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, partial    string
+		base64, canceled bool
+	}{
+		{"base64 truncated JSON", `{"ok":`, true, false},
+		{"legacy valid JSON prefix", `{"ok":true}`, false, false},
+		{"base64 canceled", `{}`, true, true},
+		{"legacy canceled", `{}`, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var resp *http.Response
+			if tc.canceled {
+				resp = &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: &unaryFailedBody{data: []byte(tc.partial), err: context.Canceled}}
+			} else {
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					conn, buf, err := w.(http.Hijacker).Hijack()
+					if err != nil {
+						return
+					}
+					defer conn.Close()
+					_, _ = buf.WriteString("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n" + tc.partial)
+					_ = buf.Flush()
+				}))
+				t.Cleanup(srv.Close)
+				var err error
+				resp, err = srv.Client().Get(srv.URL)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer resp.Body.Close()
+			}
+			observed := &unaryObservedBody{ReadCloser: resp.Body}
+			resp.Body = observed
+			c, ctrl := newTestClient(t)
+			if tc.base64 {
+				c.controllerCaps = []string{protocol.CapResponseBodyBase64}
+			}
+			logger, _, err := audit.New("", 8)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(logger.Close)
+			c.auditor = logger
+			c.dockerClient = &fakeDocker{doResp: resp}
+			c.handleRequest(context.Background(), protocol.RequestMessage{RequestID: "read-failure", Method: http.MethodGet, Path: "/info"})
+			var response protocol.ErrorMessage
+			decodeData(t, expectType(t, ctrl, protocol.TypeError), &response)
+			if response.RequestID != "read-failure" || !strings.Contains(response.Message, observed.readErr.Error()) {
+				t.Fatalf("error response = %+v, read error = %v", response, observed.readErr)
+			}
+			wantErr := error(io.ErrUnexpectedEOF)
+			if tc.canceled {
+				wantErr = context.Canceled
+			}
+			if !errors.Is(observed.readErr, wantErr) || !observed.closed {
+				t.Fatalf("read error=%v closed=%v", observed.readErr, observed.closed)
+			}
+			records := logger.Records(0)
+			if len(records) != 1 || records[0].Event != audit.EventAPIRequest || records[0].Outcome != audit.OutcomeError || records[0].Status != http.StatusOK {
+				t.Fatalf("audit records = %+v", records)
+			}
+			if err := c.sendTypedMessage(protocol.TypePong, protocol.PongMessage{}); err != nil {
+				t.Fatal(err)
+			}
+			expectType(t, ctrl, protocol.TypePong)
+		})
+	}
+}
+
+type unaryObservedBody struct {
+	io.ReadCloser
+	readErr error
+	closed  bool
+}
+
+func (b *unaryObservedBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil {
+		b.readErr = err
+	}
+	return n, err
+}
+func (b *unaryObservedBody) Close() error { b.closed = true; return b.ReadCloser.Close() }
+
+type unaryFailedBody struct {
+	data []byte
+	err  error
+}
+
+func (b *unaryFailedBody) Read(p []byte) (int, error) { return copy(p, b.data), b.err }
+func (*unaryFailedBody) Close() error                 { return nil }

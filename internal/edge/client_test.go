@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1325,6 +1326,172 @@ func TestWritePumpHeartbeatTick(t *testing.T) {
 
 	if !gotPing {
 		t.Error("writePump never sent a TypePing on the heartbeat tick")
+	}
+}
+
+type blockingPollAdapter struct {
+	fakeAdapter
+	entered       chan struct{}
+	release       chan struct{}
+	canceled      chan struct{}
+	cleanup       chan struct{}
+	calls         atomic.Int32
+	active        atomic.Int32
+	notifications atomic.Int32
+}
+
+func (a *blockingPollAdapter) RefreshContainers(ctx context.Context) (_, _, _ []adapter.Container, err error) {
+	a.calls.Add(1)
+	a.active.Add(1)
+	defer a.active.Add(-1)
+	a.entered <- struct{}{}
+	select {
+	case <-a.release:
+	case <-ctx.Done():
+		if a.canceled != nil {
+			close(a.canceled)
+			<-a.cleanup
+		}
+	}
+	return []adapter.Container{{ID: "refreshed"}}, nil, nil, nil
+}
+
+func (a *blockingPollAdapter) OnContainerRefresh(_ context.Context, sender adapter.MessageSender, added, _, _ []adapter.Container) error {
+	a.notifications.Add(1)
+	return sender.SendTypedMessage("test:refresh", added)
+}
+
+func TestWritePumpHeartbeatContinuesDuringSerialRefresh(t *testing.T) {
+	t.Parallel()
+	c, ctrl := newTestClient(t)
+	c.collector = metrics.NewCollector("", true)
+	c.cfg.HeartbeatInterval = 1
+	a := &blockingPollAdapter{fakeAdapter: fakeAdapter{pollInterval: 1}, entered: make(chan struct{}, 8), release: make(chan struct{}, 1)}
+	c.adapter = a
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	done := make(chan struct{})
+	readDone := make(chan struct{})
+	go func() { defer close(done); c.writePump(ctx) }()
+	go func() { defer close(readDone); _ = c.readPump(ctx) }()
+	defer func() {
+		cancel()
+		_ = ctrl.Close()
+		for _, ch := range []chan struct{}{done, readDone} {
+			select {
+			case <-ch:
+			case <-time.After(2 * time.Second):
+				t.Error("pump did not stop")
+			}
+		}
+	}()
+	select {
+	case <-a.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("refresh did not start")
+	}
+	enteredAt := time.Now().UnixMilli()
+	sendEnvelope(t, ctrl, protocol.TypePing, protocol.PingMessage{Timestamp: 12345})
+	gotPong, gotMetrics, pings := false, false, 0
+	for pings < 3 || !gotPong {
+		env := expectEnvelope(t, ctrl)
+		switch env.Type {
+		case protocol.TypeMetrics:
+			gotMetrics = true
+		case protocol.TypeError:
+			var msg protocol.ErrorMessage
+			decodeData(t, env.Data, &msg)
+			if msg.Code != metricsUnavailableCode {
+				t.Fatalf("unexpected error: %+v", msg)
+			}
+			gotMetrics = true
+		case protocol.TypePing:
+			var msg protocol.PingMessage
+			decodeData(t, env.Data, &msg)
+			if msg.Timestamp > enteredAt {
+				if !gotMetrics {
+					t.Fatal("heartbeat missing metrics or unavailable frame")
+				}
+				pings++
+			}
+			gotMetrics = false
+		case protocol.TypePong:
+			var msg protocol.PongMessage
+			decodeData(t, env.Data, &msg)
+			gotPong = msg.Timestamp == 12345
+		default:
+			t.Fatalf("unexpected frame while refresh blocked: %s", env.Type)
+		}
+	}
+	if a.calls.Load() != 1 || a.active.Load() != 1 {
+		t.Fatalf("refresh calls=%d active=%d", a.calls.Load(), a.active.Load())
+	}
+	a.release <- struct{}{}
+	for {
+		env := expectEnvelope(t, ctrl)
+		if env.Type == "test:refresh" {
+			var added []adapter.Container
+			decodeData(t, env.Data, &added)
+			if len(added) != 1 || added[0].ID != "refreshed" {
+				t.Fatalf("refresh payload=%+v", added)
+			}
+			break
+		}
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("write pump did not join refresh")
+	}
+	if a.active.Load() != 0 || a.notifications.Load() != 1 {
+		t.Fatalf("after stop: active=%d notifications=%d", a.active.Load(), a.notifications.Load())
+	}
+}
+
+func TestWritePumpCancellationJoinsRefreshBeforeReturning(t *testing.T) {
+	t.Parallel()
+	c, _ := newTestClient(t)
+	c.cfg.HeartbeatInterval = 999
+	a := &blockingPollAdapter{fakeAdapter: fakeAdapter{pollInterval: 1}, entered: make(chan struct{}, 8), release: make(chan struct{}), canceled: make(chan struct{}), cleanup: make(chan struct{})}
+	c.adapter = a
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	var cleanupOnce sync.Once
+	finishCleanup := func() { cleanupOnce.Do(func() { close(a.cleanup) }) }
+	go func() { defer close(done); c.writePump(ctx) }()
+	defer func() {
+		cancel()
+		finishCleanup()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Error("write pump did not stop")
+		}
+	}()
+	select {
+	case <-a.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("refresh did not start")
+	}
+	cancel()
+	select {
+	case <-a.canceled:
+	case <-time.After(time.Second):
+		t.Fatal("refresh did not receive cancellation")
+	}
+	select {
+	case <-done:
+		t.Fatal("write pump returned before refresh cleanup")
+	case <-time.After(50 * time.Millisecond):
+	}
+	finishCleanup()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("write pump did not join refresh")
+	}
+	if a.active.Load() != 0 || a.calls.Load() != 1 || a.notifications.Load() != 0 {
+		t.Fatalf("after cancellation: active=%d calls=%d notifications=%d", a.active.Load(), a.calls.Load(), a.notifications.Load())
 	}
 }
 
