@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Portwing Agent API
-  version: 0.9.16
+  version: 0.9.17
   description: |
     Portwing is a lightweight remote Docker agent for the Drydock container
     monitoring platform. This specification covers the **Standard Mode** HTTP API
@@ -31,7 +31,7 @@ info:
     Docker daemon (Unix socket). This includes every endpoint in the
     [Docker Engine API](https://docs.docker.com/engine/api/) — streaming
     endpoints (`/logs`, `/attach`, `/exec/*/start`, `/events`, `/build`,
-    `/images/create`, `/images/push`), interactive exec hijacking
+    `/images/create`, `/images/{name}/push`, `/containers/{id}/stats` (streaming is disabled when `stream` is empty, `0`, `no`, `false`, or `none`)), interactive exec hijacking
     (`Upgrade: tcp`), and binary responses. Paths are forwarded verbatim; the
     agent negotiates the API version on startup (fallback: `v1.44`).
 
@@ -124,7 +124,7 @@ components:
         version:
           type: string
           description: Portwing agent version.
-          example: "0.9.16"
+          example: "0.9.17"
         uptimeSeconds:
           type: number
           minimum: 0
@@ -145,7 +145,7 @@ components:
         version:
           type: string
           description: Portwing agent version
-          example: "0.9.16"
+          example: "0.9.17"
         dockerVersion:
           type: string
           description: Docker Engine version string
@@ -317,6 +317,13 @@ components:
           example: "docker"
         agent:
           type: string
+        health:
+          type: string
+          description: >
+            Docker health-check state, present only when the container
+            declares a health check.
+          enum: [starting, healthy, unhealthy]
+          example: "healthy"
         image:
           $ref: '#/components/schemas/ContainerImage'
         result:
@@ -326,8 +333,7 @@ components:
         updateAvailable:
           type: boolean
         updateKind:
-          type: string
-          example: "tag"
+          $ref: '#/components/schemas/ContainerUpdateKind'
         includeTags:
           type: string
         excludeTags:
@@ -343,13 +349,93 @@ components:
 
     ContainerImage:
       type: object
+      description: >
+        Drydock's image model. `registry`, `tag` and `digest` are objects, not
+        strings: Drydock's AgentClient stores this shape verbatim, so the
+        nesting is the wire contract rather than an encoding detail.
+      required: [id, registry, name, tag, digest, architecture, os]
       properties:
         id:
           type: string
+          example: "sha256:0f2c1a2f"
+        registry:
+          $ref: '#/components/schemas/ContainerImageRegistry'
         name:
           type: string
+          example: "library/nginx"
         tag:
+          $ref: '#/components/schemas/ContainerImageTag'
+        digest:
+          $ref: '#/components/schemas/ContainerImageDigest'
+        architecture:
           type: string
+          description: Image architecture, falling back to the agent's own.
+          example: "arm64"
+        os:
+          type: string
+          description: Image OS, falling back to the agent's own.
+          example: "linux"
+        created:
+          type: string
+          description: Image creation timestamp, when the daemon reports one.
+
+    ContainerImageRegistry:
+      type: object
+      description: >
+        Registry component assignment. Portwing reports the URL it parsed from
+        the image reference and leaves `name` as `unknown`, because the
+        registry component is named by the Drydock controller's own config.
+      required: [name, url]
+      properties:
+        name:
+          type: string
+          example: "unknown"
+        url:
+          type: string
+          example: "docker.io"
+
+    ContainerImageTag:
+      type: object
+      required: [value, semver]
+      properties:
+        value:
+          type: string
+          example: "1.27.0"
+        semver:
+          type: boolean
+          description: >
+            Whether Drydock should treat `value` as a semver range. Portwing
+            reports false; semver classification is controller-owned.
+          example: false
+
+    ContainerImageDigest:
+      type: object
+      required: [watch]
+      properties:
+        watch:
+          type: boolean
+          description: >
+            Whether Drydock should watch the digest for changes. Portwing
+            reports false; digest watching is controller-owned.
+          example: false
+        value:
+          type: string
+          description: Image digest (`sha256:...`) when the daemon reports one.
+        repo:
+          type: string
+          description: Digest repository, set by the Drydock controller.
+
+    ContainerUpdateKind:
+      type: object
+      description: >
+        Update classification. Portwing's raw inventory always reports
+        `{"kind":"unknown"}`; the Drydock controller fills in the real kind
+        from its own watcher result.
+      required: [kind]
+      properties:
+        kind:
+          type: string
+          example: "unknown"
 
     ContainerResult:
       type: object
@@ -371,10 +457,6 @@ components:
       properties:
         message:
           type: string
-        timestamp:
-          type: string
-          format: date-time
-          description: When the error was recorded.
 
     RuntimeDetails:
       type: object
@@ -437,7 +519,7 @@ components:
       properties:
         agentVersion:
           type: string
-          example: "0.9.16"
+          example: "0.9.17"
         protocolName:
           type: string
           example: "portwing"
@@ -998,7 +1080,7 @@ paths:
 
         **Example stream:**
         ```
-        data: {"type":"dd:ack","data":{"version":"0.9.16","os":"linux","arch":"amd64","cpus":4,"memoryGb":0,"uptimeSeconds":3600,"lastSeen":"2024-07-23T10:00:00Z","containers":{"total":5,"running":4,"stopped":1},"images":3}}
+        data: {"type":"dd:ack","data":{"version":"0.9.17","os":"linux","arch":"amd64","cpus":4,"memoryGb":0,"uptimeSeconds":3600,"lastSeen":"2024-07-23T10:00:00Z","containers":{"total":5,"running":4,"stopped":1},"images":3}}
 
         data: {"type":"dd:watcher-snapshot","data":{"watcher":{...WatcherComponent...},"containers":[{...Container...}]}}
 
@@ -1605,7 +1687,7 @@ paths:
         agent prepends it automatically.
 
         Streaming endpoints (`/logs`, `/attach`, `/exec/*/start`, `/events`,
-        `/build`, `/images/create`, `/images/push`) are detected by path and
+        `/build`, `/images/create`, `/images/{name}/push`, `/containers/{id}/stats` (streaming is disabled when `stream` is empty, `0`, `no`, `false`, or `none`)) are detected by path and
         forwarded with flush-on-read streaming. Interactive exec sessions
         using `Upgrade: tcp` or `Upgrade: websocket` are handled via HTTP
         hijacking. Bearer auth is required for all proxy paths.

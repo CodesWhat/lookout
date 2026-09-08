@@ -3,6 +3,7 @@ package edge
 import (
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -56,6 +57,13 @@ type ExecSession struct {
 	client      *Client
 	target      outboundTarget
 
+	// tty records whether the exec was created with a PTY, which decides how
+	// readLoop reads the hijacked stream: a TTY exec is raw bytes, a non-TTY
+	// one is Docker's stdcopy multiplexing and has to be demultiplexed. It is
+	// written in StartExec before any session goroutine starts, so the read
+	// loop observes it without synchronisation.
+	tty bool
+
 	// dockerExecID is the Docker-assigned exec instance ID returned by
 	// CreateExec. It differs from execID (which is the controller's ID) and is
 	// the one Docker's resize endpoint expects. Written once in bringUpExec
@@ -101,10 +109,13 @@ func (c *Client) StartExec(ctx context.Context, msg protocol.ExecStartMessage) {
 		containerID: msg.ContainerID,
 		client:      c,
 		target:      target,
-		connReady:   make(chan struct{}),
-		inbox:       make(chan execItem, execInputQueue),
-		done:        make(chan struct{}),
-		cancel:      sessionCancel,
+		// tty defaults to true when the field is absent (nil), preserving the
+		// prior hardcoded behavior. Explicit false disables PTY allocation.
+		tty:       msg.Tty == nil || *msg.Tty,
+		connReady: make(chan struct{}),
+		inbox:     make(chan execItem, execInputQueue),
+		done:      make(chan struct{}),
+		cancel:    sessionCancel,
 	}
 	admitted := false
 	defer func() {
@@ -157,9 +168,7 @@ func (c *Client) bringUpExec(ctx context.Context, msg protocol.ExecStartMessage,
 		return
 	}
 
-	// tty defaults to true when the field is absent (nil), preserving the
-	// prior hardcoded behavior. Explicit false disables PTY allocation.
-	tty := msg.Tty == nil || *msg.Tty
+	tty := session.tty
 
 	// Create exec instance.
 	execID, err := c.dockerClient.CreateExec(ctx, msg.ContainerID, msg.Cmd, msg.User, tty)
@@ -436,18 +445,112 @@ func (s *ExecSession) failStart(reason string) {
 	})
 }
 
+// execFrameHeaderLen is the size of Docker's stream-multiplexing frame header
+// on a non-TTY exec: a stream-type byte, three zero bytes, then the payload
+// length as a 4-byte big-endian integer.
+const execFrameHeaderLen = 8
+
+// execStreamSystemErr is the highest stream type Docker emits. 0, 1 and 2 are
+// stdin, stdout and stderr; 3 carries a daemon-side error.
+const execStreamSystemErr = 3
+
+// execMaxFrameBytes bounds the payload length a single frame header may claim.
+// The daemon copies an attached exec through a 32 KiB buffer, so a real frame
+// never approaches this; a header claiming more is corrupt or hostile, and
+// honouring it would make the demuxer swallow up to 4 GiB of the stream as one
+// frame's payload. It matches the cap the container-log decoders already use
+// (internal/docker's maxLogFrameSize).
+const execMaxFrameBytes = 256 << 10 // 256 KiB
+
+// execDemuxer strips those headers off a non-TTY exec stream. It keeps the
+// header bytes seen so far and the payload bytes still outstanding across
+// calls because the hijacked connection is read into a 4 KiB pooled buffer
+// while Docker writes frames of up to 32 KiB: a header can straddle two reads
+// and a payload routinely spans several.
+type execDemuxer struct {
+	header    [execFrameHeaderLen]byte
+	headerLen int
+	// remaining is an int, not the uint32 the header carries, because it is
+	// only ever compared and decremented against slice lengths. The width
+	// conversion happens once, after the header's length has been bounded by
+	// execMaxFrameBytes, instead of on every payload chunk.
+	remaining int
+}
+
+// decode compacts chunk in place and returns the prefix holding only payload
+// bytes. Overwriting the input is safe because a payload byte's destination
+// index is never past its source index — every header consumed only widens the
+// gap — and copy is defined for overlapping slices. stdout and stderr payloads
+// are merged in arrival order: exec_output carries no stream identifier, so the
+// controller receives them the way a terminal would.
+func (d *execDemuxer) decode(chunk []byte) ([]byte, error) {
+	w := 0
+	for r := 0; r < len(chunk); {
+		if d.remaining == 0 {
+			n := copy(d.header[d.headerLen:], chunk[r:])
+			d.headerLen += n
+			r += n
+			if d.headerLen < execFrameHeaderLen {
+				break
+			}
+			if d.header[0] > execStreamSystemErr || d.header[1] != 0 || d.header[2] != 0 || d.header[3] != 0 {
+				return chunk[:w], fmt.Errorf("exec stream desynchronized: bad frame header %x", d.header[:4])
+			}
+			size := binary.BigEndian.Uint32(d.header[4:])
+			if size > execMaxFrameBytes {
+				return chunk[:w], fmt.Errorf("exec stream desynchronized: frame length %d exceeds %d bytes", size, execMaxFrameBytes)
+			}
+			// Narrowed only after the bound above, so the conversion cannot
+			// overflow int on any platform Go builds for.
+			d.remaining = int(size)
+			d.headerLen = 0
+			continue
+		}
+
+		n := len(chunk) - r
+		if n > d.remaining {
+			n = d.remaining
+		}
+		w += copy(chunk[w:w+n], chunk[r:r+n])
+		d.remaining -= n
+		r += n
+	}
+	return chunk[:w], nil
+}
+
 // readLoop reads output from the exec session's connection and sends it back
 // as exec_output messages. On error or EOF, it sends exec_end and cleans up.
 func (s *ExecSession) readLoop() {
 	defer s.Close()
 	defer recoverSession("readLoop", s.execID)
 
+	// Docker only writes a raw stream when the exec has a PTY. Without one it
+	// multiplexes stdout and stderr behind 8-byte frame headers, which used to
+	// be forwarded verbatim and rendered as garbage in the middle of the
+	// command's own output.
+	var demux *execDemuxer
+	if !s.tty {
+		demux = &execDemuxer{}
+	}
+
 	for {
 		buf := pool.GetBuffer()
 
 		n, err := s.conn.Read(buf)
-		if n > 0 {
-			encoded := base64.StdEncoding.EncodeToString(buf[:n])
+		out := buf[:n]
+		if demux != nil && n > 0 {
+			decoded, decodeErr := demux.decode(out)
+			out = decoded
+			if decodeErr != nil {
+				// A desynchronized stream can't be trusted past this point, so
+				// the decode failure replaces any read error: reporting the
+				// io.EOF that came with it would end the session as a clean
+				// "exited".
+				err = decodeErr
+			}
+		}
+		if len(out) > 0 {
+			encoded := base64.StdEncoding.EncodeToString(out)
 
 			data, marshalErr := json.Marshal(protocol.ExecOutputMessage{
 				ExecID: s.execID,

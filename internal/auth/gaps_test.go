@@ -33,6 +33,8 @@ func TestNonceLRU_CleanupTickerFires(t *testing.T) {
 		done:    make(chan struct{}),
 	}
 
+	lru.order.PushBack("stale")
+
 	// Start the cleanup goroutine. The ticker will fire after ~10 s.
 	go lru.cleanup()
 

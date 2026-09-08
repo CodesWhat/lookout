@@ -1,14 +1,19 @@
 package edge
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"io"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/gorilla/websocket"
 
 	"github.com/codeswhat/portwing/internal/protocol"
 )
@@ -70,6 +75,217 @@ func TestReadLoopExecEndCarriesErrorReason(t *testing.T) {
 	decodeData(t, expectType(t, ctrl, protocol.TypeExecEnd), &end)
 	if end.Reason != "connection reset" {
 		t.Errorf("exec_end reason = %q, want %q", end.Reason, "connection reset")
+	}
+}
+
+// mkExecFrame builds one frame of Docker's stream multiplexing: the stream
+// type byte, three zero bytes, a 4-byte big-endian payload length, then the
+// payload.
+func mkExecFrame(stream byte, payload string) []byte {
+	frame := make([]byte, execFrameHeaderLen+len(payload))
+	frame[0] = stream
+	binary.BigEndian.PutUint32(frame[4:], uint32(len(payload)))
+	copy(frame[execFrameHeaderLen:], payload)
+	return frame
+}
+
+// drainExecOutput collects exec_output payloads until the terminal exec_end,
+// returning the concatenated bytes and the end message. Read splits decide how
+// many exec_output frames a session emits, so tests assert on the whole stream
+// rather than on a frame count.
+func drainExecOutput(t *testing.T, ctrl *websocket.Conn) ([]byte, protocol.ExecEndMessage) {
+	t.Helper()
+
+	var out []byte
+	var end protocol.ExecEndMessage
+	for {
+		env := expectEnvelope(t, ctrl)
+		if env.Type == protocol.TypeExecEnd {
+			decodeData(t, env.Data, &end)
+			return out, end
+		}
+		if env.Type != protocol.TypeExecOutput {
+			t.Fatalf("envelope type = %q, want exec_output or exec_end", env.Type)
+		}
+		var msg protocol.ExecOutputMessage
+		decodeData(t, env.Data, &msg)
+		decoded, err := base64.StdEncoding.DecodeString(msg.Data)
+		if err != nil {
+			t.Fatalf("exec_output data not base64: %v", err)
+		}
+		out = append(out, decoded...)
+	}
+}
+
+// A non-TTY exec stream is multiplexed: readLoop must strip the 8-byte frame
+// headers and forward only the payloads, merging stdout and stderr in arrival
+// order because exec_output carries no stream identifier. Forwarding the
+// headers verbatim, as this used to, injected NUL-padded control bytes into the
+// middle of the command's own output. The reads are split mid-header and
+// mid-payload, which is what a 4 KiB buffer does to Docker's larger frames.
+func TestReadLoopDemuxesNonTTYOutput(t *testing.T) {
+	t.Parallel()
+
+	stream := mkExecFrame(1, "out-one\n")
+	stream = append(stream, mkExecFrame(2, "err-one\n")...)
+	stream = append(stream, mkExecFrame(1, "out-two\n")...)
+
+	c, ctrl := newTestClient(t)
+	conn := &fakeConn{
+		// 5 bytes cuts the first header in half; 13 lands inside the first
+		// payload; the rest arrives as one read.
+		reads:   [][]byte{stream[:5], stream[5:13], stream[13:]},
+		readErr: io.EOF,
+	}
+	session := newExecSession(c, "demux", conn)
+	session.tty = false
+
+	go session.readLoop()
+
+	out, end := drainExecOutput(t, ctrl)
+	if string(out) != "out-one\nerr-one\nout-two\n" {
+		t.Errorf("exec output = %q, want %q", out, "out-one\nerr-one\nout-two\n")
+	}
+	if end.Reason != "exited" {
+		t.Errorf("exec_end reason = %q, want exited", end.Reason)
+	}
+}
+
+// A TTY exec stream is raw, so readLoop must not demultiplex it: bytes that
+// happen to look like a frame header are command output and go out untouched.
+func TestReadLoopLeavesTTYOutputRaw(t *testing.T) {
+	t.Parallel()
+
+	raw := mkExecFrame(1, "looks-framed")
+
+	c, ctrl := newTestClient(t)
+	conn := &fakeConn{reads: [][]byte{raw}, readErr: io.EOF}
+	// newExecSession builds a TTY session, which is exec_start's default.
+	session := newExecSession(c, "raw", conn)
+
+	go session.readLoop()
+
+	out, end := drainExecOutput(t, ctrl)
+	if !bytes.Equal(out, raw) {
+		t.Errorf("exec output = %q, want the raw stream %q", out, raw)
+	}
+	if end.Reason != "exited" {
+		t.Errorf("exec_end reason = %q, want exited", end.Reason)
+	}
+}
+
+// A frame header that isn't one means the multiplexed stream has lost sync and
+// nothing after it can be trusted, so the session ends on the decode failure
+// rather than forwarding the remaining bytes as output.
+func TestReadLoopNonTTYDesyncEndsSession(t *testing.T) {
+	t.Parallel()
+
+	c, ctrl := newTestClient(t)
+	conn := &fakeConn{
+		// Stream type 9 is not one Docker emits, so the header is garbage.
+		reads:   [][]byte{{9, 0, 0, 0, 0, 0, 0, 1, 'x'}},
+		readErr: io.EOF,
+	}
+	session := newExecSession(c, "desync", conn)
+	session.tty = false
+
+	go session.readLoop()
+
+	out, end := drainExecOutput(t, ctrl)
+	if len(out) != 0 {
+		t.Errorf("exec output = %q, want nothing forwarded from a desynchronized stream", out)
+	}
+	if !strings.Contains(end.Reason, "exec stream desynchronized") {
+		t.Errorf("exec_end reason = %q, want it to name the desynchronization", end.Reason)
+	}
+}
+
+// The decoder carries partial frames across calls, so the same multiplexed
+// stream must decode to the same payload bytes no matter where the reads split
+// it — inside a header, inside a payload, or on a frame boundary. Zero-length
+// and system-error frames are in the fixture because Docker emits both.
+func TestExecDemuxerDecodeIsSplitInvariant(t *testing.T) {
+	t.Parallel()
+
+	stream := mkExecFrame(1, "alpha")
+	stream = append(stream, mkExecFrame(2, "beta")...)
+	stream = append(stream, mkExecFrame(1, "")...)
+	stream = append(stream, mkExecFrame(execStreamSystemErr, "daemon")...)
+	const want = "alphabetadaemon"
+
+	for split := 0; split <= len(stream); split++ {
+		chunks := [][]byte{append([]byte(nil), stream[:split]...), append([]byte(nil), stream[split:]...)}
+
+		var d execDemuxer
+		var got []byte
+		for _, chunk := range chunks {
+			payload, err := d.decode(chunk)
+			if err != nil {
+				t.Fatalf("split %d: decode: %v", split, err)
+			}
+			got = append(got, payload...)
+		}
+		if string(got) != want {
+			t.Errorf("split %d: decoded %q, want %q", split, got, want)
+		}
+		if d.remaining != 0 || d.headerLen != 0 {
+			t.Errorf("split %d: decoder left mid-frame (remaining=%d headerLen=%d)", split, d.remaining, d.headerLen)
+		}
+	}
+}
+
+// A header with a non-zero byte where the format requires zero is as broken as
+// an out-of-range stream type, and the payload decoded before it still has to
+// be returned so nothing already parsed is lost.
+func TestExecDemuxerDecodeRejectsMalformedHeader(t *testing.T) {
+	t.Parallel()
+
+	stream := mkExecFrame(1, "before")
+	stream = append(stream, 1, 0, 7, 0, 0, 0, 0, 1, 'x')
+
+	var d execDemuxer
+	payload, err := d.decode(stream)
+	if err == nil {
+		t.Fatal("decode error = nil, want a malformed-header failure")
+	}
+	if string(payload) != "before" {
+		t.Errorf("decoded %q, want the payload that preceded the bad header", payload)
+	}
+}
+
+// A frame header may claim up to execMaxFrameBytes. One byte more is corrupt:
+// honouring it would let a bad header swallow the rest of the stream as a
+// single frame's payload, and the length is a uint32, so it cannot be narrowed
+// to an int index until it has been bounded. Both sides of the boundary are
+// asserted so the comparison can't drift to >=.
+func TestExecDemuxerDecodeBoundsFrameLength(t *testing.T) {
+	t.Parallel()
+
+	header := func(size uint32) []byte {
+		h := make([]byte, execFrameHeaderLen)
+		h[0] = 1
+		binary.BigEndian.PutUint32(h[4:], size)
+		return h
+	}
+
+	var atCap execDemuxer
+	if _, err := atCap.decode(header(execMaxFrameBytes)); err != nil {
+		t.Errorf("decode of a header at the cap: %v, want it accepted", err)
+	}
+	if atCap.remaining != execMaxFrameBytes {
+		t.Errorf("remaining = %d, want %d outstanding payload bytes", atCap.remaining, execMaxFrameBytes)
+	}
+
+	var over execDemuxer
+	payload, err := over.decode(append(mkExecFrame(1, "before"), header(execMaxFrameBytes+1)...))
+	if err == nil {
+		t.Fatal("decode error = nil, want an oversized-length failure")
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Errorf("error = %v, want it to name the length bound", err)
+	}
+	if string(payload) != "before" {
+		t.Errorf("decoded %q, want the payload that preceded the oversized header", payload)
 	}
 }
 

@@ -3,11 +3,13 @@ package config
 import (
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -217,11 +219,6 @@ func Load() (*Config, error) {
 		AgentID:   agentID,
 		AgentName: agentName,
 
-		HeartbeatInterval: getEnvInt("HEARTBEAT_INTERVAL", 30),
-		RequestTimeout:    getEnvInt("REQUEST_TIMEOUT", 30),
-		ReconnectDelay:    getEnvInt("RECONNECT_DELAY", 1),
-		MaxReconnectDelay: getEnvInt("MAX_RECONNECT_DELAY", 60),
-		WelcomeTimeout:    getEnvInt("WELCOME_TIMEOUT", 30),
 		LogLevel:          getEnv("LOG_LEVEL", "info"),
 		SkipDFCollection:  getEnvBool("SKIP_DF_COLLECTION", false),
 		MaxStreamSessions: getEnvInt("MAX_STREAM_SESSIONS", 100),
@@ -229,18 +226,45 @@ func Load() (*Config, error) {
 
 		Adapter: getEnv("ADAPTER", "drydock"),
 
-		DDPollInterval: getEnvInt("DD_POLL_INTERVAL", 300),
-
 		AuditLog:        getEnv("AUDIT_LOG", ""),
 		AuditBufferSize: getEnvInt("AUDIT_BUFFER_SIZE", 256),
 
-		AuthorizedKeysFile:  authorizedKeysFile,
-		MaxClockSkewSeconds: getEnvInt("MAX_CLOCK_SKEW_SECONDS", 60),
-		NonceLRUSize:        getEnvInt("NONCE_LRU_SIZE", 10000),
+		AuthorizedKeysFile: authorizedKeysFile,
+		NonceLRUSize:       getEnvInt("NONCE_LRU_SIZE", 10000),
 
 		EnrollmentToken: enrollmentToken,
 
 		PrivateKeyFile: getEnv("PRIVATE_KEY_FILE", ""),
+	}
+
+	for _, setting := range []struct {
+		name      string
+		value     *int
+		fallback  int
+		allowZero bool
+	}{
+		{"HEARTBEAT_INTERVAL", &cfg.HeartbeatInterval, 30, false},
+		{"DD_POLL_INTERVAL", &cfg.DDPollInterval, 300, false},
+		{"WELCOME_TIMEOUT", &cfg.WelcomeTimeout, 30, false},
+		{"MAX_CLOCK_SKEW_SECONDS", &cfg.MaxClockSkewSeconds, 60, false},
+		{"REQUEST_TIMEOUT", &cfg.RequestTimeout, 30, true},
+		{"RECONNECT_DELAY", &cfg.ReconnectDelay, 1, true},
+		{"MAX_RECONNECT_DELAY", &cfg.MaxReconnectDelay, 60, true},
+	} {
+		seconds := setting.fallback
+		if raw := os.Getenv(setting.name); raw != "" {
+			parsed, err := strconv.Atoi(raw)
+			if err != nil {
+				return nil, fmt.Errorf("%s must be an integer number of seconds: %w", setting.name, err)
+			}
+			seconds = parsed
+		}
+		if seconds != 0 || !setting.allowZero {
+			if err := ValidateIntervalSeconds(setting.name, seconds); err != nil {
+				return nil, err
+			}
+		}
+		*setting.value = seconds
 	}
 
 	// Edge mode's operations listener (health, metrics, audit export) carries
@@ -256,6 +280,49 @@ func Load() (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// MaxIntervalSeconds is the largest seconds value that survives every
+// time.Duration conversion applied to an interval. The tightest is edge mode's
+// read deadline, which doubles the heartbeat before scaling it to nanoseconds
+// (readDeadline in internal/edge/client.go), so the bound is math.MaxInt64
+// divided by two seconds' worth of nanoseconds. That is roughly 146 years, far
+// past any real interval and short of the overflow.
+const MaxIntervalSeconds = int64(math.MaxInt64) / (2 * int64(time.Second))
+
+// ValidateIntervalSeconds rejects a seconds-valued interval that time.NewTicker
+// would panic on: non-positive, or large enough that the conversion to a
+// time.Duration overflows and wraps negative. Exported because the same bound
+// has to hold for intervals that arrive off the wire rather than from the
+// environment — edge mode's welcome frame carries one (internal/edge/client.go).
+// name is whatever the caller should tell the operator to fix: an environment
+// variable here, a wire field there.
+func ValidateIntervalSeconds(name string, seconds int) error {
+	if seconds <= 0 {
+		return fmt.Errorf("%s must be a positive number of seconds, got %d", name, seconds)
+	}
+	if int64(seconds) > MaxIntervalSeconds {
+		return fmt.Errorf("%s must be at most %d seconds (larger values overflow the conversion to a duration), got %d",
+			name, MaxIntervalSeconds, seconds)
+	}
+	return nil
+}
+
+// ListenAddress joins a configured BIND_ADDRESS and PORT into an address
+// net.Listen accepts. Concatenating them with a colon is wrong for IPv6: the
+// documented unbracketed form ("::1", "::") produces "::1:3000", which
+// net.SplitHostPort reads as host "::1:3000" with no port and the listen
+// fails. net.JoinHostPort adds the brackets, but it adds them to any host
+// containing a colon, so an already-bracketed "[::1]" would come back as
+// "[[::1]]:3000" — strip one layer first. Shared by standard mode's
+// Docker-proxy listener, edge mode's operations listener, and the startup log
+// line, so all three agree on the address that is actually bound.
+func ListenAddress(bindAddress, port string) string {
+	host := bindAddress
+	if len(host) >= 2 && strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = host[1 : len(host)-1]
+	}
+	return net.JoinHostPort(host, port)
 }
 
 // IsLoopbackBind reports whether address is a loopback bind (127.0.0.1,

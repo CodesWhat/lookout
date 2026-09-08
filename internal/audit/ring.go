@@ -1,8 +1,10 @@
 package audit
 
 import (
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // Record holds a single structured audit event captured in the ring buffer.
@@ -45,6 +47,14 @@ func newRing(capacity int) *ring {
 
 // push appends r to the buffer, overwriting the oldest entry when full.
 func (rb *ring) push(r Record) {
+	r.Path = retainedDisplay(r.Path, 4096)
+	r.Method = retainedDisplay(r.Method, 64)
+	r.Actor = retainedDisplay(r.Actor, 256)
+	r.Operation = retainedDisplay(r.Operation, 256)
+	r.Stack = retainedDisplay(r.Stack, 4096)
+	r.Container = retainedDisplay(r.Container, 4096)
+	r.ExecID = retainedDisplay(r.ExecID, 256)
+	r.KeyID = retainedDisplay(r.KeyID, 256)
 	rb.mu.Lock()
 	rb.next++
 	r.Cursor = rb.next
@@ -54,6 +64,20 @@ func (rb *ring) push(r Record) {
 		rb.size++
 	}
 	rb.mu.Unlock()
+}
+
+// retainedDisplay owns its storage so even a short request-line substring cannot
+// keep the entire input allocation alive. The marker counts toward the byte cap.
+func retainedDisplay(value string, limit int) string {
+	if len(value) <= limit {
+		return strings.Clone(value)
+	}
+	const marker = "[truncated]"
+	end := limit - len(marker)
+	for end > 0 && !utf8.RuneStart(value[end]) {
+		end--
+	}
+	return value[:end] + marker
 }
 
 // recordsAfter returns records with a cursor greater than after, oldest-first,

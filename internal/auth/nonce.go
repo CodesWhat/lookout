@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"container/list"
 	"sync"
 	"time"
 )
@@ -10,13 +11,16 @@ import (
 // internal/server/middleware.go: a Mutex-protected map with a background
 // cleanup goroutine.
 //
-// Capacity is bounded to maxSize entries. When the cap is reached, new nonces
-// are silently dropped (fail-open for tracking, not for auth: the timestamp
-// window alone still limits replay to 60 s).
+// Capacity is bounded to maxSize entries. At the cap the cache first evicts
+// every nonce whose TTL has expired; if that frees nothing it rejects rather
+// than admitting a nonce it cannot record. Accepting an unrecorded nonce made
+// that one request replayable for the rest of the timestamp window, which is
+// the whole thing this cache exists to prevent.
 type NonceLRU struct {
 	mu      sync.Mutex
 	seen    map[string]time.Time // nonce → time first seen
 	maxSize int
+	order   list.List // oldest insertion first; all entries have the same TTL
 	// ttl is how long a nonce must be retained before it is safe to evict.
 	// Invariant: ttl must be >= the widest span a signed timestamp can stay
 	// valid for, measured from when the nonce was first recorded, or an
@@ -60,25 +64,26 @@ func (l *NonceLRU) Close() {
 	}
 }
 
-// Add records the nonce if it has not been seen before and the cache is not
-// full. Returns true if the nonce was freshly added (not a replay), false if
-// it has been seen before.
-func (l *NonceLRU) Add(nonce string) bool {
+// Add atomically records a fresh nonce, or returns ErrNonceReplay or
+// ErrNonceCapacity. Only expired entries may be evicted to make room.
+func (l *NonceLRU) Add(nonce string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	if _, exists := l.seen[nonce]; exists {
-		return false
+		return ErrNonceReplay
 	}
 
 	if len(l.seen) >= l.maxSize {
-		// Drop the new entry rather than evicting one. The timestamp check
-		// already limits replay; this path should be extremely rare.
-		return true // treat as fresh (fail-open for tracking)
+		l.evictExpiredLocked(time.Now())
+	}
+	if len(l.seen) >= l.maxSize {
+		return ErrNonceCapacity
 	}
 
 	l.seen[nonce] = time.Now()
-	return true
+	l.order.PushBack(nonce)
+	return nil
 }
 
 // Seen reports whether the nonce has been recorded in the cache.
@@ -122,10 +127,20 @@ func (l *NonceLRU) cleanup() {
 func (l *NonceLRU) evictExpired() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	cutoff := time.Now().Add(-l.ttl)
-	for nonce, t := range l.seen {
-		if t.Before(cutoff) {
-			delete(l.seen, nonce)
+	l.evictExpiredLocked(time.Now())
+}
+
+// evictExpiredLocked drops every nonce recorded more than ttl before now. The
+// caller must hold l.mu. Add calls it to reclaim space at capacity rather than
+// waiting for the cleanup ticker.
+func (l *NonceLRU) evictExpiredLocked(now time.Time) {
+	cutoff := now.Add(-l.ttl)
+	for entry := l.order.Front(); entry != nil; entry = l.order.Front() {
+		nonce := entry.Value.(string)
+		if !l.seen[nonce].Before(cutoff) {
+			break
 		}
+		delete(l.seen, nonce)
+		l.order.Remove(entry)
 	}
 }

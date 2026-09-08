@@ -52,7 +52,7 @@ No authentication is required for the health endpoints. Use them for Docker `HEA
   "live": true,
   "ready": false,
   "mode": "standard",
-  "version": "0.9.16",
+  "version": "0.9.17",
   "uptimeSeconds": 3842.7,
   "docker": "unknown",
   "controller": "not_applicable"
@@ -67,7 +67,7 @@ No authentication is required for the health endpoints. Use them for Docker `HEA
   "live": true,
   "ready": true,
   "mode": "standard",
-  "version": "0.9.16",
+  "version": "0.9.17",
   "uptimeSeconds": 3842.7,
   "docker": "connected",
   "controller": "not_applicable"
@@ -81,7 +81,7 @@ edge mode, when the controller WebSocket is disconnected.
 
 ```json
 {
-  "version": "0.9.16",
+  "version": "0.9.17",
   "dockerVersion": "27.0.3",
   "mode": "standard",
   "uptime": "2h34m56.789s",
@@ -327,7 +327,7 @@ Available when `ADAPTER=generic`. These endpoints expose container management wi
 
 ```json
 {
-  "agentVersion": "0.9.16",
+  "agentVersion": "0.9.17",
   "protocolName": "portwing",
   "protocolVersion": "1.0",
   "adapter": "generic"
@@ -478,7 +478,13 @@ Any path not matched by a named Portwing route is transparently proxied to the l
 `v1.44` is the fallback API version. The agent negotiates the actual version with the Docker daemon on startup (e.g. `v1.47`). Clients may also omit the version prefix — the agent prepends it automatically.
 </Callout>
 
-Streaming endpoints (`/logs`, `/attach`, `/exec/.../start`, `/events`, `/build`, `/images/create`, `/images/push`) are detected by path and forwarded with flush-on-read streaming. Interactive exec sessions using `Upgrade: tcp` or `Upgrade: websocket` are handled via HTTP hijacking.
+Streaming endpoints include logs, attach, exec start, events, builds, image
+creation, named image pushes (`POST /images/{name}/push`) and container stats
+(`GET /containers/{id}/stats`). These responses use streaming transport and
+are flushed as data arrives. Stats requests use the normal request timeout when `stream` is explicitly
+empty, `0`, `no`, `false`, or `none` (case-insensitive, with surrounding
+whitespace ignored). An omitted `stream` defaults to streaming. Interactive exec sessions using `Upgrade: tcp` or
+`Upgrade: websocket` are handled via HTTP hijacking.
 
 The complete Docker Engine API is documented at [https://docs.docker.com/engine/api/v1.44/](https://docs.docker.com/engine/api/v1.44/).
 

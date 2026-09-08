@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"runtime"
 	"strings"
 	"sync"
@@ -500,40 +502,42 @@ func TestLegacyContainerLogRequestStopsWhileWaitingForAdmission(t *testing.T) {
 	}
 }
 
-func TestLegacyContainerLogAdmissionReleasedWhenHandlerPoolCanceled(t *testing.T) {
+func TestLegacyContainerLogAdmissionReleasedWhenHandlerPoolFull(t *testing.T) {
 	t.Parallel()
-
 	a := NewAdapter(nil, "test-agent", AgentInfo{})
 	for i := 0; i < cap(a.messageSem); i++ {
 		a.messageSem <- struct{}{}
 	}
-
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sender := newLogStreamTestSender()
 	returned := make(chan bool, 1)
 	go func() {
-		returned <- a.HandleMessage(
-			ctx,
-			newLogStreamTestSender(),
-			protocol.TypeDDContainerLogRequest,
-			json.RawMessage(`{"requestId":"handler-wait","containerId":"container-1"}`),
-		)
+		returned <- a.HandleMessage(ctx, sender, protocol.TypeDDContainerLogRequest, json.RawMessage(`{"requestId":"handler-full","containerId":"container-1"}`))
 	}()
-
-	waitForLogCondition(t, "legacy log admission", func() bool {
-		return len(a.getLegacyLogSemaphore()) == 1
-	})
-	cancel()
-
 	select {
 	case handled := <-returned:
 		if !handled {
-			t.Fatal("canceled legacy log request was not recognized")
+			t.Fatal("log request not recognized")
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("legacy log request did not stop after handler-pool cancellation")
+	case <-time.After(250 * time.Millisecond):
+		cancel()
+		<-returned
+		t.Fatal("full pool blocked log rejection")
+	}
+	event := waitForLogStreamEvent(t, sender)
+	var reply protocol.DDContainerLogResponseMessage
+	if err := json.Unmarshal(event.data, &reply); err != nil {
+		t.Fatal(err)
+	}
+	if event.msgType != protocol.TypeDDContainerLogResponse || reply.RequestID != "handler-full" || reply.ContainerID != "container-1" || !strings.HasPrefix(reply.Logs, "error:") {
+		t.Fatalf("reply=%+v", event)
 	}
 	if got := len(a.getLegacyLogSemaphore()); got != 0 {
-		t.Fatalf("legacy admission reservations = %d after cancellation, want 0", got)
+		t.Fatalf("legacy slots=%d, want 0", got)
+	}
+	if got := len(a.getMessageSemaphore()); got != defaultMessageHandlerConcurrency {
+		t.Fatalf("shared slots=%d", got)
 	}
 }
 
@@ -660,6 +664,12 @@ func TestContainerLogStreamRejectsMissingIdentityAndMismatchedCancel(t *testing.
 	}
 }
 
+// maxSharedLogFrameBytes mirrors internal/docker's unexported maxLogFrameSize,
+// the payload size the shared decoder refuses to allocate for. Only the
+// oversized case below depends on the exact value; if the two ever drift, that
+// case degrades into an ordinary truncated frame and still expects an error.
+const maxSharedLogFrameBytes = 256 << 10
+
 func TestForwardContainerLogStreamFrameFailures(t *testing.T) {
 	t.Parallel()
 
@@ -682,7 +692,7 @@ func TestForwardContainerLogStreamFrameFailures(t *testing.T) {
 
 	oversizedFrame := make([]byte, 8)
 	oversizedFrame[0] = 1
-	binary.BigEndian.PutUint32(oversizedFrame[4:8], maxContainerLogStreamFrameBytes+1)
+	binary.BigEndian.PutUint32(oversizedFrame[4:8], maxSharedLogFrameBytes+1)
 	if err := a.forwardContainerLogStream(
 		context.Background(),
 		nil,
@@ -705,7 +715,87 @@ func TestForwardContainerLogStreamFrameFailures(t *testing.T) {
 	}
 }
 
-func TestForwardRawContainerLogStreamReaderAndSenderFailures(t *testing.T) {
+// TestForwardContainerLogStreamEmitsPartialFinalFrame is the reason the
+// forwarder delegates to docker.DecodeContainerLogStream instead of carrying
+// its own copy of the frame loop. A daemon that dies mid-frame leaves a header
+// promising more bytes than follow; the copy read the payload with io.ReadFull
+// and returned on the short read, throwing away the bytes it had. The shared
+// decoder emits them first and then reports the error, so the chunk reaches
+// the controller.
+//
+// The HTTP route is asserted alongside it because it decodes the same body
+// through the same decoder — the two paths agree by construction now, and this
+// pins that.
+func TestForwardContainerLogStreamEmitsPartialFinalFrame(t *testing.T) {
+	t.Parallel()
+
+	complete := routeTestDockerLogFrame(1, []byte("complete\n"))
+	partial := append(routeTestDockerLogHeader(2, uint32(len("truncated\n"))), []byte("trunc")...)
+	body := append(append([]byte{}, complete...), partial...)
+
+	t.Run("websocket stream", func(t *testing.T) {
+		t.Parallel()
+
+		a := &Adapter{}
+		sender := newLogStreamTestSender()
+		msg := protocol.DDContainerLogRequestMessage{
+			RequestID:   "stream-1",
+			ContainerID: "container-1",
+		}
+
+		if err := a.forwardContainerLogStream(
+			context.Background(),
+			sender,
+			msg,
+			bytes.NewReader(body),
+		); err == nil {
+			t.Fatal("expected the truncated final frame to report an error")
+		}
+
+		want := []struct {
+			stream string
+			logs   string
+		}{
+			{stream: "stdout", logs: "complete\n"},
+			{stream: "stderr", logs: "trunc"},
+		}
+		for i, expected := range want {
+			event := waitForLogStreamEvent(t, sender)
+			if event.msgType != protocol.TypeDDContainerLogChunk {
+				t.Fatalf("chunk %d type = %q, want %q", i, event.msgType, protocol.TypeDDContainerLogChunk)
+			}
+			var chunk protocol.DDContainerLogChunkMessage
+			if err := json.Unmarshal(event.data, &chunk); err != nil {
+				t.Fatalf("decode chunk %d: %v", i, err)
+			}
+			if chunk.Stream != expected.stream || chunk.Logs != expected.logs {
+				t.Fatalf("chunk %d = {stream:%q logs:%q}, want {stream:%q logs:%q}",
+					i, chunk.Stream, chunk.Logs, expected.stream, expected.logs)
+			}
+		}
+	})
+
+	t.Run("http route", func(t *testing.T) {
+		t.Parallel()
+
+		client, calls, shutdown := newRouteTestDockerClient(t)
+		defer shutdown()
+		calls.setLogsResponse("container-1", body)
+
+		a := NewAdapter(client, "test-agent", AgentInfo{})
+		req := httptest.NewRequest(http.MethodGet, "/api/containers/container-1/logs", nil)
+		req.SetPathValue("id", "container-1")
+		rec := httptest.NewRecorder()
+
+		a.handleContainerLogs(rec, req)
+
+		if got, want := rec.Body.String(), "complete\ntrunc"; got != want {
+			t.Fatalf("body = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestForwardContainerLogStreamReaderAndSenderFailures(t *testing.T) {
 	t.Parallel()
 
 	a := &Adapter{}
@@ -714,7 +804,7 @@ func TestForwardRawContainerLogStreamReaderAndSenderFailures(t *testing.T) {
 		ContainerID: "container-1",
 	}
 	readErr := errors.New("read failed")
-	if err := a.forwardRawContainerLogStream(
+	if err := a.forwardContainerLogStream(
 		context.Background(),
 		newLogStreamTestSender(),
 		msg,
@@ -824,41 +914,5 @@ func TestContainerLogStreamNormalCompletionCancelsStreamContext(t *testing.T) {
 				"from its parent instead of leaking for the life of the connection",
 			leaked, streams, baseline, after,
 		)
-	}
-}
-
-// ---- looksLikeDockerLogFrame ----
-
-// TestLooksLikeDockerLogFrame exercises each of the four ANDed conditions in
-// isolation: for every condition, the other three are held true so that
-// only the guard under test can turn the overall result from true to
-// false. This kills each individual invert-&&-to-|| mutation, since an
-// inverted operator would let the surrounding true operands paper over the
-// one false operand this case targets.
-func TestLooksLikeDockerLogFrame(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name   string
-		header []byte
-		want   bool
-	}{
-		{name: "valid stdout frame header", header: []byte{1, 0, 0, 0, 0, 0, 0, 0}, want: true},
-		{name: "valid stderr frame header", header: []byte{2, 0, 0, 0, 0, 0, 0, 0}, want: true},
-		{name: "too short fails length check", header: []byte{1, 0, 0, 0, 0, 0, 0}, want: false},
-		{name: "stream type out of range fails first byte check", header: []byte{3, 0, 0, 0, 0, 0, 0, 0}, want: false},
-		{name: "byte 1 nonzero fails second byte check", header: []byte{1, 1, 0, 0, 0, 0, 0, 0}, want: false},
-		{name: "byte 2 nonzero fails third byte check", header: []byte{1, 0, 1, 0, 0, 0, 0, 0}, want: false},
-		{name: "byte 3 nonzero fails fourth byte check", header: []byte{1, 0, 0, 1, 0, 0, 0, 0}, want: false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			if got := looksLikeDockerLogFrame(tt.header); got != tt.want {
-				t.Fatalf("looksLikeDockerLogFrame(%v) = %v, want %v", tt.header, got, tt.want)
-			}
-		})
 	}
 }

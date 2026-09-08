@@ -344,3 +344,30 @@ func TestEscapeLabelValue(t *testing.T) {
 		}
 	}
 }
+
+// TestHandleMetricsWithoutDockerClient covers the Server that has no Docker
+// client: the scrape must serve the rest of the exposition without the
+// container series. The nil client is dropped while it is still a typed
+// pointer, because the collector's interface field would read it as non-nil
+// and the collection runs on a goroutine of its own, where the resulting nil
+// dereference would take the agent down instead of failing one scrape.
+func TestHandleMetricsWithoutDockerClient(t *testing.T) {
+	t.Parallel()
+
+	s := makeTestServer(nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rr := httptest.NewRecorder()
+	s.handleMetrics(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, `portwing_build_info{version="`+protocol.AgentVersion+`"} 1`) {
+		t.Errorf("missing build info line; got:\n%s", body)
+	}
+	if strings.Contains(body, "container_") {
+		t.Errorf("container series emitted without a Docker client; got:\n%s", body)
+	}
+}

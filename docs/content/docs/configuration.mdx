@@ -39,7 +39,7 @@ The following variables govern how Portwing authenticates incoming requests. `TO
 | `TOKEN_HASH_FILE` | — | Path to a file containing the Argon2id hash. Overrides `TOKEN_HASH`. |
 | `AUTHORIZED_KEYS` | — | Path to an Ed25519 `authorized_keys` file for per-client asymmetric authentication (Model B). `AUTHORIZED_KEYS_FILE` is an alias for this variable. |
 | `AUTHORIZED_KEYS_FILE` | — | Alias for `AUTHORIZED_KEYS`. |
-| `MAX_CLOCK_SKEW_SECONDS` | `60` | Maximum tolerated clock difference (seconds) between client and agent when validating Ed25519 request timestamps. |
+| `MAX_CLOCK_SKEW_SECONDS` | `60` | Maximum tolerated clock difference (seconds) between client and agent when validating Ed25519 request timestamps. Range: `1..4611686018` seconds. |
 | `NONCE_LRU_SIZE` | `10000` | Capacity of the in-memory nonce cache used for replay protection. |
 | `ENROLLMENT_TOKEN` | — | One-shot bootstrap token for Model C key enrollment; consumed on first use. |
 | `ENROLLMENT_TOKEN_FILE` | — | Path to a file containing the enrollment token. |
@@ -83,19 +83,24 @@ Portwing talks to the Docker daemon over the Unix socket only — there is no `D
 
 ## Operational
 
+Duration settings require integer seconds. Empty values use the defaults;
+malformed or out-of-range values stop startup and name the setting. The upper
+bound also cannot exceed the platform's integer maximum (`2147483647` on
+32-bit builds).
+
 | Variable | Default | Description |
 |---|---|---|
 | `LOG_LEVEL` | `info` | Log verbosity. Accepted values: `debug`, `info`, `warn`, `error`. |
-| `HEARTBEAT_INTERVAL` | `30` | Seconds between WebSocket ping frames in Edge mode. The read deadline is `max(2 * HEARTBEAT_INTERVAL, 60)` seconds. |
-| `WELCOME_TIMEOUT` | `30` | Seconds to wait for the Drydock welcome message after the WebSocket handshake in Edge mode. |
-| `REQUEST_TIMEOUT` | `30` | Timeout in seconds for individual Docker API calls. |
-| `RECONNECT_DELAY` | `1` | Initial reconnect backoff delay in seconds (doubles on each failure, capped at `MAX_RECONNECT_DELAY`, with ±25% jitter). |
-| `MAX_RECONNECT_DELAY` | `60` | Maximum reconnect backoff delay in seconds. |
+| `HEARTBEAT_INTERVAL` | `30` | Seconds between WebSocket ping frames in Edge mode. The read deadline is `max(2 * HEARTBEAT_INTERVAL, 60)` seconds. Range: `1..4611686018` seconds. |
+| `WELCOME_TIMEOUT` | `30` | Seconds to wait for the Drydock welcome message after the WebSocket handshake in Edge mode. Range: `1..4611686018` seconds. |
+| `REQUEST_TIMEOUT` | `30` | Timeout in seconds for individual Docker API calls; `0` disables the timeout. Range: `0..4611686018` seconds. |
+| `RECONNECT_DELAY` | `1` | Initial reconnect backoff delay in seconds; `0` retries immediately (doubles on each failure, capped at `MAX_RECONNECT_DELAY`, with ±25% jitter). Range: `0..4611686018` seconds. |
+| `MAX_RECONNECT_DELAY` | `60` | Maximum reconnect backoff delay in seconds. Range: `0..4611686018` seconds. |
 | `SKIP_DF_COLLECTION` | `false` | Set to `true` (or `1`/`yes`) to disable disk-usage metric collection. Useful when the host filesystem is inaccessible or collection is slow. |
 | `MAX_STREAM_SESSIONS` | `100` | Standard mode only: maximum concurrent streaming Docker proxy responses. A non-positive value disables the bound. Edge mode enforces the same 100-session limit, but it is fixed and not configurable. |
 | `MAX_EXEC_SESSIONS` | `100` | Standard mode only: maximum concurrent hijacked exec/attach sessions. A non-positive value disables the bound. Edge mode enforces the same 100-session limit, but it is fixed and not configurable. |
 | `AUDIT_LOG` | — | Optional persistent audit destination: `stdout`, `stderr`, or an absolute file path. When unset, only the sink is disabled; `AUDIT_BUFFER_SIZE` still controls in-memory retention. |
-| `AUDIT_BUFFER_SIZE` | `256` | Number of audit records retained in the in-memory ring buffer for pull-based retrieval at `GET /_portwing/audit`. Set to `0` to disable the buffer. Independent of `AUDIT_LOG`. |
+| `AUDIT_BUFFER_SIZE` | `256` | Number of audit records retained in the in-memory ring buffer for pull-based retrieval at `GET /_portwing/audit`. Set to `0` to disable the buffer. Independent of `AUDIT_LOG`. Retained display fields are copied and capped at 4096 bytes for `path`, `stack`, and `container`; 64 bytes for `method`; and 256 bytes for `actor`, `operation`, `exec_id`, and `key_id`. Oversized fields end with `[truncated]` within that cap, preserving UTF-8 character boundaries. These limits apply only to in-memory audit retention, not incoming requests or the persistent audit sink. |
 
 ---
 
@@ -115,4 +120,4 @@ These variables mirror Drydock agent configuration names for deployments managed
 |---|---|---|
 | `DD_AGENT_SECRET` | — | Drydock agent secret token. Read before `TOKEN` is applied; `TOKEN` takes precedence if both are set. |
 | `DD_AGENT_SECRET_FILE` | — | File containing the Drydock agent secret token. |
-| `DD_POLL_INTERVAL` | `300` | Container inventory refresh interval in seconds (Drydock-compatible polling mode). |
+| `DD_POLL_INTERVAL` | `300` | Container inventory refresh interval in seconds (Drydock-compatible polling mode). Range: `1..4611686018` seconds. |

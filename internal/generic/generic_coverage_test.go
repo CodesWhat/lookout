@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -383,19 +384,21 @@ func newTestDockerClientWithHeartbeat(t *testing.T) (*docker.Client, func()) {
 
 // TestServeHTTPHeartbeat exercises the heartbeat case (<-heartbeat.C) in
 // ServeHTTP (events.go:97-103) using a non-failing writer so flusher.Flush()
-// is reached. The ticker fires every 30 s, so this test is skipped with -short.
+// is reached. It overrides heartbeatInterval so the test doesn't have to wait
+// out the production 30 s ticker, and it asserts the heartbeat comment
+// actually landed in the response body: previously the poll loop below just
+// fell through on a bare timeout with no failure, so a broadcaster that never
+// wrote a heartbeat still passed.
 func TestServeHTTPHeartbeat(t *testing.T) {
-	if testing.Short() {
-		t.Skip("heartbeat fires every 30 s — skipped in short mode")
-	}
+	t.Parallel()
 
 	client, shutdown := newTestDockerClientWithHeartbeat(t)
 	defer shutdown()
 
 	b := NewEventBroadcaster(client)
+	b.heartbeatInterval = 20 * time.Millisecond
 
-	// Wait 35 s for the heartbeat to fire at least once.
-	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/events", nil).WithContext(ctx)
@@ -407,19 +410,23 @@ func TestServeHTTPHeartbeat(t *testing.T) {
 		b.ServeHTTP(rec, req)
 	}()
 
-	// Poll until we see a heartbeat comment or the deadline expires.
-	deadline := time.Now().Add(34 * time.Second)
+	// Poll until we see the heartbeat comment or the deadline expires.
+	const heartbeatMarker = ": heartbeat"
+	deadline := time.Now().Add(4 * time.Second)
+	var body string
 	for time.Now().Before(deadline) {
-		if body := rec.BodyString(); len(body) > 0 {
-			// Found a heartbeat comment line.
-			t.Logf("heartbeat received: %q", body)
-			cancel()
+		body = rec.BodyString()
+		if strings.Contains(body, heartbeatMarker) {
 			break
 		}
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
-
+	cancel()
 	<-done
+
+	if !strings.Contains(body, heartbeatMarker) {
+		t.Fatalf("ServeHTTP body = %q, want it to contain a %q heartbeat comment line", body, heartbeatMarker)
+	}
 }
 
 // TestServeHTTPHeartbeatWriteError exercises the heartbeat write-error branch

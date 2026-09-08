@@ -2,9 +2,12 @@ package audit
 
 import (
 	"encoding/json"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
+	"unsafe"
 )
 
 // TestRingPushAndOrder verifies that records come back newest-first.
@@ -216,6 +219,92 @@ func TestRecordJSONMarshal(t *testing.T) {
 	for _, absent := range []string{`"method"`, `"path"`, `"outcome"`, `"status"`, `"duration_ms"`, `"operation"`, `"stack"`, `"container"`, `"exec_id"`, `"key_id"`} {
 		if strings.Contains(s, absent) {
 			t.Errorf("expected %q to be omitted, got: %s", absent, s)
+		}
+	}
+}
+
+func TestRingRetainedDisplayFields(t *testing.T) {
+	t.Parallel()
+	for _, field := range []struct {
+		name       string
+		limit      int
+		makeRecord func(string) Record
+		read       func(Record) string
+	}{
+		{"path", 4096, func(s string) Record { return Record{Path: s} }, func(r Record) string { return r.Path }},
+		{"method", 64, func(s string) Record { return Record{Method: s} }, func(r Record) string { return r.Method }},
+		{"actor", 256, func(s string) Record { return Record{Actor: s} }, func(r Record) string { return r.Actor }},
+		{"operation", 256, func(s string) Record { return Record{Operation: s} }, func(r Record) string { return r.Operation }},
+		{"stack", 4096, func(s string) Record { return Record{Stack: s} }, func(r Record) string { return r.Stack }},
+		{"container", 4096, func(s string) Record { return Record{Container: s} }, func(r Record) string { return r.Container }},
+		{"exec_id", 256, func(s string) Record { return Record{ExecID: s} }, func(r Record) string { return r.ExecID }},
+		{"key_id", 256, func(s string) Record { return Record{KeyID: s} }, func(r Record) string { return r.KeyID }},
+	} {
+		t.Run(field.name, func(t *testing.T) {
+			for _, input := range []struct{ name, value string }{
+				{"ordinary", "normal"},
+				{"at-limit", strings.Repeat("a", field.limit)},
+				{"oversized", strings.Repeat("a", 1<<20)},
+				{"unicode-two-byte", strings.Repeat("é", field.limit)},
+				{"unicode-three-byte", strings.Repeat("界", field.limit)},
+				{"unicode-four-byte", strings.Repeat("🙂", field.limit)},
+			} {
+				t.Run(input.name, func(t *testing.T) {
+					backing := "prefix" + input.value + strings.Repeat("z", 1<<20)
+					value := backing[len("prefix") : len("prefix")+len(input.value)]
+					rb := newRing(1)
+					rb.push(field.makeRecord(value))
+					got := field.read(rb.records(1)[0])
+					if len(got) > field.limit {
+						t.Errorf("retained %d bytes, limit %d", len(got), field.limit)
+					}
+					if len(value) <= field.limit {
+						if got != value {
+							t.Error("ordinary value changed")
+						}
+					} else {
+						if !strings.HasSuffix(got, "[truncated]") {
+							t.Error("missing truncation marker")
+						}
+						if !utf8.ValidString(got) {
+							t.Error("truncation split a UTF-8 character")
+						}
+						prefix := strings.TrimSuffix(got, "[truncated]")
+						if !strings.HasPrefix(value, prefix) {
+							t.Error("retained content is not an input prefix")
+						}
+					}
+					retained := uintptr(unsafe.Pointer(unsafe.StringData(got)))  // #nosec G103 -- read-only address comparison verifies owned storage; no dereference or mutation.
+					start := uintptr(unsafe.Pointer(unsafe.StringData(backing))) // #nosec G103 -- read-only backing range for the ownership assertion; no dereference or mutation.
+					if retained >= start && retained < start+uintptr(len(backing)) {
+						t.Error("retained display value aliases the large input allocation")
+					}
+					runtime.KeepAlive(backing)
+				})
+			}
+		})
+	}
+}
+
+func TestLoggerRetainsBoundedDisplayFields(t *testing.T) {
+	t.Parallel()
+	l, cleanup, err := New("", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(cleanup)
+	oversized := strings.Repeat("x", 1<<20)
+	l.AuthFailure(oversized, oversized, oversized)
+	l.RateLimited(oversized, oversized, oversized)
+	l.ComposeOp("actor", oversized, oversized, OutcomeError)
+	l.ExecStart("actor", oversized, oversized)
+	l.Enrollment("actor", oversized, OutcomeAllowed)
+	for _, r := range l.Records(0) {
+		if len(r.Path) > 4096 || len(r.Method) > 64 || len(r.Actor) > 256 {
+			t.Errorf("unbounded %s: path=%d method=%d actor=%d", r.Event, len(r.Path), len(r.Method), len(r.Actor))
+		}
+		if len(r.Operation) > 256 || len(r.Stack) > 4096 || len(r.Container) > 4096 || len(r.ExecID) > 256 || len(r.KeyID) > 256 {
+			t.Errorf("unbounded %s: operation=%d stack=%d container=%d exec_id=%d key_id=%d", r.Event, len(r.Operation), len(r.Stack), len(r.Container), len(r.ExecID), len(r.KeyID))
 		}
 	}
 }

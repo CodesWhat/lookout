@@ -116,7 +116,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			return 1
 		}
 	} else {
-		slog.Info("starting in standard mode", "address", cfg.BindAddress+":"+cfg.Port)
+		slog.Info("starting in standard mode", "address", config.ListenAddress(cfg.BindAddress, cfg.Port))
 		srv, err := server.NewServer(cfg, dockerClient, a)
 		if err != nil {
 			slog.Error("failed to create server", "error", err)

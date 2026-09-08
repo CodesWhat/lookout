@@ -180,6 +180,7 @@ func (c *Client) currentMessageSender() *edgeMessageSender {
 type Client struct {
 	cfg          *config.Config
 	dockerClient dockerAPI
+	readiness    docker.HealthProbe
 	adapter      adapter.EdgeAdapter
 	compose      *docker.ComposeManager
 	collector    hostCollector
@@ -203,6 +204,12 @@ type Client struct {
 
 	// streamSem bounds concurrent in-flight request handlers (maxStreams).
 	streamSem chan struct{}
+
+	// containerMetricsOnce guards containerCollector, the one collector every
+	// scrape of the health server's /metrics shares so overlapping scrapes
+	// cost Docker a single stats pool.
+	containerMetricsOnce sync.Once
+	containerCollector   *metrics.ContainerCollector
 
 	// welcomePollInterval is the poll interval (seconds) received from the
 	// controller's welcome frame. Zero means the controller did not supply one,
@@ -529,14 +536,30 @@ func (c *Client) connect(ctx context.Context) (bool, error) {
 	// controller (or one with a parse failure below) doesn't inherit
 	// capabilities advertised by a previous connection.
 	c.controllerCaps = nil
+	c.welcomePollInterval = 0
 
 	var welcome protocol.WelcomeMessage
 	if err := json.Unmarshal(env.Data, &welcome); err != nil {
 		slog.Warn("could not parse welcome payload", "error", err)
 	} else {
 		c.controllerCaps = welcome.Capabilities
-		if welcome.PollInterval > 0 {
-			c.welcomePollInterval = welcome.PollInterval
+		// A zero pollInterval means the controller did not supply one, so the
+		// configured default stands. A supplied value still has to be usable:
+		// writePump converts it to a time.Duration and hands it to
+		// time.NewTicker, which panics on a non-positive interval and on one
+		// large enough that the seconds-to-nanoseconds multiply wraps
+		// negative — a controller could otherwise crash the agent with a
+		// number. Falling back to the configured default matches how the rest
+		// of this welcome parse treats an unusable payload: warn and keep the
+		// connection. Closing instead would reconnect-loop against a
+		// controller the agent can serve perfectly well on its own default.
+		if welcome.PollInterval != 0 {
+			if err := config.ValidateIntervalSeconds("controller welcome pollInterval", welcome.PollInterval); err != nil {
+				slog.Warn("ignoring unusable poll interval from the controller, keeping the configured default",
+					"error", err, "configuredPollInterval", c.cfg.DDPollInterval)
+			} else {
+				c.welcomePollInterval = welcome.PollInterval
+			}
 		}
 		if compat, ok := welcome.Config["serverCompatLevel"]; ok {
 			// Compare major version only so patch-level bumps on either side
@@ -1258,7 +1281,6 @@ func (c *Client) handleRequestTo(ctx context.Context, req protocol.RequestMessag
 		return
 	}
 	defer resp.Body.Close()
-	c.auditor.APIRequest(c.cfg.DrydockURL, req.Method, req.Path, audit.OutcomeAllowed, resp.StatusCode, msEdge(start))
 
 	// Build response headers.
 	headers := make(map[string]string)
@@ -1279,6 +1301,7 @@ func (c *Client) handleRequestTo(ctx context.Context, req protocol.RequestMessag
 		// Stream body in chunks using a pooled 32 KiB buffer so the per-request
 		// stream buffer is reused instead of freshly allocated each time.
 		buf := pool.GetStreamBuffer()
+		var streamErr error
 		for {
 			n, readErr := resp.Body.Read(buf)
 			if n > 0 {
@@ -1289,18 +1312,49 @@ func (c *Client) handleRequestTo(ctx context.Context, req protocol.RequestMessag
 				})
 			}
 			if readErr != nil {
+				if !errors.Is(readErr, io.EOF) {
+					streamErr = readErr
+				}
 				break
 			}
 		}
 		pool.PutStreamBuffer(buf)
 
+		// io.EOF is the only clean end of a Docker response body. Everything
+		// else — dockerd dying mid-pull, a declared Content-Length the body
+		// never reaches (io.ErrUnexpectedEOF), a read error partway through a
+		// build, export or event stream — used to end the stream with the same
+		// "complete" the clean path sends, so the controller could not tell a
+		// finished stream from a truncated one and would treat a half-written
+		// image or tar as the whole thing.
+		reason := "complete"
+		outcome := audit.OutcomeAllowed
+		if streamErr != nil {
+			reason = "error"
+			outcome = audit.OutcomeError
+			slog.Warn("docker response stream ended early",
+				"requestId", applog.Sanitize(req.RequestID),
+				"path", applog.Sanitize(req.Path),
+				"error", applog.Sanitize(streamErr.Error()))
+		}
+
+		c.auditor.APIRequest(c.cfg.DrydockURL, req.Method, req.Path, outcome, resp.StatusCode, msEdge(start))
 		_ = c.sendTypedMessageTo(target, protocol.TypeStreamEnd, protocol.StreamEndMessage{
 			RequestID: req.RequestID,
-			Reason:    "complete",
+			Reason:    reason,
 		})
 	} else {
 		// Read body (capped).
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
+		if err != nil {
+			c.auditor.APIRequest(c.cfg.DrydockURL, req.Method, req.Path, audit.OutcomeError, resp.StatusCode, msEdge(start))
+			_ = c.sendTypedMessageTo(target, protocol.TypeError, protocol.ErrorMessage{
+				Message:   fmt.Sprintf("reading Docker response: %v", err),
+				RequestID: req.RequestID,
+			})
+			return
+		}
+		c.auditor.APIRequest(c.cfg.DrydockURL, req.Method, req.Path, audit.OutcomeAllowed, resp.StatusCode, msEdge(start))
 
 		respMsg := protocol.ResponseMessage{
 			RequestID:   req.RequestID,
@@ -1446,10 +1500,35 @@ func (c *Client) writePump(ctx context.Context) {
 	heartbeatTicker := time.NewTicker(heartbeat)
 	defer heartbeatTicker.Stop()
 
-	pollTicker := time.NewTicker(pollDuration)
-	defer pollTicker.Stop()
-
 	sender := c.currentMessageSender()
+	pollDone := make(chan struct{})
+	go func() {
+		defer close(pollDone)
+		pollTicker := time.NewTicker(pollDuration)
+		defer pollTicker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-pollTicker.C:
+				if ctx.Err() != nil {
+					return
+				}
+				added, updated, removed, err := c.adapter.RefreshContainers(ctx)
+				if ctx.Err() != nil {
+					return
+				}
+				if err != nil {
+					slog.Warn("container refresh failed", "error", err)
+					continue
+				}
+				if err := c.adapter.OnContainerRefresh(ctx, sender, added, updated, removed); err != nil {
+					slog.Warn("container refresh notify failed", "error", err)
+				}
+			}
+		}
+	}()
+	defer func() { <-pollDone }()
 
 	for {
 		select {
@@ -1464,17 +1543,6 @@ func (c *Client) writePump(ctx context.Context) {
 			_ = c.sendTypedMessage(protocol.TypePing, protocol.PingMessage{
 				Timestamp: time.Now().UnixMilli(),
 			})
-
-		case <-pollTicker.C:
-			// Refresh container inventory via adapter.
-			added, updated, removed, err := c.adapter.RefreshContainers(ctx)
-			if err != nil {
-				slog.Warn("container refresh failed", "error", err)
-				continue
-			}
-			if err := c.adapter.OnContainerRefresh(ctx, sender, added, updated, removed); err != nil {
-				slog.Warn("container refresh notify failed", "error", err)
-			}
 		}
 	}
 }
@@ -1824,6 +1892,19 @@ func closeWebSocket(conn *websocket.Conn, context string) {
 	}
 }
 
+// containerMetrics returns the collector every /metrics scrape shares, built
+// on first use because tests inject their Docker client after NewClient. It
+// stays nil for a client that cannot serve container stats, which leaves those
+// series out exactly as the failed type assertion did before.
+func (c *Client) containerMetrics() *metrics.ContainerCollector {
+	c.containerMetricsOnce.Do(func() {
+		if dockerMetrics, ok := c.dockerClient.(metrics.DockerMetricsClient); ok {
+			c.containerCollector = metrics.NewContainerCollector(dockerMetrics)
+		}
+	})
+	return c.containerCollector
+}
+
 // startHealthServer starts the local liveness, readiness, and operational
 // metrics server used by Docker, Kubernetes, and Prometheus.
 func (c *Client) startHealthServer() {
@@ -1892,15 +1973,13 @@ func (c *Client) startHealthServer() {
 		if hostCol, ok := c.collector.(*metrics.Collector); ok {
 			metrics.WriteHostPrometheus(&b, hostCol)
 		}
-		if dockerMetrics, ok := c.dockerClient.(metrics.DockerMetricsClient); ok {
-			metrics.WriteContainerPrometheus(r.Context(), &b, dockerMetrics, metrics.EscapeLabelValue)
-		}
+		metrics.WriteContainerPrometheus(r.Context(), &b, c.containerMetrics(), metrics.EscapeLabelValue)
 		c.metrics.WritePrometheus(&b, metrics.EscapeLabelValue)
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		_, _ = io.WriteString(w, b.String())
 	})
 	c.healthServer = &http.Server{
-		Addr:              c.cfg.BindAddress + ":" + c.cfg.Port,
+		Addr:              config.ListenAddress(c.cfg.BindAddress, c.cfg.Port),
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 		// BaseContext runs once, right after the listener binds, which is
@@ -1951,16 +2030,22 @@ func (c *Client) dockerReady(ctx context.Context) bool {
 	if c.dockerClient == nil {
 		return false
 	}
-	pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	response, err := c.dockerClient.Do(pingCtx, http.MethodGet, "/_ping", nil)
-	if err != nil || response == nil {
-		return false
-	}
-	if response.Body != nil {
-		_ = response.Body.Close()
-	}
-	return response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices
+	return c.readiness.Check(ctx, func(pingCtx context.Context) error {
+		response, err := c.dockerClient.Do(pingCtx, http.MethodGet, "/_ping", nil)
+		if err != nil {
+			return err
+		}
+		if response == nil {
+			return errors.New("docker ping returned no response")
+		}
+		if response.Body != nil {
+			_ = response.Body.Close()
+		}
+		if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+			return fmt.Errorf("docker ping returned status %d", response.StatusCode)
+		}
+		return nil
+	}) == nil
 }
 
 func currentDockerState(connected bool) string {

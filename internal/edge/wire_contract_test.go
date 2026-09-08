@@ -1216,3 +1216,78 @@ func TestSendMetricsCarriesDiskUnavailability(t *testing.T) {
 		t.Error("DiskError is empty, want the statfs failure reason")
 	}
 }
+
+// TestConnectRejectsUnusableWelcomePollInterval is a regression test for a
+// controller-triggered panic: welcome.PollInterval was accepted on nothing but
+// a "> 0" check and then handed to writePump, which converts it to a
+// time.Duration and calls time.NewTicker. A value large enough to overflow the
+// seconds-to-nanoseconds multiply wraps negative, and NewTicker panics on a
+// non-positive interval — in a goroutine with no recover, so the agent dies on
+// a number a controller sent it.
+//
+// The agent must keep the connection and fall back to the configured poll
+// interval, which is how the rest of the welcome parse treats an unusable
+// payload. This drives the real connect path with the pumps running, so a
+// regression panics the test binary rather than merely failing an assertion.
+func TestConnectRejectsUnusableWelcomePollInterval(t *testing.T) {
+	t.Parallel()
+
+	// Held in an int64 and converted at run time so the literal cannot
+	// overflow an int at compile time on a 32-bit build.
+	var overflowing int64 = 10_000_000_000
+	pollInterval := int(overflowing)
+	if d := time.Duration(pollInterval) * time.Second; d > 0 {
+		t.Fatalf("%d seconds converts to %v, expected the multiply to overflow", pollInterval, d)
+	}
+
+	for _, tc := range []struct {
+		name         string
+		pollInterval int
+		want         int
+	}{
+		{name: "overflows a duration", pollInterval: pollInterval, want: 0},
+		{name: "negative", pollInterval: -1, want: 0},
+		{name: "usable value is still honoured", pollInterval: 42, want: 42},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := newControllerServer(t, func(ctrl *websocket.Conn) {
+				readAndAckHello(t, ctrl)
+				sendWelcomeMsg(t, ctrl, protocol.WelcomeMessage{PollInterval: tc.pollInterval})
+				_ = ctrl.SetReadDeadline(time.Now().Add(3 * time.Second))
+				_, _, _ = ctrl.ReadMessage()
+			})
+
+			cfg := &config.Config{
+				DrydockURL:        srv,
+				HeartbeatInterval: 30,
+				WelcomeTimeout:    5,
+				ReconnectDelay:    1,
+				MaxReconnectDelay: 60,
+				DDPollInterval:    300,
+				SkipDFCollection:  true,
+			}
+			c := newWireClient(t, cfg)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			established, err := c.connect(ctx)
+
+			// The connection is kept either way: an unusable field is a
+			// diagnostic, not grounds for dropping a controller the agent can
+			// serve on its own default.
+			if !established {
+				t.Errorf("established = false, want true (the welcome was delivered)")
+			}
+			if errors.Is(err, errFatal) {
+				t.Errorf("connect returned errFatal for pollInterval %d: %v", tc.pollInterval, err)
+			}
+			if c.welcomePollInterval != tc.want {
+				t.Errorf("welcomePollInterval = %d, want %d for a welcome pollInterval of %d",
+					c.welcomePollInterval, tc.want, tc.pollInterval)
+			}
+		})
+	}
+}

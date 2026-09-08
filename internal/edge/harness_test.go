@@ -190,10 +190,15 @@ func decodeData(t *testing.T, data json.RawMessage, v any) {
 // directly and don't exercise the input queue.
 func newExecSession(c *Client, execID string, conn net.Conn) *ExecSession {
 	s := &ExecSession{
-		execID:    execID,
-		conn:      conn,
-		client:    c,
-		target:    c.currentOutboundTarget(),
+		execID: execID,
+		conn:   conn,
+		client: c,
+		target: c.currentOutboundTarget(),
+		// A TTY session, which is what exec_start defaults to when it carries
+		// no tty field, so the read loop treats conn as a raw stream. Tests
+		// covering the non-TTY (stdcopy-multiplexed) path clear this before
+		// starting readLoop.
+		tty:       true,
 		connReady: make(chan struct{}),
 		inbox:     make(chan execItem, execInputQueue),
 		done:      make(chan struct{}),

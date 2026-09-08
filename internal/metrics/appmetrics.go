@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"fmt"
+	"net/http"
 	"sort"
 	"strconv"
 	"strings"
@@ -64,10 +65,43 @@ func NewRegistry() *Registry {
 	}
 }
 
+// otherMethodLabel is the method label every unrecognised HTTP method shares.
+const otherMethodLabel = "OTHER"
+
+// knownMethods is the set of methods that keep their own method label. The
+// method comes straight off the request line, which an unauthenticated caller
+// controls, and net/http passes any RFC 9110 token through to the handler
+// verbatim ("ZORKMID", "!#$%&'*+-.^_`|~9Az", ...). Labelling by the raw value
+// would let such a caller add a series per request, growing this map and the
+// sort WritePrometheus runs over it without bound.
+var knownMethods = map[string]struct{}{
+	http.MethodGet:     {},
+	http.MethodHead:    {},
+	http.MethodPost:    {},
+	http.MethodPut:     {},
+	http.MethodPatch:   {},
+	http.MethodDelete:  {},
+	http.MethodOptions: {},
+	http.MethodConnect: {},
+	http.MethodTrace:   {},
+}
+
+// methodLabel bounds the method label set: a known method keeps its own label
+// and everything else collapses to otherMethodLabel. Matching is exact because
+// HTTP methods are case-sensitive, so "get" is a different method from GET
+// rather than a spelling of it.
+func methodLabel(method string) string {
+	if _, ok := knownMethods[method]; ok {
+		return method
+	}
+	return otherMethodLabel
+}
+
 // IncRequest records a completed HTTP request with the given method and
-// numeric status code.
+// numeric status code. Methods outside the standard set are recorded under a
+// single "OTHER" label so the label set cannot grow with caller input.
 func (reg *Registry) IncRequest(method string, code int) {
-	key := method + "\x00" + strconv.Itoa(code)
+	key := methodLabel(method) + "\x00" + strconv.Itoa(code)
 	reg.requestsMu.Lock()
 	reg.requestsTotal[key]++
 	reg.requestsMu.Unlock()

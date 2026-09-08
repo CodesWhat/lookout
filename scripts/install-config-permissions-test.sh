@@ -257,4 +257,135 @@ if [ "${failure}" -ne 0 ]; then
 	exit 1
 fi
 
-echo "Installer config permission checks passed."
+# Extract the installed template without invoking OpenRC or writing system paths.
+openrc_case="${test_root}/openrc"
+mkdir -p "${openrc_case}"
+sed -n '/^#!\/sbin\/openrc-run$/,/^OPENRC$/p' scripts/install.sh |
+	sed -e '$d' -e "s|/etc/portwing/config|${openrc_case}/config|g" >"${openrc_case}/service.sh"
+if ! grep -q '^start_pre()' "${openrc_case}/service.sh"; then
+	echo "FAIL: OpenRC template was not extracted" >&2
+	exit 1
+fi
+
+cat >"${openrc_case}/check.sh" <<'EOF'
+#!/bin/sh
+set -eu
+RC_SVCNAME=portwing
+. "$OPENRC_FIXTURE/service.sh"
+case "$INITIAL_ERREXIT" in
+on) set -e ;;
+off) set +e ;;
+esac
+case "$INITIAL_ALLEXPORT" in
+on) set -a ;;
+off) set +a ;;
+esac
+hook_status=0
+start_pre || hook_status=$?
+case "$-" in
+*a*) actual_allexport=on ;;
+*) actual_allexport=off ;;
+esac
+if [ "$actual_allexport" != "$INITIAL_ALLEXPORT" ]; then
+	echo "FAIL: OpenRC hook changed allexport from $INITIAL_ALLEXPORT to $actual_allexport" >&2
+	exit 1
+fi
+case "$-" in
+*e*) actual_errexit=on ;;
+*) actual_errexit=off ;;
+esac
+if [ "$actual_errexit" != "$INITIAL_ERREXIT" ]; then
+	echo "FAIL: OpenRC hook changed errexit from $INITIAL_ERREXIT to $actual_errexit" >&2
+	exit 1
+fi
+if [ "$hook_status" -ne "$EXPECTED_STATUS" ]; then
+	echo "FAIL: OpenRC hook returned $hook_status, want $EXPECTED_STATUS" >&2
+	exit 1
+fi
+if [ "$CHECK_EXPORTS" = yes ]; then
+	/bin/sh -c 'printf "%s\n" "PRIVATE_KEY_FILE=${PRIVATE_KEY_FILE-}" "AUTHORIZED_KEYS=${AUTHORIZED_KEYS-}" "TOKEN_FILE=${TOKEN_FILE-}" "DOCKER_SOCKET=${DOCKER_SOCKET-}" "STACKS_DIR=${STACKS_DIR-}" "AGENT_NAME=${AGENT_NAME-}" "PORT=${PORT-}" "BIND_ADDRESS=${BIND_ADDRESS-}" "DRYDOCK_URL=${DRYDOCK_URL-}" "TOKEN=${TOKEN-}" "LOG_LEVEL=${LOG_LEVEL-}"' >"$OPENRC_FIXTURE/actual"
+	if ! cmp -s "$OPENRC_FIXTURE/expected" "$OPENRC_FIXTURE/actual"; then
+		echo "FAIL: OpenRC hook did not export exact configuration values to its child" >&2
+		diff -u "$OPENRC_FIXTURE/expected" "$OPENRC_FIXTURE/actual" >&2 || true
+		exit 1
+	fi
+fi
+EOF
+
+openrc_shells=(/bin/sh)
+if command -v dash >/dev/null 2>&1; then
+	openrc_shells+=("$(command -v dash)")
+fi
+
+run_openrc_case() {
+	local initial="$1"
+	local expected_status="$2"
+	local check_exports="$3"
+	local shell_path initial_errexit
+	local result=0
+	for shell_path in "${openrc_shells[@]}"; do
+		for initial_errexit in off on; do
+			if ! env -i PATH=/usr/bin:/bin OPENRC_FIXTURE="${openrc_case}" \
+				INITIAL_ALLEXPORT="${initial}" INITIAL_ERREXIT="${initial_errexit}" \
+				EXPECTED_STATUS="${expected_status}" CHECK_EXPORTS="${check_exports}" \
+				"${shell_path}" "${openrc_case}/check.sh"; then
+				echo "FAIL: OpenRC fixture failed under ${shell_path} (allexport=${initial}, errexit=${initial_errexit}, expected status=${expected_status})" >&2
+				result=1
+			fi
+		done
+	done
+	return "${result}"
+}
+
+for initial in off on; do
+	run_openrc_case "${initial}" 0 no || failure=1
+done
+
+cat >"${openrc_case}/config" <<'EOF'
+PRIVATE_KEY_FILE=/fixture/private.pem
+AUTHORIZED_KEYS=/fixture/authorized_keys
+TOKEN_FILE=/fixture/auth
+DOCKER_SOCKET=/fixture/docker.sock
+STACKS_DIR=/fixture/stacks
+AGENT_NAME='fixture agent with spaces'
+PORT=4187
+BIND_ADDRESS=127.0.0.1
+DRYDOCK_URL=https://fixture.invalid:3001
+TOKEN=fixture-secret
+LOG_LEVEL=debug
+EOF
+cat >"${openrc_case}/expected" <<'EOF'
+PRIVATE_KEY_FILE=/fixture/private.pem
+AUTHORIZED_KEYS=/fixture/authorized_keys
+TOKEN_FILE=/fixture/auth
+DOCKER_SOCKET=/fixture/docker.sock
+STACKS_DIR=/fixture/stacks
+AGENT_NAME=fixture agent with spaces
+PORT=4187
+BIND_ADDRESS=127.0.0.1
+DRYDOCK_URL=https://fixture.invalid:3001
+TOKEN=fixture-secret
+LOG_LEVEL=debug
+EOF
+for initial in off on; do
+	run_openrc_case "${initial}" 0 yes || failure=1
+done
+
+printf 'return 7\n' >"${openrc_case}/config"
+for initial in off on; do
+	run_openrc_case "${initial}" 7 no || failure=1
+done
+
+printf 'false\n' >"${openrc_case}/config"
+for initial in off on; do
+	run_openrc_case "${initial}" 1 no || failure=1
+done
+
+if ! grep -Fq 'DRYDOCK_URL + PRIVATE_KEY_FILE' "${new_case}/etc/portwing/config" ||
+	! grep -Fq '# PRIVATE_KEY_FILE=' "${new_case}/etc/portwing/config"; then
+	echo "FAIL: generated Edge example must include its mandatory private key" >&2
+	failure=1
+fi
+
+[ "${failure}" -eq 0 ] || exit 1
+echo "Installer config permission and OpenRC environment checks passed."

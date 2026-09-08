@@ -7,10 +7,13 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/codeswhat/portwing/internal/audit"
 	"github.com/codeswhat/portwing/internal/docker"
 	"github.com/codeswhat/portwing/internal/protocol"
 )
@@ -227,6 +230,152 @@ func TestHandleRequestStream(t *testing.T) {
 	decodeData(t, expectType(t, ctrl, protocol.TypeStreamEnd), &end)
 	if end.RequestID != "r3" || end.Reason != "complete" {
 		t.Errorf("stream_end = %+v, want r3 / complete", end)
+	}
+}
+
+func TestHandleRequestStreamAuditAtEnd(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name    string
+		end     error
+		outcome string
+	}{
+		{"complete", nil, audit.OutcomeAllowed},
+		{"truncated", io.ErrUnexpectedEOF, audit.OutcomeError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c, ctrl := newTestClient(t)
+			logger, closeAudit, err := audit.New("", 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(closeAudit)
+			c.auditor = logger
+			reader, writer := io.Pipe()
+			t.Cleanup(func() { _ = reader.Close(); _ = writer.Close() })
+			entered := make(chan struct{})
+			c.dockerClient = &fakeDocker{streamResp: &http.Response{
+				StatusCode: http.StatusOK, Header: make(http.Header),
+				Body: &auditStreamReader{ReadCloser: reader, entered: entered},
+			}}
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				c.handleRequest(context.Background(), protocol.RequestMessage{RequestID: "audit-stream", Method: http.MethodGet, Path: "/events"})
+			}()
+			select {
+			case <-entered:
+			case <-time.After(readTimeout):
+				t.Fatal("stream body was not read")
+			}
+			expectType(t, ctrl, protocol.TypeResponse)
+			if records := logger.Records(0); len(records) != 0 {
+				t.Errorf("stream audited before completion: %+v", records)
+			}
+			_ = writer.CloseWithError(tc.end)
+			select {
+			case <-done:
+			case <-time.After(readTimeout):
+				t.Fatal("stream handler did not finish")
+			}
+			expectType(t, ctrl, protocol.TypeStreamEnd)
+			records := logger.Records(0)
+			if len(records) != 1 || records[0].Event != audit.EventAPIRequest || records[0].Outcome != tc.outcome || records[0].Status != http.StatusOK {
+				t.Fatalf("stream completion audit = %+v, want one %s API request", records, tc.outcome)
+			}
+		})
+	}
+}
+
+type auditStreamReader struct {
+	io.ReadCloser
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (r *auditStreamReader) Read(p []byte) (int, error) {
+	r.once.Do(func() { close(r.entered) })
+	return r.ReadCloser.Read(p)
+}
+
+// A Docker response body that stops short of its declared Content-Length must
+// end with a reason other than "complete". That reason is the controller's only
+// signal that a pull, build, log or export stream was truncated rather than
+// finished, and sending "complete" for both left a half-written image or tar
+// indistinguishable from the whole thing.
+func TestHandleRequestStreamTruncatedBodyEndsWithErrorReason(t *testing.T) {
+	t.Parallel()
+
+	// A hijacked handler that declares 64 bytes, writes 12, and hangs up. Go's
+	// HTTP client surfaces that to Body.Read as io.ErrUnexpectedEOF, which is
+	// what a dockerd killed mid-pull produces on the wire.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		conn, buf, hijackErr := w.(http.Hijacker).Hijack()
+		if hijackErr != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = buf.WriteString("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\nhalf-a-layer")
+		_ = buf.Flush()
+	}))
+	t.Cleanup(srv.Close)
+
+	httpReq, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
+	if err != nil {
+		t.Fatalf("build truncating request: %v", err)
+	}
+	//nolint:bodyclose // the response body is consumed and closed by handleRequest, the code under test.
+	truncated, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		t.Fatalf("fetch truncated response: %v", err)
+	}
+
+	c, ctrl := newTestClient(t)
+	c.dockerClient = &fakeDocker{streamResp: truncated}
+
+	c.handleRequest(context.Background(), protocol.RequestMessage{
+		RequestID: "r-trunc",
+		Method:    http.MethodGet,
+		Path:      "/containers/abc/logs?follow=1",
+	})
+
+	var resp protocol.ResponseMessage
+	decodeData(t, expectType(t, ctrl, protocol.TypeResponse), &resp)
+	if !resp.IsStream {
+		t.Fatal("IsStream = false, want true for a streaming path")
+	}
+
+	// The partial body can land as one chunk or several, so drain stream frames
+	// until the terminal stream_end rather than assuming a frame count.
+	var body []byte
+	var end protocol.StreamEndMessage
+	for {
+		env := expectEnvelope(t, ctrl)
+		if env.Type == protocol.TypeStreamEnd {
+			decodeData(t, env.Data, &end)
+			break
+		}
+		if env.Type != protocol.TypeStream {
+			t.Fatalf("envelope type = %q, want stream or stream_end", env.Type)
+		}
+		var chunk protocol.StreamMessage
+		decodeData(t, env.Data, &chunk)
+		decoded, decodeErr := base64.StdEncoding.DecodeString(chunk.Data)
+		if decodeErr != nil {
+			t.Fatalf("stream chunk not base64: %v", decodeErr)
+		}
+		body = append(body, decoded...)
+	}
+
+	if string(body) != "half-a-layer" {
+		t.Errorf("streamed bytes = %q, want %q", body, "half-a-layer")
+	}
+	if end.RequestID != "r-trunc" {
+		t.Errorf("stream_end RequestID = %q, want r-trunc", end.RequestID)
+	}
+	if end.Reason != "error" {
+		t.Errorf("stream_end reason = %q, want error", end.Reason)
 	}
 }
 
@@ -518,3 +667,98 @@ func TestHandleRequestNonStreamWithBody(t *testing.T) {
 		t.Errorf("StatusCode = %d, want 200", resp.StatusCode)
 	}
 }
+
+func TestHandleRequestUnaryReadFailure(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, partial    string
+		base64, canceled bool
+	}{
+		{"base64 truncated JSON", `{"ok":`, true, false},
+		{"legacy valid JSON prefix", `{"ok":true}`, false, false},
+		{"base64 canceled", `{}`, true, true},
+		{"legacy canceled", `{}`, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var resp *http.Response
+			if tc.canceled {
+				resp = &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: &unaryFailedBody{data: []byte(tc.partial), err: context.Canceled}}
+			} else {
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					conn, buf, err := w.(http.Hijacker).Hijack()
+					if err != nil {
+						return
+					}
+					defer conn.Close()
+					_, _ = buf.WriteString("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n" + tc.partial)
+					_ = buf.Flush()
+				}))
+				t.Cleanup(srv.Close)
+				var err error
+				resp, err = srv.Client().Get(srv.URL)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer resp.Body.Close()
+			}
+			observed := &unaryObservedBody{ReadCloser: resp.Body}
+			resp.Body = observed
+			c, ctrl := newTestClient(t)
+			if tc.base64 {
+				c.controllerCaps = []string{protocol.CapResponseBodyBase64}
+			}
+			logger, _, err := audit.New("", 8)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(logger.Close)
+			c.auditor = logger
+			c.dockerClient = &fakeDocker{doResp: resp}
+			c.handleRequest(context.Background(), protocol.RequestMessage{RequestID: "read-failure", Method: http.MethodGet, Path: "/info"})
+			var response protocol.ErrorMessage
+			decodeData(t, expectType(t, ctrl, protocol.TypeError), &response)
+			if response.RequestID != "read-failure" || !strings.Contains(response.Message, observed.readErr.Error()) {
+				t.Fatalf("error response = %+v, read error = %v", response, observed.readErr)
+			}
+			wantErr := error(io.ErrUnexpectedEOF)
+			if tc.canceled {
+				wantErr = context.Canceled
+			}
+			if !errors.Is(observed.readErr, wantErr) || !observed.closed {
+				t.Fatalf("read error=%v closed=%v", observed.readErr, observed.closed)
+			}
+			records := logger.Records(0)
+			if len(records) != 1 || records[0].Event != audit.EventAPIRequest || records[0].Outcome != audit.OutcomeError || records[0].Status != http.StatusOK {
+				t.Fatalf("audit records = %+v", records)
+			}
+			if err := c.sendTypedMessage(protocol.TypePong, protocol.PongMessage{}); err != nil {
+				t.Fatal(err)
+			}
+			expectType(t, ctrl, protocol.TypePong)
+		})
+	}
+}
+
+type unaryObservedBody struct {
+	io.ReadCloser
+	readErr error
+	closed  bool
+}
+
+func (b *unaryObservedBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil {
+		b.readErr = err
+	}
+	return n, err
+}
+func (b *unaryObservedBody) Close() error { b.closed = true; return b.ReadCloser.Close() }
+
+type unaryFailedBody struct {
+	data []byte
+	err  error
+}
+
+func (b *unaryFailedBody) Read(p []byte) (int, error) { return copy(p, b.data), b.err }
+func (*unaryFailedBody) Close() error                 { return nil }

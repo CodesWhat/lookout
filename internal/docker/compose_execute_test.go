@@ -1,6 +1,9 @@
 package docker
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -141,7 +144,7 @@ func TestExecuteRejectsUnsupportedOperationBeforeSideEffects(t *testing.T) {
 		},
 	}
 
-	if err := cm.validateRequest(req); err == nil {
+	if _, err := cm.validateRequest(req); err == nil {
 		t.Error("validateRequest accepted an unsupported compose operation")
 	}
 	resp, err := cm.Execute(t.Context(), req)
@@ -152,15 +155,62 @@ func TestExecuteRejectsUnsupportedOperationBeforeSideEffects(t *testing.T) {
 		t.Errorf("response = %+v, want an unsupported-operation error", resp)
 	}
 	cm.stackLocksMu.Lock()
-	_, loaded := cm.stackLocks[req.StackName]
+	locks := len(cm.stackLocks)
 	cm.stackLocksMu.Unlock()
-	if loaded {
+	if locks != 0 {
 		t.Error("unsupported operation created a stack lock before rejection")
 	}
 	if got, err := os.ReadFile(composePath); err != nil {
 		t.Errorf("read preexisting compose file: %v", err)
 	} else if string(got) != original {
 		t.Errorf("preexisting compose file was mutated before rejection: got %q", got)
+	}
+	if calls, err := os.ReadFile(callsPath); err == nil {
+		t.Errorf("Docker was invoked before rejection: %q", calls)
+	} else if !os.IsNotExist(err) {
+		t.Errorf("read Docker invocation record: %v", err)
+	}
+}
+
+// ---- Execute: invalid stack path rejected before side effects ----
+
+// TestExecuteRejectsInvalidStackPathBeforeSideEffects exercises Execute's use
+// of the (stackDirKey, error) validateRequest now returns: a StackDir that
+// escapes stacksDir must be rejected by validateRequest itself, before
+// Execute ever calls lockStack or touches the filesystem or Docker. This is
+// the end-to-end counterpart to TestValidateRequest_StackPathTraversal, which
+// only exercises validateRequest directly.
+func TestExecuteRejectsInvalidStackPathBeforeSideEffects(t *testing.T) {
+	binDir := t.TempDir()
+	callsPath := filepath.Join(binDir, "calls")
+	fakeDocker := filepath.Join(binDir, "docker")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$PORTWING_TEST_CALLS\"\n"
+	if err := os.WriteFile(fakeDocker, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PORTWING_TEST_CALLS", callsPath)
+	t.Setenv("PATH", binDir+string(filepath.ListSeparator)+os.Getenv("PATH"))
+
+	cm := &ComposeManager{stacksDir: t.TempDir(), composeBin: fakeDocker}
+	req := ComposeRequest{
+		StackName: "app",
+		StackDir:  "../escape",
+		Operation: "up",
+	}
+
+	resp, err := cm.Execute(t.Context(), req)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if resp.Success || !strings.Contains(resp.Error, "invalid stack path") {
+		t.Errorf("response = %+v, want an invalid-stack-path error", resp)
+	}
+
+	cm.stackLocksMu.Lock()
+	locks := len(cm.stackLocks)
+	cm.stackLocksMu.Unlock()
+	if locks != 0 {
+		t.Errorf("stack locks = %d, want 0 (an escaping StackDir must not have taken a lock)", locks)
 	}
 	if calls, err := os.ReadFile(callsPath); err == nil {
 		t.Errorf("Docker was invoked before rejection: %q", calls)
@@ -408,7 +458,10 @@ func TestComposeManagerLockStackRemovesUnusedEntries(t *testing.T) {
 	cm := &ComposeManager{}
 
 	for i := 0; i < 1000; i++ {
-		unlock := cm.lockStack(fmt.Sprintf("stack-%d", i))
+		unlock, err := cm.lockStack(t.Context(), fmt.Sprintf("stack-%d", i))
+		if err != nil {
+			t.Fatal(err)
+		}
 		unlock()
 	}
 
@@ -422,10 +475,18 @@ func TestComposeManagerLockStackRemovesUnusedEntries(t *testing.T) {
 func TestComposeManagerLockStackWaiterPreventsEarlyRemoval(t *testing.T) {
 	t.Parallel()
 	cm := &ComposeManager{}
-	unlockFirst := cm.lockStack("app")
+	unlockFirst, err := cm.lockStack(t.Context(), "app")
+	if err != nil {
+		t.Fatal(err)
+	}
 	secondAcquired := make(chan func(), 1)
 	go func() {
-		secondAcquired <- cm.lockStack("app")
+		unlock, err := cm.lockStack(t.Context(), "app")
+		if err != nil {
+			secondAcquired <- nil
+			return
+		}
+		secondAcquired <- unlock
 	}()
 
 	deadline := time.Now().Add(time.Second)
@@ -445,6 +506,9 @@ func TestComposeManagerLockStackWaiterPreventsEarlyRemoval(t *testing.T) {
 	unlockFirst()
 
 	unlockSecond := <-secondAcquired
+	if unlockSecond == nil {
+		t.Fatal("waiter failed to acquire lock")
+	}
 	cm.stackLocksMu.Lock()
 	if got := len(cm.stackLocks); got != 1 {
 		cm.stackLocksMu.Unlock()
@@ -525,6 +589,72 @@ func TestComposeManagerExecute_ConcurrentSameStackSerializes(t *testing.T) {
 			}
 			if got, want := strings.TrimSpace(resp.Output), contents[idx]; got != want {
 				t.Fatalf("run %d: Execute observed %q, want its own content %q (cross-contamination from a concurrent write to the same stack)", i, got, want)
+			}
+		}
+	}
+}
+
+// TestComposeManagerExecute_ConcurrentSameStackDirDifferentNamesSerializes
+// exercises RV-9: the per-stack lock used to be keyed by StackName while
+// file and project-directory operations are keyed by StackDir, so two
+// requests with different StackNames but the same StackDir got independent
+// mutexes and could interleave exactly like the unserialized same-StackName
+// case above. This drives two concurrent Execute calls with distinct
+// StackNames but one shared StackDir through the same sleeping fake compose
+// binary; each call must still observe only the content it wrote itself,
+// which only holds if the lock is keyed by the shared directory.
+//
+// Note: not parallel, same ETXTBSY reason as the test above.
+func TestComposeManagerExecute_ConcurrentSameStackDirDifferentNamesSerializes(t *testing.T) {
+	dir := t.TempDir()
+
+	scriptPath := filepath.Join(dir, "compose-lock-test.sh")
+	script := "#!/usr/bin/env sh\nsleep 0.1\ncat docker-compose.yml\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cm := &ComposeManager{stacksDir: dir, composeBin: scriptPath, isV2: false}
+
+	const runs = 5
+	names := []string{"app-a", "app-b"}
+	contents := []string{"content-A", "content-B"}
+	for i := 0; i < runs; i++ {
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		results := make([]*ComposeResponse, len(contents))
+		errs := make([]error, len(contents))
+
+		for idx, content := range contents {
+			wg.Add(1)
+			go func(idx int, name, content string) {
+				defer wg.Done()
+				<-start
+				resp, err := cm.Execute(t.Context(), ComposeRequest{
+					StackName: name,
+					StackDir:  "shared",
+					Operation: "up",
+					Files: map[string]string{
+						"docker-compose.yml": content,
+					},
+				})
+				results[idx] = resp
+				errs[idx] = err
+			}(idx, names[idx], content)
+		}
+
+		close(start)
+		wg.Wait()
+
+		for idx, resp := range results {
+			if errs[idx] != nil {
+				t.Fatalf("run %d: Execute: unexpected error %v", i, errs[idx])
+			}
+			if !resp.Success {
+				t.Fatalf("run %d: Execute: expected Success=true, got Error=%q", i, resp.Error)
+			}
+			if got, want := strings.TrimSpace(resp.Output), contents[idx]; got != want {
+				t.Fatalf("run %d: Execute observed %q, want its own content %q (different StackNames sharing a StackDir interleaved, so the lock is not keyed by directory)", i, got, want)
 			}
 		}
 	}
@@ -658,7 +788,7 @@ func TestValidateRequest_FilePathTraversal(t *testing.T) {
 			"../evil/compose.yml": "services: {}\n",
 		},
 	}
-	if err := cm.validateRequest(req); err == nil {
+	if _, err := cm.validateRequest(req); err == nil {
 		t.Fatal("expected error for file path traversal, got nil")
 	}
 }
@@ -673,7 +803,7 @@ func TestValidateRequest_StackPathTraversal(t *testing.T) {
 	req := ComposeRequest{
 		StackName: "../outside",
 	}
-	if err := cm.validateRequest(req); err == nil {
+	if _, err := cm.validateRequest(req); err == nil {
 		t.Fatal("expected error for stack path traversal, got nil")
 	}
 }
@@ -748,4 +878,314 @@ func TestWriteStackFiles_EnvFileDrydockWriteFailure(t *testing.T) {
 	if err := cm.writeStackFiles(req); err == nil {
 		t.Fatal("expected error when .env.drydock target is a directory, got nil")
 	}
+}
+
+func TestExecuteEnvironmentWithoutComposeFiles(t *testing.T) {
+	const original = "APP_PORT=8080\nOLD=gone\n"
+	for _, tc := range []struct {
+		name, fields, initial, want string
+		blocked                     bool
+	}{
+		{name: "omitted files", fields: `,"envVars":{"APP_PORT":"9090"}`, initial: original, want: "APP_PORT=9090\n"},
+		{name: "null files", fields: `,"files":null,"envVars":{"APP_PORT":"9090"}`, initial: original, want: "APP_PORT=9090\n"},
+		{name: "empty files", fields: `,"files":{},"envVars":{"APP_PORT":"9090"}`, initial: original, want: "APP_PORT=9090\n"},
+		{name: "creates environment", fields: `,"envVars":{"APP_PORT":"9090"}`, want: "APP_PORT=9090\n"},
+		{name: "nil environment preserves file", initial: original, want: original},
+		{name: "empty environment preserves file", fields: `,"envVars":{}`, initial: original, want: original},
+		{name: "empty environment creates no file", fields: `,"envVars":{}`},
+		{name: "environment write failure", fields: `,"envVars":{"APP_PORT":"9090"}`, blocked: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			stack := filepath.Join(dir, "app")
+			if err := os.Mkdir(stack, 0o750); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(stack, "compose.yaml"), []byte("services: {}\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			envPath := filepath.Join(stack, ".env.drydock")
+			if tc.blocked {
+				if err := os.Mkdir(envPath, 0o750); err != nil {
+					t.Fatal(err)
+				}
+			} else if tc.initial != "" {
+				if err := os.WriteFile(envPath, []byte(tc.initial), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			scriptPath := filepath.Join(dir, "fake-compose.sh")
+			script := `#!/bin/sh
+printf invoked > invoked
+while [ "$#" -gt 0 ]; do
+ if [ "$1" = "--env-file" ]; then
+  cat "$2"
+  exit
+ fi
+ shift
+done
+printf no-env
+`
+			if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			var req ComposeRequest
+			if err := json.Unmarshal([]byte(`{"operation":"up","stackName":"app"`+tc.fields+`}`), &req); err != nil {
+				t.Fatal(err)
+			}
+			cm := &ComposeManager{stacksDir: dir, composeBin: scriptPath}
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			resp, err := cm.Execute(ctx, req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.blocked {
+				if resp.Success || !strings.Contains(resp.Error, "writing stack files") {
+					t.Fatalf("expected environment-write failure, got %+v", resp)
+				}
+				if _, err := os.Stat(filepath.Join(stack, "invoked")); !os.IsNotExist(err) {
+					t.Fatalf("subprocess ran after failed write: %v", err)
+				}
+				return
+			}
+			if !resp.Success {
+				t.Fatalf("Execute failed: %+v", resp)
+			}
+			content, readErr := os.ReadFile(envPath)
+			if tc.want == "" {
+				if !os.IsNotExist(readErr) || resp.Output != "no-env" {
+					t.Fatalf("unexpected environment: file error=%v output=%q", readErr, resp.Output)
+				}
+				return
+			}
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if string(content) != tc.want || resp.Output != tc.want {
+				t.Fatalf("stored=%q subprocess=%q want=%q", content, resp.Output, tc.want)
+			}
+		})
+	}
+}
+
+func TestExecuteCanceledStackWaitDoesNotWrite(t *testing.T) {
+	for _, deadline := range []bool{false, true} {
+		t.Run(fmt.Sprintf("deadline=%v", deadline), func(t *testing.T) {
+			dir := t.TempDir()
+			stack := filepath.Join(dir, "app")
+			if err := os.Mkdir(stack, 0o750); err != nil {
+				t.Fatal(err)
+			}
+			target := filepath.Join(stack, "compose.yaml")
+			if err := os.WriteFile(target, []byte("original"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cm := &ComposeManager{stacksDir: dir, composeBin: filepath.Join(dir, "must-not-run")}
+			unlock, err := cm.lockStack(t.Context(), stack)
+			if err != nil {
+				t.Fatal(err)
+			}
+			release := sync.OnceFunc(unlock)
+			defer release()
+			ctx, cancel := context.WithCancel(t.Context())
+			if deadline {
+				cancel()
+				ctx, cancel = context.WithTimeout(t.Context(), 200*time.Millisecond)
+			}
+			defer cancel()
+			type result struct {
+				response *ComposeResponse
+				err      error
+			}
+			done := make(chan result, 1)
+			go func() {
+				response, err := cm.Execute(ctx, ComposeRequest{Operation: "up", StackName: "app", Files: map[string]string{"compose.yaml": "replacement"}})
+				done <- result{response, err}
+			}()
+			waitForStackReferences(t, cm, stack, 2)
+			if !deadline {
+				cancel()
+			}
+			var got result
+			select {
+			case got = <-done:
+				cm.stackLocksMu.Lock()
+				refs := cm.stackLocks[stack].refs
+				cm.stackLocksMu.Unlock()
+				if refs != 1 {
+					t.Errorf("references after canceled waiter = %d, want owner only", refs)
+				}
+			case <-time.After(time.Second):
+				t.Error("canceled request remained blocked behind owner")
+				release()
+				select {
+				case got = <-done:
+				case <-time.After(time.Second):
+					t.Fatal("request did not finish after owner release")
+				}
+			}
+			if got.err != nil || got.response == nil || got.response.Success || !strings.Contains(got.response.Error, ctx.Err().Error()) {
+				t.Fatalf("cancellation result = %+v, err=%v", got.response, got.err)
+			}
+			content, err := os.ReadFile(target)
+			if err != nil || string(content) != "original" {
+				t.Errorf("canceled request changed stack: content=%q err=%v", content, err)
+			}
+			release()
+			cm.stackLocksMu.Lock()
+			count := len(cm.stackLocks)
+			cm.stackLocksMu.Unlock()
+			if count != 0 {
+				t.Fatalf("unused stack entries=%d", count)
+			}
+		})
+	}
+}
+
+func TestExecuteAlreadyCanceledDoesNotWrite(t *testing.T) {
+	dir := t.TempDir()
+	cm := &ComposeManager{stacksDir: dir, composeBin: filepath.Join(dir, "must-not-run")}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	response, err := cm.Execute(ctx, ComposeRequest{Operation: "up", StackName: "app", Files: map[string]string{"compose.yaml": "replacement"}})
+	if err != nil || response.Success || !strings.Contains(response.Error, context.Canceled.Error()) {
+		t.Fatalf("response=%+v err=%v", response, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "app")); !os.IsNotExist(err) {
+		t.Fatalf("canceled request created stack: %v", err)
+	}
+	if len(cm.stackLocks) != 0 {
+		t.Fatal("canceled request retained stack entry")
+	}
+}
+
+func waitForStackReferences(t *testing.T, cm *ComposeManager, key string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		cm.stackLocksMu.Lock()
+		refs := 0
+		if entry := cm.stackLocks[key]; entry != nil {
+			refs = entry.refs
+		}
+		cm.stackLocksMu.Unlock()
+		if refs == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("stack references=%d, want %d", refs, want)
+		}
+		runtime.Gosched()
+	}
+}
+
+type stackAcquisition struct {
+	unlock func()
+	err    error
+}
+
+func TestComposeManagerCanceledWaiterPreservesLiveWaiter(t *testing.T) {
+	t.Parallel()
+	cm := &ComposeManager{}
+	owner, err := cm.lockStack(t.Context(), "app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseOwner := sync.OnceFunc(owner)
+	defer releaseOwner()
+	live := make(chan stackAcquisition, 1)
+	go func() { unlock, err := cm.lockStack(t.Context(), "app"); live <- stackAcquisition{unlock, err} }()
+	waitForStackReferences(t, cm, "app", 2)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	canceled := make(chan stackAcquisition, 1)
+	go func() { unlock, err := cm.lockStack(ctx, "app"); canceled <- stackAcquisition{unlock, err} }()
+	waitForStackReferences(t, cm, "app", 3)
+	cancel()
+	select {
+	case result := <-canceled:
+		if result.unlock != nil {
+			result.unlock()
+			t.Fatal("canceled waiter acquired held lock")
+		}
+		if !errors.Is(result.err, context.Canceled) {
+			t.Fatalf("waiter error=%v", result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled waiter did not return")
+	}
+	waitForStackReferences(t, cm, "app", 2)
+	select {
+	case result := <-live:
+		if result.unlock != nil {
+			result.unlock()
+		}
+		t.Fatal("live waiter completed while owner still holds lock")
+	default:
+	}
+	independentCtx, stop := context.WithTimeout(t.Context(), time.Second)
+	defer stop()
+	other, err := cm.lockStack(independentCtx, "other")
+	if err != nil {
+		t.Fatalf("independent directory blocked: %v", err)
+	}
+	other()
+	releaseOwner()
+	select {
+	case result := <-live:
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		waitForStackReferences(t, cm, "app", 1)
+		result.unlock()
+	case <-time.After(time.Second):
+		t.Fatal("live waiter did not acquire released lock")
+	}
+	cm.stackLocksMu.Lock()
+	defer cm.stackLocksMu.Unlock()
+	if len(cm.stackLocks) != 0 {
+		t.Fatalf("retained lock entries=%d", len(cm.stackLocks))
+	}
+}
+
+func TestComposeManagerCancellationRacingRelease(t *testing.T) {
+	t.Parallel()
+	cm := &ComposeManager{}
+	for range 100 {
+		owner, err := cm.lockStack(t.Context(), "app")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan stackAcquisition, 1)
+		go func() { unlock, err := cm.lockStack(ctx, "app"); done <- stackAcquisition{unlock, err} }()
+		waitForStackReferences(t, cm, "app", 2)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); cancel() }()
+		go func() { defer wg.Done(); owner() }()
+		wg.Wait()
+		select {
+		case result := <-done:
+			if result.err == nil {
+				result.unlock()
+			} else if !errors.Is(result.err, context.Canceled) {
+				t.Fatal(result.err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("racing waiter did not complete")
+		}
+		cm.stackLocksMu.Lock()
+		count := len(cm.stackLocks)
+		cm.stackLocksMu.Unlock()
+		if count != 0 {
+			t.Fatalf("retained lock entries after race=%d", count)
+		}
+	}
+	unlock, err := cm.lockStack(t.Context(), "app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unlock()
 }

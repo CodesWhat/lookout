@@ -251,7 +251,7 @@ func FuzzComposeRequestValidate(f *testing.F) {
 			return
 		}
 
-		if err := cm.validateRequest(req); err != nil {
+		if _, err := cm.validateRequest(req); err != nil {
 			// Rejected requests must never reach writeStackFiles.
 			return
 		}
@@ -315,7 +315,7 @@ func TestComposeRequestValidateRejectsKnownBad(t *testing.T) {
 				t.Fatalf("decoding %s: %v", tc.body, err)
 			}
 			cm := newTestComposeManager(t)
-			if err := cm.validateRequest(req); err == nil {
+			if _, err := cm.validateRequest(req); err == nil {
 				t.Fatalf("validateRequest accepted %s", tc.body)
 			}
 		})

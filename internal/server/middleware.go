@@ -354,7 +354,7 @@ func (rl *RateLimiter) rateLimitOnly(next http.Handler, reg *metrics.Registry) h
 				reg.IncRequest(r.Method, http.StatusTooManyRequests)
 				reg.IncRateLimited()
 			}
-			http.Error(w, "too many requests", http.StatusTooManyRequests)
+			rejectUnadmitted(w, "too many requests", http.StatusTooManyRequests)
 			return
 		}
 		rw := &statusRecorder{ResponseWriter: w, code: http.StatusOK}
@@ -404,6 +404,23 @@ func isDeadlineExceeded(err error) bool {
 	return errors.Is(err, os.ErrDeadlineExceeded)
 }
 
+// rejectUnadmitted answers a request that was turned away before its body was
+// read. net/http drains an unread request body once the handler returns
+// (server.go's finishRequest, then transfer.go's body.Close), and that drain
+// has no deadline of its own, so a declared-but-never-sent body pins the
+// handler goroutine there indefinitely — exactly what an admission rejection
+// exists to prevent. An already-elapsed read deadline aborts the drain on its
+// first read from the connection, and "Connection: close" stops the connection
+// being reused with a half-sent body still on the wire.
+func rejectUnadmitted(w http.ResponseWriter, message string, status int) {
+	// Best effort: a ResponseWriter with no underlying connection to bound
+	// (httptest.ResponseRecorder, some wrappers) reports ErrNotSupported and
+	// has no drain to abort either.
+	_ = http.NewResponseController(w).SetReadDeadline(time.Now())
+	w.Header().Set("Connection", "close")
+	http.Error(w, message, status)
+}
+
 // AuthMiddlewareWithEd25519 validates raw or Argon2id credentials and supports
 // an optional Ed25519 verification path. When a request carries X-Portwing-Signature,
 // it is verified via Ed25519;
@@ -448,7 +465,7 @@ func (rl *RateLimiter) AuthMiddlewareWithEd25519(
 				reg.IncRequest(r.Method, http.StatusTooManyRequests)
 				reg.IncRateLimited()
 			}
-			http.Error(w, "too many failed attempts", http.StatusTooManyRequests)
+			rejectUnadmitted(w, "too many failed attempts", http.StatusTooManyRequests)
 			return
 		}
 
@@ -456,6 +473,40 @@ func (rl *RateLimiter) AuthMiddlewareWithEd25519(
 		// that path exclusively. Reading the body first is required because
 		// VerifyRequest needs it for the canonical message.
 		if ed.Registry != nil && auth.HasSignature(r.Header) {
+			// Reserve the per-IP verification slot BEFORE touching the body.
+			// The read below is the attacker-controlled part of this path:
+			// anyone can attach signature headers and then drip up to 1 MiB
+			// for authBodyReadDeadline without holding a credential, so
+			// reading first let N concurrent slow bodies from one IP occupy
+			// N goroutines and N connections while maxInFlight was still
+			// showing zero in use.
+			if !rl.tryBeginAuth(clientIP) {
+				auditor.RateLimited(clientIP, r.Method, r.URL.Path)
+				if reg != nil {
+					reg.IncRequest(r.Method, http.StatusTooManyRequests)
+					reg.IncRateLimited()
+				}
+				rejectUnadmitted(w, "too many failed attempts", http.StatusTooManyRequests)
+				return
+			}
+			// The slot covers the body read and the signature check only, not
+			// the downstream handler: holding it through next.ServeHTTP would
+			// cap one client's concurrent authenticated requests at
+			// maxInFlight. releaseAuthSlot is idempotent, so the deferred call
+			// covers every early return (and a panic) while the success path
+			// still releases explicitly before next.ServeHTTP runs.
+			authSlotReleased := false
+			releaseAuthSlot := func(success bool) {
+				if authSlotReleased {
+					return
+				}
+				authSlotReleased = true
+				rl.finishAuth(clientIP, success)
+			}
+			// A body that never arrives is not a credential failure, so the
+			// fallback release does not spend the rolling failure budget.
+			defer releaseAuthSlot(true)
+
 			// Buffer the body (capped at 1 MB; MaxBytesReader also closes the
 			// connection on overflow, preventing slow-drip memory exhaustion).
 			var body []byte
@@ -463,9 +514,8 @@ func (rl *RateLimiter) AuthMiddlewareWithEd25519(
 				r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 
 				// Deadline the read itself, not just its size: a slow drip
-				// under the 1 MiB cap would otherwise pin this goroutine
-				// forever, and this happens before tryBeginAuth below, the
-				// only per-IP concurrency gate on this path.
+				// under the 1 MiB cap would otherwise pin this goroutine for
+				// as long as it liked, holding the slot reserved above.
 				rc := http.NewResponseController(w)
 				if err := rc.SetReadDeadline(time.Now().Add(authBodyReadDeadline)); err != nil {
 					slog.Warn("setting auth body read deadline", "error", err)
@@ -497,17 +547,8 @@ func (rl *RateLimiter) AuthMiddlewareWithEd25519(
 			if skew <= 0 {
 				skew = 60
 			}
-			if !rl.tryBeginAuth(clientIP) {
-				auditor.RateLimited(clientIP, r.Method, r.URL.Path)
-				if reg != nil {
-					reg.IncRequest(r.Method, http.StatusTooManyRequests)
-					reg.IncRateLimited()
-				}
-				http.Error(w, "too many failed attempts", http.StatusTooManyRequests)
-				return
-			}
 			keyID, err := auth.VerifyRequest(r, body, ed.Registry, ed.Nonces, skew)
-			rl.finishAuth(clientIP, err == nil)
+			releaseAuthSlot(err == nil)
 			if err != nil {
 				reason := auth.ReasonFor(err)
 				slog.Warn("ed25519 authentication failed",
@@ -558,7 +599,7 @@ func (rl *RateLimiter) AuthMiddlewareWithEd25519(
 				reg.IncRequest(r.Method, http.StatusTooManyRequests)
 				reg.IncRateLimited()
 			}
-			http.Error(w, "too many failed attempts", http.StatusTooManyRequests)
+			rejectUnadmitted(w, "too many failed attempts", http.StatusTooManyRequests)
 			return
 		}
 		valid, attempted := verifyTokenWithCapacity(verifier, provided)
@@ -569,7 +610,7 @@ func (rl *RateLimiter) AuthMiddlewareWithEd25519(
 				reg.IncRequest(r.Method, http.StatusTooManyRequests)
 				reg.IncRateLimited()
 			}
-			http.Error(w, "authentication verification capacity exceeded", http.StatusTooManyRequests)
+			rejectUnadmitted(w, "authentication verification capacity exceeded", http.StatusTooManyRequests)
 			return
 		}
 		rl.finishAuth(clientIP, valid)
@@ -641,6 +682,9 @@ func RecoveryMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if err := recover(); err != nil {
+				if err == http.ErrAbortHandler { //nolint:errorlint // net/http recognizes only the exact abort sentinel.
+					panic(err)
+				}
 				stack := debug.Stack()
 				slog.Error("panic recovered",
 					"error", applog.Sanitize(fmt.Sprintf("%v", err)),

@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -120,6 +121,12 @@ func (l *concurrencyLimiter) limit() int {
 	return cap(l.slots)
 }
 
+// readinessPingTimeout bounds one Docker ping made on behalf of a readiness
+// request, and readinessPingTTL is how long that ping's result is reused.
+// /ready and /_portwing/health are unauthenticated, so without both bounds a
+// slow daemon lets remote callers pile up handlers and Docker connections at
+// whatever rate they can open them.
+//
 // Server is the standard-mode HTTP server that exposes Docker API proxy
 // endpoints, adapter-specific routes, and health checks.
 type Server struct {
@@ -137,6 +144,11 @@ type Server struct {
 	auditor      *audit.Logger
 	httpServer   *http.Server
 	startTime    time.Time
+
+	// readiness bounds the Docker ping the unauthenticated readiness routes
+	// perform. Its zero value is a working, empty cache, so Servers built as
+	// struct literals rather than through NewServer get the bound too.
+	readiness docker.HealthProbe
 
 	// listenAddr holds the net.Addr ListenAndServe bound, set once the
 	// listener is up and before Serve/ServeTLS starts blocking. It lets
@@ -159,6 +171,11 @@ type Server struct {
 	// hupCh is the signal channel registered for SIGHUP; kept so Shutdown
 	// can call signal.Stop on it.
 	hupCh chan os.Signal
+
+	// containerMetricsOnce guards containerCollector, the one collector every
+	// scrape shares so overlapping scrapes cost Docker a single stats pool.
+	containerMetricsOnce sync.Once
+	containerCollector   *metrics.ContainerCollector
 
 	shutdownOnce   sync.Once
 	auditCloseOnce sync.Once
@@ -292,7 +309,7 @@ func NewServer(cfg *config.Config, dockerClient *docker.Client, a adapter.Server
 	handler := RecoveryMiddleware(http.Handler(mux))
 
 	s.httpServer = &http.Server{
-		Addr:    cfg.BindAddress + ":" + cfg.Port,
+		Addr:    config.ListenAddress(cfg.BindAddress, cfg.Port),
 		Handler: s.trackActiveHandler(handler),
 		// Bound the request-header read to mitigate slow-header (Slowloris)
 		// attacks. ReadTimeout/WriteTimeout are deliberately left zero so the
@@ -395,8 +412,11 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 // handleHealth returns readiness including Docker connectivity. It is exposed
 // at both the compatibility path /_portwing/health and the explicit /ready.
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	err := s.dockerClient.Ping(ctx)
+	if r.ContentLength != 0 {
+		rejectUnadmitted(w, "health requests must not have a body", http.StatusBadRequest)
+		return
+	}
+	err := s.readiness.Check(r.Context(), s.dockerClient.Ping)
 
 	status := "healthy"
 	dockerStatus := "connected"
@@ -423,6 +443,10 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 // handleSimpleHealth reports process liveness without probing dependencies.
 func (s *Server) handleSimpleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.ContentLength != 0 {
+		rejectUnadmitted(w, "health requests must not have a body", http.StatusBadRequest)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(protocol.HealthResponse{
@@ -510,7 +534,7 @@ func (s *Server) handleCompose(w http.ResponseWriter, r *http.Request) {
 // to the local Docker daemon, handling both regular and streaming responses.
 func (s *Server) handleDockerProxy(w http.ResponseWriter, r *http.Request) {
 	// Determine if this is a streaming endpoint.
-	isStream := docker.IsStreamingRequest(r.Method, r.URL.Path)
+	isStream := docker.IsStreamingRequest(r.Method, r.URL.RequestURI())
 
 	// Docker exec and attach upgrade requests need a bidirectional raw
 	// connection. The regular HTTP transport cannot proxy the upgraded stream.
@@ -563,7 +587,9 @@ func (s *Server) handleDockerProxy(w http.ResponseWriter, r *http.Request) {
 
 	// Stream or copy body.
 	if isStream {
-		s.streamResponse(w, resp.Body)
+		if err := s.streamResponse(w, resp.Body); err != nil {
+			panic(http.ErrAbortHandler)
+		}
 	} else {
 		// io.Copy to a ResponseWriter: errors indicate a dropped client connection.
 		_, _ = io.Copy(w, resp.Body)
@@ -808,7 +834,7 @@ func copyHeaders(dst, src http.Header) {
 
 // streamResponse copies from body to the ResponseWriter, flushing after each
 // read for streaming endpoints.
-func (s *Server) streamResponse(w http.ResponseWriter, body io.Reader) {
+func (s *Server) streamResponse(w http.ResponseWriter, body io.Reader) error {
 	flusher, canFlush := w.(http.Flusher)
 	buf := make([]byte, 32*1024)
 
@@ -816,13 +842,22 @@ func (s *Server) streamResponse(w http.ResponseWriter, body io.Reader) {
 		n, err := body.Read(buf)
 		if n > 0 {
 			// Write to ResponseWriter: errors indicate a dropped client connection.
-			_, _ = w.Write(buf[:n])
+			written, writeErr := w.Write(buf[:n])
+			if writeErr != nil {
+				return writeErr
+			}
+			if written != n {
+				return io.ErrShortWrite
+			}
 			if canFlush {
 				flusher.Flush()
 			}
 		}
 		if err != nil {
-			return
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
 		}
 	}
 }

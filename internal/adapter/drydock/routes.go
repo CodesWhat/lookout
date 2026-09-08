@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"strconv"
 	"strings"
 
 	"github.com/codeswhat/portwing/internal/adapter"
@@ -13,10 +12,8 @@ import (
 )
 
 // streamLimitRejectionMessage is the body returned when a long-lived adapter
-// stream is rejected for want of a free concurrency slot. Matches the
-// Docker-proxy stream rejection in internal/server/http.go so a client (or a
-// test) can't tell the two rejection paths apart.
-const streamLimitRejectionMessage = "agent busy: too many concurrent streams"
+// stream is rejected for want of a free concurrency slot.
+const streamLimitRejectionMessage = adapter.StreamLimitRejectionMessage
 
 // RegisterRoutes registers Drydock-specific HTTP routes. admitStream gates the
 // SSE route and follow-mode container log streaming against the server's
@@ -57,64 +54,16 @@ func (a *Adapter) handleContainers(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(toDrydockContainers(containers))
 }
 
+// handleContainerLogs serves Drydock's container log route. Drydock is the
+// adapter that exposes the daemon's `timestamps` flag; the rest of the
+// lifecycle is adapter.ServeContainerLogs, shared with the generic adapter.
 func (a *Adapter) handleContainerLogs(w http.ResponseWriter, r *http.Request) {
-	containerID := r.PathValue("id")
-	tail := r.URL.Query().Get("tail")
-	since := r.URL.Query().Get("since")
-	until := r.URL.Query().Get("until")
-	follow := r.URL.Query().Get("follow") == "1" || r.URL.Query().Get("follow") == "true"
 	timestamps := r.URL.Query().Get("timestamps") == "1" || r.URL.Query().Get("timestamps") == "true"
-
-	if tail != "" {
-		n, err := strconv.Atoi(tail)
-		if err != nil || n <= 0 {
-			http.Error(w, "invalid tail: must be a positive integer", http.StatusBadRequest)
-			return
-		}
-		tail = strconv.Itoa(n)
-	}
-
-	// Bound concurrent follow-mode log streams against the shared stream
-	// limit (SPEC 7.3), before the daemon call so a rejected follow request
-	// costs nothing. Non-follow requests are a single bounded read and are
-	// never gated.
-	var release func()
-	if follow {
-		var ok bool
-		release, ok = a.admit.Admit()
-		if !ok {
-			slog.Warn("concurrent stream limit reached, rejecting log follow", "containerId", containerID)
-			http.Error(w, streamLimitRejectionMessage, http.StatusServiceUnavailable)
-			return
-		}
-		defer release()
-	}
-
-	body, err := a.dockerClient.GetContainerLogs(r.Context(), containerID, tail, since, until, follow, timestamps)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("getting logs: %v", err), docker.StatusCodeForError(err))
-		return
-	}
-	defer body.Close()
-
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	if follow {
-		w.Header().Set("Transfer-Encoding", "chunked")
-	}
-
-	flusher, canFlush := w.(http.Flusher)
-	err = docker.DecodeContainerLogStream(body, func(_ docker.ContainerLogStream, payload []byte) error {
-		if _, writeErr := w.Write(payload); writeErr != nil {
-			return writeErr
-		}
-		if canFlush {
-			flusher.Flush()
-		}
-		return nil
+	adapter.ServeContainerLogs(w, r, adapter.ContainerLogOptions{
+		Client:     a.dockerClient,
+		Admit:      a.admit,
+		Timestamps: timestamps,
 	})
-	if err != nil {
-		slog.Debug("log stream ended", "error", err)
-	}
 }
 
 func (a *Adapter) handleContainerDelete(w http.ResponseWriter, r *http.Request) {

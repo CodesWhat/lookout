@@ -7,6 +7,125 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v0.9.17] - 2026-09-08
+
+### Fixed
+
+- Health, enrollment, and authentication-capacity responses bound unread request-body cleanup,
+  preventing connections from waiting indefinitely after the handler returns.
+- The audit buffer bounds and copies request-derived display fields, keeping
+  long paths, Compose fields, exec identifiers, and shared request-line allocations
+  from exhausting retained memory.
+- Docker stats and named image-push endpoints use streaming transport in both
+  modes. Explicit `stats?stream=false` requests retain the normal request timeout.
+- Interrupted Standard-mode Docker downloads abort the downstream response
+  instead of presenting a truncated archive as a completed transfer.
+- Unary Edge responses reject Docker body-read failures and record an error
+  audit outcome in both base64 and legacy response modes.
+- Compose applies environment updates when unchanged Compose files are omitted
+  from the request.
+- Canceled Compose requests stop waiting for a stack lock and cannot write stack
+  files after their canceled wait eventually acquires the lock.
+- Paused and restarting containers retain their specific status even when
+  Docker also marks them running, and status transitions emit inventory updates.
+- Edge reconnects clear the previous controller's polling override before
+  applying the new welcome or falling back to configured defaults.
+- Slow inventory refreshes no longer delay periodic Edge metrics and pings.
+- A full Drydock handler pool rejects additional work promptly, preserving
+  control-message handling and balanced log-admission cleanup.
+- OpenRC services export all configured settings, including private-key and
+  file-authentication paths, instead of only the original five variables.
+- Edge Docker response streams write their audit outcome when the body ends;
+  truncated streams record `error` instead of an early `allowed` result.
+- A full nonce cache reports `nonce-capacity` in auth response headers and
+  metrics, distinguishing capacity pressure from replays. Expiry uses insertion
+  order, avoiding a full-cache scan for each rejected request.
+- Edge readiness checks share the bounded, cached Docker probe used by Standard
+  mode, preventing concurrent operations requests from opening one ping each.
+- Duration environment variables reject malformed, negative, and overflowing
+  values at startup. Request timeouts and reconnect delays still accept zero;
+  heartbeat, polling, welcome, and clock-skew settings require positive seconds.
+- Container renames now emit an update immediately, and reordering Docker's
+  listed names no longer invalidates the inspect cache. The OpenAPI container
+  error schema no longer declares an unused timestamp field.
+- **A truncated Docker response stream no longer reports itself as complete.**
+  The edge agent's response relay ended every stream with `reason: "complete"`,
+  including the ones that ended on `io.ErrUnexpectedEOF`, a dockerd that died
+  mid-pull, or a declared `Content-Length` the body never reached. A controller
+  had no way to tell a finished image pull, build, `logs?follow`, export or
+  event stream from a truncated one, so a half-written layer or tar looked like
+  the whole payload. `io.EOF` is now the only end that sends `complete`;
+  anything else sends `reason: "error"` and logs the underlying read error. The
+  two-value vocabulary is documented in the Drydock integration reference.
+- **Non-TTY exec output is demultiplexed instead of shipped with its frame
+  headers.** An `exec_start` with `tty: false` gets a stream-multiplexed
+  attach from Docker, and the edge agent forwarded it byte for byte, so every
+  chunk of `exec_output` began with an 8-byte `[stream type, 0, 0, 0,
+  big-endian length]` header that the controller rendered as control bytes in
+  the middle of the command's own output. The read loop now strips the frames
+  for non-TTY sessions and merges stdout and stderr in arrival order, since
+  `exec_output` carries no stream identifier; a stream that loses frame sync
+  ends the session with an `exec_end` naming the desynchronization rather than
+  forwarding unframeable bytes. TTY sessions are raw and are unchanged.
+- **Unauthenticated callers can no longer grow the metrics registry.** The
+  request counter labelled by raw HTTP method, and the 401 path counted before
+  any credential check, so arbitrary method strings added label values (and
+  scrape sort cost) without bound. The nine standard methods keep their label;
+  anything else is counted as `method="OTHER"`.
+- **Overlapping metrics scrapes share one Docker stats collection.** Each
+  scrape used to start its own eight-worker stats pool, so concurrent scrapers
+  multiplied Docker requests. Scrapes that arrive while a collection is in
+  flight now wait for it and format the same result; the collection is
+  cancelled only when the last waiter leaves.
+- **A transient inspect failure no longer drops a container from the
+  inventory.** A listed container whose inspect errored was removed from the
+  snapshot and reported as `removed` until a later poll succeeded. It now keeps
+  its last known entry and is re-inspected on the next poll. A `docker rename`
+  is also picked up on the next poll instead of being masked by the inspect
+  cache.
+- **The Drydock log forwarder keeps partial final frames.** It used its own
+  frame reader and discarded the payload of a frame cut short by the daemon;
+  it now uses the shared decoder, and both adapters serve container logs
+  through one code path.
+- **Compose operations on the same directory serialise.** The stack lock was
+  keyed by `StackName` while every file and project operation used
+  `StackDir`, so two requests with different names for one directory could
+  interleave. The lock now keys on the canonical stack directory.
+- **Unbracketed IPv6 bind addresses work.** `BIND_ADDRESS=::1` produced
+  `too many colons in address` on the API server, the edge operations
+  listener and the CLI; addresses are now joined with proper bracketing, and
+  the already-bracketed form still works.
+- **Ed25519 admission is enforced before the body is read.** Signed requests
+  buffered up to 1 MiB before taking the per-IP verification slot, so slow
+  bodies bypassed the intended concurrency bound. The slot is taken first, and
+  a rejected request closes the connection instead of draining the body.
+- **Readiness pings are bounded.** `/_portwing/ready` ran an unbounded
+  synchronous Docker ping per request; it now has a 2s timeout, one ping in
+  flight shared by concurrent callers, and a 1s result cache.
+- **Nonces are never accepted without being recorded.** At cache capacity a
+  fresh nonce was accepted but not stored, so a captured signed request stayed
+  replayable for the rest of its timestamp window. The cache now evicts
+  expired entries and records, or rejects when nothing has expired.
+- **Bad interval settings fail at startup instead of panicking.**
+  `HEARTBEAT_INTERVAL` and `DD_POLL_INTERVAL` must be positive and within
+  range, and a controller welcome carrying an out-of-range `pollInterval`
+  logs a warning and keeps the configured interval rather than crashing the
+  agent.
+
+### Changed
+
+- **`api/openapi.yaml` now matches what `/api/containers` serves.** The
+  schema declared `image.tag` and `updateKind` as strings, but the wire has
+  always carried the `{value, semver}` and `{kind}` objects Drydock stores
+  verbatim under `DrydockCompat` 1.4.0. The schema moved to the objects and
+  gained the `health`, `architecture`, `os` and `created` fields; a contract
+  test now pins the served types to the file.
+- **The MCP docs describe the credential honestly.** The MCP tools are
+  read-only, but the credential that authenticates `/_portwing/mcp` is the
+  same one that authenticates the Docker proxy, and there is no scope tier.
+  The page now says so and points at per-client Ed25519 keys as the isolation
+  the code provides.
+
 ## [v0.9.16] - 2026-09-07
 
 ### Changed

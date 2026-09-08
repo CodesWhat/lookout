@@ -2,6 +2,7 @@ package docker
 
 import (
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -9,7 +10,24 @@ import (
 // produce a streaming response. Container archive paths are method-sensitive:
 // GET downloads a tar stream, while PUT uploads one and returns no tar body.
 func IsStreamingRequest(method, path string) bool {
-	pathOnly, _, _ := strings.Cut(path, "?")
+	pathOnly, query, _ := strings.Cut(path, "?")
+	stats, push := streamingRouteFamily(pathOnly)
+	if stats {
+		if method != http.MethodGet {
+			return false
+		}
+		values, _ := url.ParseQuery(query)
+		if _, present := values["stream"]; present {
+			switch strings.ToLower(strings.TrimSpace(values.Get("stream"))) {
+			case "", "0", "no", "false", "none":
+				return false
+			}
+		}
+		return true
+	}
+	if push {
+		return method == http.MethodPost
+	}
 	if strings.Contains(pathOnly, "/containers/") && strings.HasSuffix(pathOnly, "/archive") {
 		return method == http.MethodGet
 	}
@@ -20,6 +38,9 @@ func IsStreamingRequest(method, path string) bool {
 // endpoint that produces a streaming response.
 func IsStreamingPath(path string) bool {
 	path, _, _ = strings.Cut(path, "?")
+	if stats, push := streamingRouteFamily(path); stats || push {
+		return true
+	}
 
 	streamSuffixes := []string{
 		"/logs",
@@ -27,7 +48,6 @@ func IsStreamingPath(path string) bool {
 		"/events",
 		"/build",
 		"/images/create",
-		"/images/push",
 		"/export", // GET /containers/{id}/export — container filesystem tar, routinely large
 	}
 	for _, suffix := range streamSuffixes {
@@ -54,4 +74,38 @@ func IsStreamingPath(path string) bool {
 		return true
 	}
 	return false
+}
+
+// streamingRouteFamily matches the stats and named-image push routes after an
+// optional numeric Docker API version prefix.
+func streamingRouteFamily(path string) (stats, push bool) {
+	if strings.HasPrefix(path, "/v") {
+		version, rest, found := strings.Cut(path[2:], "/")
+		major, minor, dotted := strings.Cut(version, ".")
+		numeric := func(s string) bool {
+			if s == "" {
+				return false
+			}
+			for _, c := range s {
+				if c < '0' || c > '9' {
+					return false
+				}
+			}
+			return true
+		}
+		if found && dotted && numeric(major) && numeric(minor) {
+			path = "/" + rest
+		}
+	}
+	if name, ok := strings.CutPrefix(path, "/containers/"); ok {
+		if id, matched := strings.CutSuffix(name, "/stats"); matched && id != "" && !strings.Contains(id, "/") {
+			stats = true
+		}
+	}
+	if name, ok := strings.CutPrefix(path, "/images/"); ok {
+		if image, matched := strings.CutSuffix(name, "/push"); matched && image != "" {
+			push = true
+		}
+	}
+	return stats, push
 }
