@@ -155,9 +155,9 @@ func TestExecuteRejectsUnsupportedOperationBeforeSideEffects(t *testing.T) {
 		t.Errorf("response = %+v, want an unsupported-operation error", resp)
 	}
 	cm.stackLocksMu.Lock()
-	_, loaded := cm.stackLocks[req.StackName]
+	locks := len(cm.stackLocks)
 	cm.stackLocksMu.Unlock()
-	if loaded {
+	if locks != 0 {
 		t.Error("unsupported operation created a stack lock before rejection")
 	}
 	if got, err := os.ReadFile(composePath); err != nil {

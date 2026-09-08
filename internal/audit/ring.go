@@ -50,6 +50,11 @@ func (rb *ring) push(r Record) {
 	r.Path = retainedDisplay(r.Path, 4096)
 	r.Method = retainedDisplay(r.Method, 64)
 	r.Actor = retainedDisplay(r.Actor, 256)
+	r.Operation = retainedDisplay(r.Operation, 256)
+	r.Stack = retainedDisplay(r.Stack, 4096)
+	r.Container = retainedDisplay(r.Container, 4096)
+	r.ExecID = retainedDisplay(r.ExecID, 256)
+	r.KeyID = retainedDisplay(r.KeyID, 256)
 	rb.mu.Lock()
 	rb.next++
 	r.Cursor = rb.next
