@@ -103,7 +103,7 @@ func TestContainerStatus(t *testing.T) {
 		},
 		{
 			name:  "restarting",
-			state: docker.ContainerState{Restarting: true},
+			state: docker.ContainerState{Running: true, Restarting: true},
 			want:  "restarting",
 		},
 		{
@@ -122,9 +122,9 @@ func TestContainerStatus(t *testing.T) {
 			want:  "stopped",
 		},
 		{
-			name:  "running takes precedence over paused",
+			name:  "paused takes precedence over running",
 			state: docker.ContainerState{Running: true, Paused: true},
-			want:  "running",
+			want:  "paused",
 		},
 	}
 

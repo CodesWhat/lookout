@@ -516,8 +516,10 @@ func buildInventorySnapshot(containers []fixtureContainer) dockerInventorySnapsh
 		case "running":
 			state.Running = true
 		case "paused":
+			state.Running = true
 			state.Paused = true
 		case "restarting":
+			state.Running = true
 			state.Restarting = true
 		case "dead":
 			state.Dead = true
@@ -543,5 +545,45 @@ func buildInventorySnapshot(containers []fixtureContainer) dockerInventorySnapsh
 	return dockerInventorySnapshot{
 		listed:    listed,
 		inspected: inspected,
+	}
+}
+
+func TestContainerManagerRefreshSpecificRunningStates(t *testing.T) {
+	t.Parallel()
+	for _, specific := range []string{"paused", "restarting"} {
+		t.Run(specific, func(t *testing.T) {
+			t.Parallel()
+			client, fixture, shutdown := newDynamicDockerClient(t)
+			defer shutdown()
+			setState := func(state string) {
+				snapshot := buildInventorySnapshot([]fixtureContainer{{id: "c1", image: "nginx:latest", state: state}})
+				snapshot.listed[0].State = state
+				snapshot.listed[0].Status = state
+				fixture.Set(snapshot)
+			}
+			setState("running")
+			manager := NewContainerManager(client, "test-agent", nil)
+			if _, _, _, err := manager.Refresh(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			for _, state := range []string{specific, "running"} {
+				setState(state)
+				added, updated, removed, err := manager.Refresh(t.Context())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(added) != 0 || len(removed) != 0 {
+					t.Fatalf("unexpected membership change: added=%v removed=%v", added, removed)
+				}
+				assertContainerIDs(t, updated, []string{"c1"})
+				if got := updated[0].Status; got != state {
+					t.Errorf("updated status = %q, want %q", got, state)
+				}
+				current, ok := manager.GetContainer("c1")
+				if !ok || current.Status != state {
+					t.Fatalf("current container = %+v, found = %v, want status %q", current, ok, state)
+				}
+			}
+		})
 	}
 }

@@ -379,12 +379,12 @@ func BuildRuntimeDetails(inspect *docker.ContainerInspect) *RuntimeDetails {
 // ContainerStatus maps Docker container state to a simple status string.
 func ContainerStatus(state *docker.ContainerState) string {
 	switch {
-	case state.Running:
-		return "running"
 	case state.Paused:
 		return "paused"
 	case state.Restarting:
 		return "restarting"
+	case state.Running:
+		return "running"
 	case state.Dead:
 		return "dead"
 	case state.Status == "created":

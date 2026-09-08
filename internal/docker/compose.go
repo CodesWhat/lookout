@@ -157,7 +157,7 @@ type ComposeManager struct {
 	apiVersion   string
 	dockerSocket string
 
-	// stackLocks holds one reference-counted mutex per active stack directory
+	// stackLocks holds one reference-counted semaphore per active stack directory
 	// (canonical, cleaned, absolute path), not per StackName: file and
 	// process operations are keyed by directory, so the lock must be too, or
 	// two requests naming the same directory under different StackNames can
@@ -168,7 +168,7 @@ type ComposeManager struct {
 }
 
 type stackLockEntry struct {
-	mu   sync.Mutex
+	sem  chan struct{}
 	refs int
 }
 
@@ -205,27 +205,26 @@ func (cm *ComposeManager) detectCompose() {
 	cm.isV2 = true
 }
 
-// lockStack acquires the per-stack-directory mutex, creating it on first
-// use, and returns a func that releases it. The key must be a canonical
-// (cleaned, absolute) directory path: requests for different directories get
-// independent mutexes and never block each other.
-func (cm *ComposeManager) lockStack(stackDirKey string) func() {
+// lockStack acquires the per-stack-directory semaphore and returns a release
+// function. The key must be a canonical directory path. Canceled waiters drop
+// their references immediately without disturbing the owner or other waiters.
+func (cm *ComposeManager) lockStack(ctx context.Context, stackDirKey string) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	cm.stackLocksMu.Lock()
 	if cm.stackLocks == nil {
 		cm.stackLocks = make(map[string]*stackLockEntry)
 	}
 	entry := cm.stackLocks[stackDirKey]
 	if entry == nil {
-		entry = &stackLockEntry{}
+		entry = &stackLockEntry{sem: make(chan struct{}, 1)}
 		cm.stackLocks[stackDirKey] = entry
 	}
 	entry.refs++
 	cm.stackLocksMu.Unlock()
 
-	entry.mu.Lock()
-	return func() {
-		entry.mu.Unlock()
-
+	releaseReference := func() {
 		cm.stackLocksMu.Lock()
 		entry.refs--
 		if entry.refs == 0 && cm.stackLocks[stackDirKey] == entry {
@@ -233,6 +232,22 @@ func (cm *ComposeManager) lockStack(stackDirKey string) func() {
 		}
 		cm.stackLocksMu.Unlock()
 	}
+	select {
+	case entry.sem <- struct{}{}:
+	case <-ctx.Done():
+		releaseReference()
+		return nil, ctx.Err()
+	}
+	unlock := func() {
+		<-entry.sem
+		releaseReference()
+	}
+	// Cancellation and a free slot can become ready together.
+	if err := ctx.Err(); err != nil {
+		unlock()
+		return nil, err
+	}
+	return unlock, nil
 }
 
 // effectiveStackDir returns the stack directory a request operates on: the
@@ -272,10 +287,16 @@ func (cm *ComposeManager) Execute(ctx context.Context, req ComposeRequest) (*Com
 	// requests are already authenticated with full compose control over this
 	// stack, so the lock is about correctness (deploying the config you
 	// asked for) rather than access control.
-	unlock := cm.lockStack(stackDirKey)
+	unlock, err := cm.lockStack(ctx, stackDirKey)
+	if err != nil {
+		return &ComposeResponse{Success: false, Error: fmt.Sprintf("waiting for stack: %v", err)}, nil
+	}
 	defer unlock()
+	if err := ctx.Err(); err != nil {
+		return &ComposeResponse{Success: false, Error: err.Error()}, nil
+	}
 
-	if req.Files != nil {
+	if req.Files != nil || len(req.EnvVars) > 0 {
 		if err := cm.writeStackFiles(req); err != nil {
 			return &ComposeResponse{Success: false, Error: fmt.Sprintf("writing stack files: %v", err)}, nil
 		}
