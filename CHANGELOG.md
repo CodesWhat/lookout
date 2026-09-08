@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A truncated Docker response stream no longer reports itself as complete.**
+  The edge agent's response relay ended every stream with `reason: "complete"`,
+  including the ones that ended on `io.ErrUnexpectedEOF`, a dockerd that died
+  mid-pull, or a declared `Content-Length` the body never reached. A controller
+  had no way to tell a finished image pull, build, `logs?follow`, export or
+  event stream from a truncated one, so a half-written layer or tar looked like
+  the whole payload. `io.EOF` is now the only end that sends `complete`;
+  anything else sends `reason: "error"` and logs the underlying read error. The
+  two-value vocabulary is documented in the Drydock integration reference.
+- **Non-TTY exec output is demultiplexed instead of shipped with its frame
+  headers.** An `exec_start` with `tty: false` gets a stream-multiplexed
+  attach from Docker, and the edge agent forwarded it byte for byte, so every
+  chunk of `exec_output` began with an 8-byte `[stream type, 0, 0, 0,
+  big-endian length]` header that the controller rendered as control bytes in
+  the middle of the command's own output. The read loop now strips the frames
+  for non-TTY sessions and merges stdout and stderr in arrival order, since
+  `exec_output` carries no stream identifier; a stream that loses frame sync
+  ends the session with an `exec_end` naming the desynchronization rather than
+  forwarding unframeable bytes. TTY sessions are raw and are unchanged.
+
 ## [v0.9.16] - 2026-09-07
 
 ### Changed

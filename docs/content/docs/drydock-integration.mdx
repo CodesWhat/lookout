@@ -317,11 +317,29 @@ token simply never sets `bodyStream`, so it costs nothing to advertise.
 | `request` | Controller → Agent | Docker API request (with `requestId`), including controller-owned watcher/update calls |
 | `response` | Agent → Controller | Docker API response (correlated by `requestId`) |
 | `stream` | Bidirectional | Streaming data (logs, exec, build) |
-| `stream_end` | Bidirectional | End of stream |
+| `stream_end` | Bidirectional | End of stream, with a `reason` (see below) |
 | `metrics` | Agent → Controller | Host metrics payload |
 | `container_event` | Agent → Controller | Docker lifecycle event; used instead of a duplicate controller event stream |
 | `ping` / `pong` | Either | Keepalive (30s default) |
 | `error` | Either | Error with optional `code` |
+
+On a response stream (an image pull, a build, a `logs?follow`, a container
+export, the event stream) the terminal `stream_end` carries one of two
+`reason` values, and they are not interchangeable:
+
+| `reason` | Meaning |
+|---|---|
+| `complete` | The Docker response body ended cleanly at EOF. Every byte the daemon produced is on the wire. |
+| `error` | The body ended early: the daemon died mid-stream, a declared `Content-Length` was never reached, or a read failed partway through. The bytes already sent are a prefix, not the whole payload. |
+
+A controller that treats `error` as `complete` will accept a truncated image
+layer or tar archive as a finished one, so branch on the value rather than on
+the frame's arrival. The agent logs the underlying read error; the wire value
+stays a fixed token so it is safe to match on.
+
+The `stream_end` that terminates a controller-to-agent streamed request body
+(`bodyStream`, above) is a different direction of the same frame and carries
+no `reason`.
 
 **Exec (interactive `docker exec` sessions):**
 
@@ -333,6 +351,16 @@ token simply never sets `bodyStream`, so it costs nothing to advertise.
 | `exec_output` | Agent → Controller | Base64 stdout/stderr chunk from a live session |
 | `exec_resize` | Controller → Agent | TTY resize (`cols`, `rows`) for a live session |
 | `exec_end` | Either | Session ended, with an optional `reason` |
+
+`exec_output` always carries plain command output, whatever `exec_start` asked
+for. `tty: true` (the default when the field is absent) attaches a PTY and
+Docker's stream is already raw. `tty: false` gets Docker's stream multiplexing
+instead — 8-byte frame headers of `[stream type, 0, 0, 0, big-endian length]`
+around each chunk — and the agent strips those before sending, merging stdout
+and stderr in arrival order because `exec_output` has no stream field. A
+controller must not demultiplex the payload itself. If a non-TTY stream loses
+frame sync the agent ends the session with an `exec_end` whose `reason` names
+the desynchronization, rather than forwarding bytes it can no longer frame.
 
 If a session fails to start (for example, a sockguard exec-policy denial),
 the agent's failStart path sends `exec_end` immediately instead of

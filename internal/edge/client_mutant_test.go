@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -521,14 +522,12 @@ type multiChunkReader struct {
 
 func (r *multiChunkReader) Read(p []byte) (int, error) {
 	if r.i >= len(r.chunks) {
-		return 0, errReaderDone
+		return 0, io.EOF
 	}
 	n := copy(p, r.chunks[r.i])
 	r.i++
 	return n, nil
 }
-
-var errReaderDone = errors.New("multiChunkReader: no more chunks")
 
 func TestHandleRequestStreamMultipleChunksSendsAllData(t *testing.T) {
 	t.Parallel()

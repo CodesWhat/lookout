@@ -1279,6 +1279,7 @@ func (c *Client) handleRequestTo(ctx context.Context, req protocol.RequestMessag
 		// Stream body in chunks using a pooled 32 KiB buffer so the per-request
 		// stream buffer is reused instead of freshly allocated each time.
 		buf := pool.GetStreamBuffer()
+		var streamErr error
 		for {
 			n, readErr := resp.Body.Read(buf)
 			if n > 0 {
@@ -1289,14 +1290,33 @@ func (c *Client) handleRequestTo(ctx context.Context, req protocol.RequestMessag
 				})
 			}
 			if readErr != nil {
+				if !errors.Is(readErr, io.EOF) {
+					streamErr = readErr
+				}
 				break
 			}
 		}
 		pool.PutStreamBuffer(buf)
 
+		// io.EOF is the only clean end of a Docker response body. Everything
+		// else — dockerd dying mid-pull, a declared Content-Length the body
+		// never reaches (io.ErrUnexpectedEOF), a read error partway through a
+		// build, export or event stream — used to end the stream with the same
+		// "complete" the clean path sends, so the controller could not tell a
+		// finished stream from a truncated one and would treat a half-written
+		// image or tar as the whole thing.
+		reason := "complete"
+		if streamErr != nil {
+			reason = "error"
+			slog.Warn("docker response stream ended early",
+				"requestId", applog.Sanitize(req.RequestID),
+				"path", applog.Sanitize(req.Path),
+				"error", applog.Sanitize(streamErr.Error()))
+		}
+
 		_ = c.sendTypedMessageTo(target, protocol.TypeStreamEnd, protocol.StreamEndMessage{
 			RequestID: req.RequestID,
-			Reason:    "complete",
+			Reason:    reason,
 		})
 	} else {
 		// Read body (capped).

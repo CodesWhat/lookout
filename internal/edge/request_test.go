@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -227,6 +228,86 @@ func TestHandleRequestStream(t *testing.T) {
 	decodeData(t, expectType(t, ctrl, protocol.TypeStreamEnd), &end)
 	if end.RequestID != "r3" || end.Reason != "complete" {
 		t.Errorf("stream_end = %+v, want r3 / complete", end)
+	}
+}
+
+// A Docker response body that stops short of its declared Content-Length must
+// end with a reason other than "complete". That reason is the controller's only
+// signal that a pull, build, log or export stream was truncated rather than
+// finished, and sending "complete" for both left a half-written image or tar
+// indistinguishable from the whole thing.
+func TestHandleRequestStreamTruncatedBodyEndsWithErrorReason(t *testing.T) {
+	t.Parallel()
+
+	// A hijacked handler that declares 64 bytes, writes 12, and hangs up. Go's
+	// HTTP client surfaces that to Body.Read as io.ErrUnexpectedEOF, which is
+	// what a dockerd killed mid-pull produces on the wire.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		conn, buf, hijackErr := w.(http.Hijacker).Hijack()
+		if hijackErr != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = buf.WriteString("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\nhalf-a-layer")
+		_ = buf.Flush()
+	}))
+	t.Cleanup(srv.Close)
+
+	httpReq, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
+	if err != nil {
+		t.Fatalf("build truncating request: %v", err)
+	}
+	//nolint:bodyclose // the response body is consumed and closed by handleRequest, the code under test.
+	truncated, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		t.Fatalf("fetch truncated response: %v", err)
+	}
+
+	c, ctrl := newTestClient(t)
+	c.dockerClient = &fakeDocker{streamResp: truncated}
+
+	c.handleRequest(context.Background(), protocol.RequestMessage{
+		RequestID: "r-trunc",
+		Method:    http.MethodGet,
+		Path:      "/containers/abc/logs?follow=1",
+	})
+
+	var resp protocol.ResponseMessage
+	decodeData(t, expectType(t, ctrl, protocol.TypeResponse), &resp)
+	if !resp.IsStream {
+		t.Fatal("IsStream = false, want true for a streaming path")
+	}
+
+	// The partial body can land as one chunk or several, so drain stream frames
+	// until the terminal stream_end rather than assuming a frame count.
+	var body []byte
+	var end protocol.StreamEndMessage
+	for {
+		env := expectEnvelope(t, ctrl)
+		if env.Type == protocol.TypeStreamEnd {
+			decodeData(t, env.Data, &end)
+			break
+		}
+		if env.Type != protocol.TypeStream {
+			t.Fatalf("envelope type = %q, want stream or stream_end", env.Type)
+		}
+		var chunk protocol.StreamMessage
+		decodeData(t, env.Data, &chunk)
+		decoded, decodeErr := base64.StdEncoding.DecodeString(chunk.Data)
+		if decodeErr != nil {
+			t.Fatalf("stream chunk not base64: %v", decodeErr)
+		}
+		body = append(body, decoded...)
+	}
+
+	if string(body) != "half-a-layer" {
+		t.Errorf("streamed bytes = %q, want %q", body, "half-a-layer")
+	}
+	if end.RequestID != "r-trunc" {
+		t.Errorf("stream_end RequestID = %q, want r-trunc", end.RequestID)
+	}
+	if end.Reason != "error" {
+		t.Errorf("stream_end reason = %q, want error", end.Reason)
 	}
 }
 
