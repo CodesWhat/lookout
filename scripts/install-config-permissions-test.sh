@@ -272,6 +272,10 @@ cat >"${openrc_case}/check.sh" <<'EOF'
 set -eu
 RC_SVCNAME=portwing
 . "$OPENRC_FIXTURE/service.sh"
+case "$INITIAL_ERREXIT" in
+on) set -e ;;
+off) set +e ;;
+esac
 case "$INITIAL_ALLEXPORT" in
 on) set -a ;;
 off) set +a ;;
@@ -284,6 +288,14 @@ case "$-" in
 esac
 if [ "$actual_allexport" != "$INITIAL_ALLEXPORT" ]; then
 	echo "FAIL: OpenRC hook changed allexport from $INITIAL_ALLEXPORT to $actual_allexport" >&2
+	exit 1
+fi
+case "$-" in
+*e*) actual_errexit=on ;;
+*) actual_errexit=off ;;
+esac
+if [ "$actual_errexit" != "$INITIAL_ERREXIT" ]; then
+	echo "FAIL: OpenRC hook changed errexit from $INITIAL_ERREXIT to $actual_errexit" >&2
 	exit 1
 fi
 if [ "$hook_status" -ne "$EXPECTED_STATUS" ]; then
@@ -300,13 +312,29 @@ if [ "$CHECK_EXPORTS" = yes ]; then
 fi
 EOF
 
+openrc_shells=(/bin/sh)
+if command -v dash >/dev/null 2>&1; then
+	openrc_shells+=("$(command -v dash)")
+fi
+
 run_openrc_case() {
 	local initial="$1"
 	local expected_status="$2"
 	local check_exports="$3"
-	env -i PATH=/usr/bin:/bin OPENRC_FIXTURE="${openrc_case}" \
-		INITIAL_ALLEXPORT="${initial}" EXPECTED_STATUS="${expected_status}" \
-		CHECK_EXPORTS="${check_exports}" /bin/sh "${openrc_case}/check.sh"
+	local shell_path initial_errexit
+	local result=0
+	for shell_path in "${openrc_shells[@]}"; do
+		for initial_errexit in off on; do
+			if ! env -i PATH=/usr/bin:/bin OPENRC_FIXTURE="${openrc_case}" \
+				INITIAL_ALLEXPORT="${initial}" INITIAL_ERREXIT="${initial_errexit}" \
+				EXPECTED_STATUS="${expected_status}" CHECK_EXPORTS="${check_exports}" \
+				"${shell_path}" "${openrc_case}/check.sh"; then
+				echo "FAIL: OpenRC fixture failed under ${shell_path} (allexport=${initial}, errexit=${initial_errexit}, expected status=${expected_status})" >&2
+				result=1
+			fi
+		done
+	done
+	return "${result}"
 }
 
 for initial in off on; do
@@ -346,6 +374,11 @@ done
 printf 'return 7\n' >"${openrc_case}/config"
 for initial in off on; do
 	run_openrc_case "${initial}" 7 no || failure=1
+done
+
+printf 'false\n' >"${openrc_case}/config"
+for initial in off on; do
+	run_openrc_case "${initial}" 1 no || failure=1
 done
 
 if ! grep -Fq 'DRYDOCK_URL + PRIVATE_KEY_FILE' "${new_case}/etc/portwing/config" ||

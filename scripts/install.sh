@@ -139,16 +139,26 @@ depend() {
 
 start_pre() {
     [ -f /etc/portwing/config ] || return 0
-    local portwing_allexport portwing_config_status=0
+    local portwing_allexport portwing_errexit portwing_config_status=0
     case "$-" in
         *a*) portwing_allexport=on ;;
         *) portwing_allexport=off ;;
     esac
+    case "$-" in
+        *e*) portwing_errexit=on ;;
+        *) portwing_errexit=off ;;
+    esac
+    # Restore shell options even when the sourced config returns an error.
+    set +e
     set -a
     . /etc/portwing/config || portwing_config_status=$?
     case "$portwing_allexport" in
         on) set -a ;;
         off) set +a ;;
+    esac
+    case "$portwing_errexit" in
+        on) set -e ;;
+        off) set +e ;;
     esac
     return "$portwing_config_status"
 }
