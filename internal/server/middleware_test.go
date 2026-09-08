@@ -24,6 +24,7 @@ import (
 
 	"github.com/codeswhat/portwing/internal/audit"
 	"github.com/codeswhat/portwing/internal/auth"
+	"github.com/codeswhat/portwing/internal/metrics"
 )
 
 // noAudit returns a disabled audit.Logger for tests that only care about HTTP
@@ -718,6 +719,31 @@ func TestEd25519MiddlewareAccept(t *testing.T) {
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+}
+
+func TestEd25519NonceCapacityHeaderAndMetric(t *testing.T) {
+	t.Parallel()
+	ed, priv := setupEd25519(t)
+	ed.Nonces.Close()
+	ed.Nonces = auth.NewNonceLRU(1, 60)
+	t.Cleanup(ed.Nonces.Close)
+	_ = ed.Nonces.Add("filler")
+	rl := NewRateLimiter()
+	t.Cleanup(rl.Stop)
+	reg := metrics.NewRegistry()
+	h := rl.AuthMiddlewareWithEd25519(nil, ed, noAudit(t), reg, http.HandlerFunc(okHandler))
+	req := httptest.NewRequest(http.MethodGet, "/_portwing/info", nil)
+	signEd25519Request(t, req, nil, priv, time.Now().Unix(), freshNonce(t))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized || rec.Header().Get(auth.HeaderReason) != "nonce-capacity" {
+		t.Fatalf("capacity rejection = %d %q", rec.Code, rec.Header().Get(auth.HeaderReason))
+	}
+	var output strings.Builder
+	reg.WritePrometheus(&output, metrics.EscapeLabelValue)
+	if !strings.Contains(output.String(), `portwing_auth_failures_total{reason="nonce-capacity"} 1`) {
+		t.Fatalf("capacity metric missing: %s", output.String())
 	}
 }
 

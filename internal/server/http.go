@@ -6,7 +6,6 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -127,91 +126,6 @@ func (l *concurrencyLimiter) limit() int {
 // slow daemon lets remote callers pile up handlers and Docker connections at
 // whatever rate they can open them.
 //
-// Vars, not consts, so tests can shrink them instead of waiting out the real
-// budget. Any test that reassigns one must not call t.Parallel: every
-// readiness handler reads them.
-var (
-	readinessPingTimeout = 2 * time.Second
-	readinessPingTTL     = time.Second
-)
-
-// healthProbe collapses concurrent readiness checks onto a single bounded
-// Docker ping and reuses its result for readinessPingTTL. N simultaneous
-// readiness requests therefore cost one ping and one Docker connection, not N,
-// and a caller never waits longer than readinessPingTimeout for one.
-type healthProbe struct {
-	mu sync.Mutex
-	// inflight is non-nil while a ping is running and is closed when it
-	// finishes, so late arrivals wait for that ping's result instead of
-	// starting their own.
-	inflight chan struct{}
-	at       time.Time
-	err      error
-	valid    bool
-}
-
-// errReadinessPingIncomplete is cached when a ping did not return normally,
-// which today means it panicked. Recording it keeps a panic from being cached
-// as a healthy result by the deferred publish, whose err is still nil at that
-// point.
-var errReadinessPingIncomplete = errors.New("readiness ping did not complete")
-
-// check returns the Docker reachability result, pinging at most once per
-// readinessPingTTL across all concurrent callers. ping is called with a
-// context bounded by readinessPingTimeout.
-func (p *healthProbe) check(ctx context.Context, ping func(context.Context) error) (err error) {
-	p.mu.Lock()
-	if p.valid && time.Since(p.at) < readinessPingTTL {
-		cached := p.err
-		p.mu.Unlock()
-		return cached
-	}
-	if wait := p.inflight; wait != nil {
-		p.mu.Unlock()
-		select {
-		case <-wait:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-		p.mu.Lock()
-		cached := p.err
-		p.mu.Unlock()
-		return cached
-	}
-	done := make(chan struct{})
-	p.inflight = done
-	p.mu.Unlock()
-
-	// Publish and hand off from a defer so an unwinding ping cannot leave
-	// inflight set: every later readiness request would block on a channel
-	// nothing ever closes, turning one panicking request into a permanently
-	// wedged readiness endpoint. RecoveryMiddleware turns the panic itself
-	// into a 500 for the one request that caused it.
-	completed := false
-	defer func() {
-		p.mu.Lock()
-		if !completed {
-			err = errReadinessPingIncomplete
-		}
-		p.err = err
-		p.at = time.Now()
-		p.valid = true
-		p.inflight = nil
-		p.mu.Unlock()
-		close(done)
-	}()
-
-	// Detached from the caller's context: everyone waiting on this ping would
-	// otherwise be cancelled by whichever client happened to start it hanging
-	// up first. The timeout is what bounds it.
-	pingCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), readinessPingTimeout)
-	defer cancel()
-
-	err = ping(pingCtx)
-	completed = true
-	return err
-}
-
 // Server is the standard-mode HTTP server that exposes Docker API proxy
 // endpoints, adapter-specific routes, and health checks.
 type Server struct {
@@ -233,7 +147,7 @@ type Server struct {
 	// readiness bounds the Docker ping the unauthenticated readiness routes
 	// perform. Its zero value is a working, empty cache, so Servers built as
 	// struct literals rather than through NewServer get the bound too.
-	readiness healthProbe
+	readiness docker.HealthProbe
 
 	// listenAddr holds the net.Addr ListenAndServe bound, set once the
 	// listener is up and before Serve/ServeTLS starts blocking. It lets
@@ -497,7 +411,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 // handleHealth returns readiness including Docker connectivity. It is exposed
 // at both the compatibility path /_portwing/health and the explicit /ready.
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	err := s.readiness.check(r.Context(), s.dockerClient.Ping)
+	err := s.readiness.Check(r.Context(), s.dockerClient.Ping)
 
 	status := "healthy"
 	dockerStatus := "connected"

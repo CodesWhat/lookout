@@ -283,4 +283,11 @@ func TestFullyPopulatedContainerMatchesOpenAPISchema(t *testing.T) {
 		}
 	}
 	assertMatchesOpenAPISchema(t, schemas, "Container", served, "container")
+	containerError, ok := served["error"].(map[string]any)
+	if !ok || len(containerError) != 1 || containerError["message"] != "inspect failed" {
+		t.Fatalf("error wire contract = %v, want only message", served["error"])
+	}
+	if schema := schemas["ContainerError"]; schema == nil || len(schema.properties) != len(containerError) {
+		t.Fatalf("ContainerError schema declares fields absent from the wire: %+v", schema)
+	}
 }

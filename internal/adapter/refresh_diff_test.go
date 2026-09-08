@@ -264,8 +264,15 @@ func TestRefreshServesTheNewNameAfterARename(t *testing.T) {
 	}
 	fixture.Set(renamedContainerSnapshot("c1", "new-name"))
 
-	if _, _, _, err := manager.Refresh(context.Background()); err != nil {
+	added, updated, removed, err := manager.Refresh(context.Background())
+	if err != nil {
 		t.Fatalf("second refresh: %v", err)
+	}
+	if len(added) != 0 || len(removed) != 0 || len(updated) != 1 || updated[0].Name != "new-name" {
+		t.Fatalf("rename diff: added=%v updated=%v removed=%v", added, updated, removed)
+	}
+	if _, updated, _, err := manager.Refresh(context.Background()); err != nil || len(updated) != 0 {
+		t.Fatalf("unchanged refresh after rename: updated=%v err=%v", updated, err)
 	}
 
 	c1, ok = manager.GetContainer("c1")
@@ -277,6 +284,21 @@ func TestRefreshServesTheNewNameAfterARename(t *testing.T) {
 	}
 	if c1.DisplayName != "new-name" {
 		t.Fatalf("displayName = %q, want new-name", c1.DisplayName)
+	}
+}
+
+func TestContainerChangeSignalIgnoresNameOrder(t *testing.T) {
+	t.Parallel()
+	entry := renamedContainerSnapshot("c1", "web").listed[0]
+	entry.Names = []string{"/web", "/alias"}
+	before := append([]string(nil), entry.Names...)
+	want := containerChangeSignal(&entry)
+	if !reflect.DeepEqual(entry.Names, before) {
+		t.Fatal("signal mutated the caller's names")
+	}
+	entry.Names = []string{"/alias", "/web"}
+	if got := containerChangeSignal(&entry); got != want {
+		t.Fatalf("reordered names changed signal: %q != %q", got, want)
 	}
 }
 

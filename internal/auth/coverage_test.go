@@ -280,7 +280,7 @@ func TestNewNonceLRU_DefaultsOnZeroValues(t *testing.T) {
 	lru := NewNonceLRU(0, 0)
 	defer lru.Close()
 
-	if !lru.Add("testNonce") {
+	if err := lru.Add("testNonce"); err != nil {
 		t.Error("expected Add to return true for fresh nonce")
 	}
 	if lru.Len() != 1 {
@@ -299,7 +299,7 @@ func TestNewNonceLRU_NegativeValues(t *testing.T) {
 	t.Parallel()
 	lru := NewNonceLRU(-1, -5)
 	defer lru.Close()
-	if !lru.Add("n1") {
+	if err := lru.Add("n1"); err != nil {
 		t.Error("expected Add to succeed with defaults")
 	}
 	if lru.ttl != 120*time.Second {
@@ -362,7 +362,7 @@ func TestNonceLRU_CleanupEvictsExpiredEntries(t *testing.T) {
 	// manipulation. The cleanup code path is exercised by the ticker firing;
 	// we test the observable behavior after Close instead of racing with a timer.
 	lru := NewNonceLRU(100, 1)
-	lru.Add("nonce-a")
+	_ = lru.Add("nonce-a")
 	if !lru.Seen("nonce-a") {
 		t.Error("nonce-a should be present before close")
 	}

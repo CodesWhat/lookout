@@ -180,6 +180,7 @@ func (c *Client) currentMessageSender() *edgeMessageSender {
 type Client struct {
 	cfg          *config.Config
 	dockerClient dockerAPI
+	readiness    docker.HealthProbe
 	adapter      adapter.EdgeAdapter
 	compose      *docker.ComposeManager
 	collector    hostCollector
@@ -1279,7 +1280,6 @@ func (c *Client) handleRequestTo(ctx context.Context, req protocol.RequestMessag
 		return
 	}
 	defer resp.Body.Close()
-	c.auditor.APIRequest(c.cfg.DrydockURL, req.Method, req.Path, audit.OutcomeAllowed, resp.StatusCode, msEdge(start))
 
 	// Build response headers.
 	headers := make(map[string]string)
@@ -1327,19 +1327,23 @@ func (c *Client) handleRequestTo(ctx context.Context, req protocol.RequestMessag
 		// finished stream from a truncated one and would treat a half-written
 		// image or tar as the whole thing.
 		reason := "complete"
+		outcome := audit.OutcomeAllowed
 		if streamErr != nil {
 			reason = "error"
+			outcome = audit.OutcomeError
 			slog.Warn("docker response stream ended early",
 				"requestId", applog.Sanitize(req.RequestID),
 				"path", applog.Sanitize(req.Path),
 				"error", applog.Sanitize(streamErr.Error()))
 		}
 
+		c.auditor.APIRequest(c.cfg.DrydockURL, req.Method, req.Path, outcome, resp.StatusCode, msEdge(start))
 		_ = c.sendTypedMessageTo(target, protocol.TypeStreamEnd, protocol.StreamEndMessage{
 			RequestID: req.RequestID,
 			Reason:    reason,
 		})
 	} else {
+		c.auditor.APIRequest(c.cfg.DrydockURL, req.Method, req.Path, audit.OutcomeAllowed, resp.StatusCode, msEdge(start))
 		// Read body (capped).
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
 
@@ -2003,16 +2007,22 @@ func (c *Client) dockerReady(ctx context.Context) bool {
 	if c.dockerClient == nil {
 		return false
 	}
-	pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	response, err := c.dockerClient.Do(pingCtx, http.MethodGet, "/_ping", nil)
-	if err != nil || response == nil {
-		return false
-	}
-	if response.Body != nil {
-		_ = response.Body.Close()
-	}
-	return response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices
+	return c.readiness.Check(ctx, func(pingCtx context.Context) error {
+		response, err := c.dockerClient.Do(pingCtx, http.MethodGet, "/_ping", nil)
+		if err != nil {
+			return err
+		}
+		if response == nil {
+			return errors.New("docker ping returned no response")
+		}
+		if response.Body != nil {
+			_ = response.Body.Close()
+		}
+		if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+			return fmt.Errorf("docker ping returned status %d", response.StatusCode)
+		}
+		return nil
+	}) == nil
 }
 
 func currentDockerState(connected bool) string {

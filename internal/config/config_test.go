@@ -514,3 +514,40 @@ func TestLoadAcceptsIntervalBoundary(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadDurationRanges(t *testing.T) {
+	for _, setting := range []struct {
+		name  string
+		zero  bool
+		value func(*Config) int
+	}{
+		{"HEARTBEAT_INTERVAL", false, func(c *Config) int { return c.HeartbeatInterval }},
+		{"DD_POLL_INTERVAL", false, func(c *Config) int { return c.DDPollInterval }},
+		{"WELCOME_TIMEOUT", false, func(c *Config) int { return c.WelcomeTimeout }},
+		{"MAX_CLOCK_SKEW_SECONDS", false, func(c *Config) int { return c.MaxClockSkewSeconds }},
+		{"REQUEST_TIMEOUT", true, func(c *Config) int { return c.RequestTimeout }},
+		{"RECONNECT_DELAY", true, func(c *Config) int { return c.ReconnectDelay }},
+		{"MAX_RECONNECT_DELAY", true, func(c *Config) int { return c.MaxReconnectDelay }},
+	} {
+		for _, value := range []string{"abc", "1.5", "-1", "9223372036854775808", strconv.FormatInt(MaxIntervalSeconds+1, 10), "0", "1", "60"} {
+			t.Run(setting.name+"/"+value, func(t *testing.T) {
+				t.Setenv(setting.name, value)
+				cfg, err := Load()
+				valid := value == "1" || value == "60" || value == "0" && setting.zero
+				if !valid {
+					if err == nil || !strings.Contains(err.Error(), setting.name) {
+						t.Fatalf("Load() for %s=%s: want named error, got %v", setting.name, value, err)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("Load() rejected %s=%s: %v", setting.name, value, err)
+				}
+				want, _ := strconv.Atoi(value)
+				if got := setting.value(cfg); got != want {
+					t.Fatalf("%s = %d, want %d", setting.name, got, want)
+				}
+			})
+		}
+	}
+}
