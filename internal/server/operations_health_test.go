@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -294,5 +295,58 @@ func TestReadinessProbeReleasesFlightOnPanic(t *testing.T) {
 	}
 	if !pinged {
 		t.Fatal("the readiness check after the TTL did not run its own ping")
+	}
+}
+
+// TestReadinessProbeWaiterHonoursCanceledContext covers the waiter's
+// cancellation branch: a readiness client queued behind an in-flight ping that
+// hangs up must be released by its own context rather than waiting out the
+// ping it never asked for. Cancelling before the call makes the select
+// deterministic — the leader's flight channel is still open, so only ctx.Done
+// is ready.
+func TestReadinessProbeWaiterHonoursCanceledContext(t *testing.T) {
+	t.Parallel()
+
+	var probe healthProbe
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseLeader := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseLeader)
+
+	leaderDone := make(chan error, 1)
+	go func() {
+		leaderDone <- probe.check(context.Background(), func(context.Context) error {
+			close(entered)
+			<-release
+			return nil
+		})
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the leading ping never started")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := probe.check(ctx, func(context.Context) error {
+		t.Error("a waiter must not start its own ping while one is in flight")
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("waiter with a canceled context returned %v, want context.Canceled", err)
+	}
+
+	releaseLeader()
+	select {
+	case err := <-leaderDone:
+		if err != nil {
+			t.Fatalf("the leading ping returned %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the leading ping never finished")
 	}
 }

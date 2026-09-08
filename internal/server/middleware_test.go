@@ -1129,3 +1129,45 @@ func TestEd25519MiddlewareBoundsConcurrentSlowBodies(t *testing.T) {
 	}
 	waitForInFlightSlots(t, rl, clientIP, 0, 2*time.Second)
 }
+
+// TestEd25519AdmissionRejectionRecordsMetrics covers the metrics branch of the
+// Ed25519 admission rejection. Every other test of that 429 passes a nil
+// registry, so the two counter calls never ran, yet production always has a
+// registry: NewServer sets one unconditionally. Without this the operator
+// dashboard would silently under-report exactly the rejections the admission
+// bound exists to produce.
+func TestEd25519AdmissionRejectionRecordsMetrics(t *testing.T) {
+	t.Parallel()
+	ed, priv := setupEd25519(t)
+	rl := NewRateLimiter()
+	defer rl.Stop()
+
+	const clientIP = "198.51.100.20"
+	rl.maxInFlight = 1
+	rl.attempts[clientIP] = &ipAttempts{inFlight: 1}
+
+	reg := newMetricsRegistry()
+	h := rl.AuthMiddlewareWithEd25519(nil, ed, noAudit(t), reg, http.HandlerFunc(okHandler))
+
+	req := httptest.NewRequest(http.MethodGet, "/_portwing/info", nil)
+	req.RemoteAddr = clientIP + ":1234"
+	signEd25519Request(t, req, nil, priv, time.Now().Unix(), freshNonce(t))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 when the verification slot is taken, got %d", rec.Code)
+	}
+
+	var b strings.Builder
+	reg.WritePrometheus(&b, func(value string) string { return value })
+	body := b.String()
+	for _, want := range []string{
+		`portwing_http_requests_total{method="GET",code="429"} 1`,
+		"portwing_rate_limited_total 1",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics output missing %q\n%s", want, body)
+		}
+	}
+}
