@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -92,6 +93,9 @@ func TestListenerBindsIPv6BindAddress(t *testing.T) {
 				}
 				select {
 				case err := <-errCh:
+					if (tc.bind == "::1" || tc.bind == "::") && errors.Is(err, syscall.EAFNOSUPPORT) {
+						t.Skipf("IPv6 address family unavailable: %v", err)
+					}
 					t.Fatalf("ListenAndServe(%q) failed instead of binding: %v", cfg.BindAddress, err)
 				default:
 				}

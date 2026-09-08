@@ -610,7 +610,7 @@ func (rl *RateLimiter) AuthMiddlewareWithEd25519(
 				reg.IncRequest(r.Method, http.StatusTooManyRequests)
 				reg.IncRateLimited()
 			}
-			http.Error(w, "authentication verification capacity exceeded", http.StatusTooManyRequests)
+			rejectUnadmitted(w, "authentication verification capacity exceeded", http.StatusTooManyRequests)
 			return
 		}
 		rl.finishAuth(clientIP, valid)

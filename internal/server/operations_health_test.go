@@ -127,7 +127,7 @@ func TestReadinessPingIsBoundedAndCollapsed(t *testing.T) {
 	client, pings, stop := newCountingPingDaemon(t, hold)
 	defer stop()
 
-	s := &Server{dockerClient: client, startTime: time.Now(), readiness: docker.HealthProbe{Timeout: 200 * time.Millisecond, TTL: 50 * time.Millisecond}}
+	s := &Server{dockerClient: client, startTime: time.Now(), readiness: docker.HealthProbe{Timeout: 200 * time.Millisecond, TTL: 5 * time.Second}}
 
 	const callers = 8
 	codes := make([]int, callers)

@@ -234,6 +234,11 @@ func TestRingRetainedDisplayFields(t *testing.T) {
 		{"path", 4096, func(s string) Record { return Record{Path: s} }, func(r Record) string { return r.Path }},
 		{"method", 64, func(s string) Record { return Record{Method: s} }, func(r Record) string { return r.Method }},
 		{"actor", 256, func(s string) Record { return Record{Actor: s} }, func(r Record) string { return r.Actor }},
+		{"operation", 256, func(s string) Record { return Record{Operation: s} }, func(r Record) string { return r.Operation }},
+		{"stack", 4096, func(s string) Record { return Record{Stack: s} }, func(r Record) string { return r.Stack }},
+		{"container", 4096, func(s string) Record { return Record{Container: s} }, func(r Record) string { return r.Container }},
+		{"exec_id", 256, func(s string) Record { return Record{ExecID: s} }, func(r Record) string { return r.ExecID }},
+		{"key_id", 256, func(s string) Record { return Record{KeyID: s} }, func(r Record) string { return r.KeyID }},
 	} {
 		t.Run(field.name, func(t *testing.T) {
 			for _, input := range []struct{ name, value string }{
@@ -283,7 +288,7 @@ func TestRingRetainedDisplayFields(t *testing.T) {
 
 func TestLoggerRetainsBoundedDisplayFields(t *testing.T) {
 	t.Parallel()
-	l, cleanup, err := New("", 2)
+	l, cleanup, err := New("", 5)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,9 +296,15 @@ func TestLoggerRetainsBoundedDisplayFields(t *testing.T) {
 	oversized := strings.Repeat("x", 1<<20)
 	l.AuthFailure(oversized, oversized, oversized)
 	l.RateLimited(oversized, oversized, oversized)
+	l.ComposeOp("actor", oversized, oversized, OutcomeError)
+	l.ExecStart("actor", oversized, oversized)
+	l.Enrollment("actor", oversized, OutcomeAllowed)
 	for _, r := range l.Records(0) {
 		if len(r.Path) > 4096 || len(r.Method) > 64 || len(r.Actor) > 256 {
 			t.Errorf("unbounded %s: path=%d method=%d actor=%d", r.Event, len(r.Path), len(r.Method), len(r.Actor))
+		}
+		if len(r.Operation) > 256 || len(r.Stack) > 4096 || len(r.Container) > 4096 || len(r.ExecID) > 256 || len(r.KeyID) > 256 {
+			t.Errorf("unbounded %s: operation=%d stack=%d container=%d exec_id=%d key_id=%d", r.Event, len(r.Operation), len(r.Stack), len(r.Container), len(r.ExecID), len(r.KeyID))
 		}
 	}
 }

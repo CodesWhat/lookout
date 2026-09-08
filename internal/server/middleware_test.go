@@ -134,6 +134,22 @@ func TestAuthMiddlewareReturns429WhenVerifierCapacityIsExhausted(t *testing.T) {
 	}
 }
 
+func TestAuthMiddlewareVerifierCapacityRejectsUnreadBodies(t *testing.T) {
+	rl := NewRateLimiter()
+	defer rl.Stop()
+
+	h := rl.AuthMiddlewareWithEd25519(saturatedTokenVerifier{}, Ed25519Config{}, noAudit(t), nil, http.HandlerFunc(okHandler))
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	for _, framing := range []string{"Content-Length: 1\r\n", "Transfer-Encoding: chunked\r\n"} {
+		t.Run(strings.TrimSpace(framing), func(t *testing.T) {
+			headers := framing + headerPortwingToken + ": presented\r\n"
+			assertUnreadBodyRejected(t, ts.URL, http.MethodPost, "/", headers, "", http.StatusTooManyRequests)
+		})
+	}
+}
+
 func TestRateLimiterAbuseWindowStateTransitions(t *testing.T) {
 	rl := &RateLimiter{
 		attempts: make(map[string]*ipAttempts),

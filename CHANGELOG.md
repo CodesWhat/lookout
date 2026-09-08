@@ -11,10 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Health and enrollment early responses bound unread request-body cleanup,
+- Health, enrollment, and authentication-capacity responses bound unread request-body cleanup,
   preventing connections from waiting indefinitely after the handler returns.
 - The audit buffer bounds and copies request-derived display fields, keeping
-  long paths and shared request-line allocations from exhausting retained memory.
+  long paths, Compose fields, exec identifiers, and shared request-line allocations
+  from exhausting retained memory.
 - Docker stats and named image-push endpoints use streaming transport in both
   modes. Explicit `stats?stream=false` requests retain the normal request timeout.
 - Interrupted Standard-mode Docker downloads abort the downstream response
