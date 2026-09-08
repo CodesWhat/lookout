@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Health and enrollment early responses bound unread request-body cleanup,
+  preventing connections from waiting indefinitely after the handler returns.
+- The audit buffer bounds and copies request-derived display fields, keeping
+  long paths and shared request-line allocations from exhausting retained memory.
+- Docker stats and named image-push endpoints use streaming transport in both
+  modes. Explicit `stats?stream=false` requests retain the normal request timeout.
+- Interrupted Standard-mode Docker downloads abort the downstream response
+  instead of presenting a truncated archive as a completed transfer.
+- Unary Edge responses reject Docker body-read failures and record an error
+  audit outcome in both base64 and legacy response modes.
+- Compose applies environment updates when unchanged Compose files are omitted
+  from the request.
+- Canceled Compose requests stop waiting for a stack lock and cannot write stack
+  files after their canceled wait eventually acquires the lock.
+- Paused and restarting containers retain their specific status even when
+  Docker also marks them running, and status transitions emit inventory updates.
+- Edge reconnects clear the previous controller's polling override before
+  applying the new welcome or falling back to configured defaults.
+- Slow inventory refreshes no longer delay periodic Edge metrics and pings.
+- A full Drydock handler pool rejects additional work promptly, preserving
+  control-message handling and balanced log-admission cleanup.
+- OpenRC services export all configured settings, including private-key and
+  file-authentication paths, instead of only the original five variables.
 - Edge Docker response streams write their audit outcome when the body ends;
   truncated streams record `error` instead of an early `allowed` result.
 - A full nonce cache reports `nonce-capacity` in auth response headers and

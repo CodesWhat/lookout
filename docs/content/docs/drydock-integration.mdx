@@ -91,7 +91,7 @@ Sent on every new SSE connection. Drydock reads `version`, `os`, `arch`, `cpus`,
 <Callout type="info">
 `memoryGb` is read from `/proc/meminfo` (the binary stays cgo-free) and rounded to one decimal GiB; non-Linux hosts report `0`, which Drydock accepts. `pollInterval` is the agent's `DD_POLL_INTERVAL` rendered as a Go duration string — the field is informational and displayed as-is. Portwing 0.5.x and earlier sent `memoryGb: 0` and omitted `logLevel`/`pollInterval`.
 
-`pollInterval` takes several different shapes depending on the source: a Go duration string (`"5m0s"`, Standard Mode `dd:ack`), a cron expression (Drydock's own legacy Node.js agent), and a bare integer string (`"300"`) on Drydock's REST `AgentInfo` surface. Edge Mode's `welcome` frame is different again — it sends `pollInterval` as a JSON *number* (e.g. `300`), not a string (see below). Treat it as an opaque, display-only value in all cases; do not parse it.
+`pollInterval` takes several display-only forms: a Go duration string (`"5m0s"`, Standard Mode `dd:ack`), a cron expression (Drydock's own legacy Node.js agent), and a bare integer string (`"300"`) on Drydock's REST `AgentInfo` surface. Treat those values as opaque display text. Edge Mode's `welcome` frame instead sends `pollInterval` as a JSON number (e.g. `300`). Portwing validates that value as an interval in seconds and uses it to control polling.
 </Callout>
 
 ### `dd:container-added` / `dd:container-updated`
@@ -445,8 +445,13 @@ unrecognized code are retried with backoff.
 `AGENT_NAME`: in Edge Mode the (sanitized) `hello.agentName` sent by Portwing is now honored by Drydock as the agent's display name, as of Drydock dev/v1.6. Sanitization lowercases the name, replaces runs of non-`[a-z0-9-]` characters with a single `-`, trims leading/trailing `-`, and truncates to 63 characters; an empty result falls back to `portwing-edge-<agentId>`.
 </Callout>
 
-<Callout type="warn">
-`DD_POLL_INTERVAL` is ignored in Edge Mode — the controller's `welcome` frame `pollInterval` is authoritative there (Drydock intentionally owns the refresh cadence in Edge Mode; this is deliberate, not a bug). It still applies as documented in Standard Mode.
+<Callout type="info">
+In Edge Mode, a usable positive `pollInterval` from the current controller's
+`welcome` overrides the adapter interval. Without a usable override, Portwing
+uses the adapter interval, falling back to `DD_POLL_INTERVAL` when the adapter
+supplies none. An absent, zero, negative, malformed or out-of-range welcome
+interval keeps that fallback and does not close the connection. The previous
+connection's override is cleared on reconnect.
 </Callout>
 
 For the full variable reference including Docker socket, metrics, and reconnect settings, see [Configuration](/configuration).
