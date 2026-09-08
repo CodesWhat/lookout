@@ -2,6 +2,7 @@ package edge
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"sync"
@@ -9,6 +10,16 @@ import (
 	"testing"
 	"time"
 )
+
+func TestDockerReadinessRejectsPingError(t *testing.T) {
+	t.Parallel()
+	c := &Client{dockerClient: &fakeDocker{doErr: errors.New("daemon unavailable")}}
+	for range 2 {
+		if c.dockerReady(context.Background()) {
+			t.Fatal("failed Docker ping reported ready")
+		}
+	}
+}
 
 type readinessDocker struct {
 	fakeDocker

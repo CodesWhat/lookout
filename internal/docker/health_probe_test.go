@@ -8,6 +8,39 @@ import (
 	"time"
 )
 
+func TestHealthProbeCachesSuccessAndFailureUntilExpiry(t *testing.T) {
+	t.Parallel()
+	var probe HealthProbe
+	failure := errors.New("daemon unavailable")
+	calls := 0
+	ping := func(context.Context) error {
+		calls++
+		if calls == 1 {
+			return nil
+		}
+		return failure
+	}
+	for range 2 {
+		if err := probe.Check(context.Background(), ping); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("healthy cached checks made %d pings", calls)
+	}
+	probe.mu.Lock()
+	probe.at = time.Now().Add(-2 * time.Second)
+	probe.mu.Unlock()
+	for range 2 {
+		if err := probe.Check(context.Background(), ping); !errors.Is(err, failure) {
+			t.Fatalf("failed ping result = %v", err)
+		}
+	}
+	if calls != 2 {
+		t.Fatalf("expiry and failed cached checks made %d pings, want 2", calls)
+	}
+}
+
 // probeInflight reports whether the probe still holds an unfinished flight.
 func probeInflight(p *HealthProbe) bool {
 	p.mu.Lock()
