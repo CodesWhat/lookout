@@ -250,7 +250,14 @@ func (cm *ComposeManager) Execute(ctx context.Context, req ComposeRequest) (*Com
 	if err := validateComposeOperation(req.Operation); err != nil {
 		return &ComposeResponse{Success: false, Error: err.Error()}, nil
 	}
-	if err := cm.validateRequest(req); err != nil {
+	// validateRequest also resolves and returns the canonical stack
+	// directory, so Execute doesn't re-derive and re-validate it a second
+	// time for the lock key below: a second, independent resolveStackRoot
+	// call here could never disagree with validateRequest's (both resolve
+	// the same StackDir/StackName fallback against the same immutable
+	// cm.stacksDir), which left that second call's error branch dead code.
+	stackDirKey, err := cm.validateRequest(req)
+	if err != nil {
 		return &ComposeResponse{Success: false, Error: err.Error()}, nil
 	}
 
@@ -265,10 +272,6 @@ func (cm *ComposeManager) Execute(ctx context.Context, req ComposeRequest) (*Com
 	// requests are already authenticated with full compose control over this
 	// stack, so the lock is about correctness (deploying the config you
 	// asked for) rather than access control.
-	stackDirKey, err := cm.resolveStackRoot(effectiveStackDir(req))
-	if err != nil {
-		return &ComposeResponse{Success: false, Error: fmt.Sprintf("invalid stack path: %v", err)}, nil
-	}
 	unlock := cm.lockStack(stackDirKey)
 	defer unlock()
 
@@ -326,59 +329,61 @@ func (cm *ComposeManager) Execute(ctx context.Context, req ComposeRequest) (*Com
 	}, nil
 }
 
-// validateRequest checks the request for invalid or dangerous inputs.
-func (cm *ComposeManager) validateRequest(req ComposeRequest) error {
+// validateRequest checks the request for invalid or dangerous inputs. On
+// success it also returns the request's canonical (cleaned, absolute) stack
+// directory, so a caller that needs it (Execute, for the per-stack lock key)
+// doesn't have to re-derive and re-validate it with a second call that could
+// never disagree with this one.
+func (cm *ComposeManager) validateRequest(req ComposeRequest) (string, error) {
 	if req.StackName == "" {
-		return fmt.Errorf("stack name is required")
+		return "", fmt.Errorf("stack name is required")
 	}
 	if req.Operation != "" {
 		if err := validateComposeOperation(req.Operation); err != nil {
-			return err
+			return "", err
 		}
 	}
 
 	// Validate env var keys and values.
 	for key, val := range req.EnvVars {
 		if !envVarKeyPattern.MatchString(key) {
-			return fmt.Errorf("invalid env var key: %q", key)
+			return "", fmt.Errorf("invalid env var key: %q", key)
 		}
 		if envVarDenylist[key] {
-			return fmt.Errorf("env var %q is not allowed", key)
+			return "", fmt.Errorf("env var %q is not allowed", key)
 		}
 		if strings.ContainsAny(val, "\n\r\x00") {
-			return fmt.Errorf("env var %q value contains invalid characters (newline, carriage return, or null)", key)
+			return "", fmt.Errorf("env var %q value contains invalid characters (newline, carriage return, or null)", key)
 		}
 	}
 
 	// Validate service names (reject names starting with "-").
 	for _, svc := range req.Services {
 		if strings.HasPrefix(svc, "-") {
-			return fmt.Errorf("invalid service name: %q", svc)
+			return "", fmt.Errorf("invalid service name: %q", svc)
 		}
 	}
 
 	// Validate registry auth server if present.
 	if req.RegistryAuth != nil {
 		if err := validateRegistryServer(req.RegistryAuth.Server); err != nil {
-			return err
+			return "", err
 		}
 	}
 
-	// Validate stack path is within stacksDir.
-	stackDir := req.StackDir
-	if stackDir == "" {
-		stackDir = req.StackName
-	}
-	if _, err := cm.resolvePath(stackDir, "."); err != nil {
-		return fmt.Errorf("invalid stack path: %w", err)
+	// Validate stack path is within stacksDir, capturing its canonical form.
+	stackDir := effectiveStackDir(req)
+	stackDirKey, err := cm.resolveStackRoot(stackDir)
+	if err != nil {
+		return "", fmt.Errorf("invalid stack path: %w", err)
 	}
 	for relPath := range req.Files {
 		if _, err := cm.resolvePath(stackDir, relPath); err != nil {
-			return fmt.Errorf("invalid stack file path %q: %w", relPath, err)
+			return "", fmt.Errorf("invalid stack file path %q: %w", relPath, err)
 		}
 	}
 
-	return nil
+	return stackDirKey, nil
 }
 
 func validateComposeOperation(operation string) error {

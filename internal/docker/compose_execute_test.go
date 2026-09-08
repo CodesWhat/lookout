@@ -141,7 +141,7 @@ func TestExecuteRejectsUnsupportedOperationBeforeSideEffects(t *testing.T) {
 		},
 	}
 
-	if err := cm.validateRequest(req); err == nil {
+	if _, err := cm.validateRequest(req); err == nil {
 		t.Error("validateRequest accepted an unsupported compose operation")
 	}
 	resp, err := cm.Execute(t.Context(), req)
@@ -161,6 +161,53 @@ func TestExecuteRejectsUnsupportedOperationBeforeSideEffects(t *testing.T) {
 		t.Errorf("read preexisting compose file: %v", err)
 	} else if string(got) != original {
 		t.Errorf("preexisting compose file was mutated before rejection: got %q", got)
+	}
+	if calls, err := os.ReadFile(callsPath); err == nil {
+		t.Errorf("Docker was invoked before rejection: %q", calls)
+	} else if !os.IsNotExist(err) {
+		t.Errorf("read Docker invocation record: %v", err)
+	}
+}
+
+// ---- Execute: invalid stack path rejected before side effects ----
+
+// TestExecuteRejectsInvalidStackPathBeforeSideEffects exercises Execute's use
+// of the (stackDirKey, error) validateRequest now returns: a StackDir that
+// escapes stacksDir must be rejected by validateRequest itself, before
+// Execute ever calls lockStack or touches the filesystem or Docker. This is
+// the end-to-end counterpart to TestValidateRequest_StackPathTraversal, which
+// only exercises validateRequest directly.
+func TestExecuteRejectsInvalidStackPathBeforeSideEffects(t *testing.T) {
+	binDir := t.TempDir()
+	callsPath := filepath.Join(binDir, "calls")
+	fakeDocker := filepath.Join(binDir, "docker")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$PORTWING_TEST_CALLS\"\n"
+	if err := os.WriteFile(fakeDocker, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PORTWING_TEST_CALLS", callsPath)
+	t.Setenv("PATH", binDir+string(filepath.ListSeparator)+os.Getenv("PATH"))
+
+	cm := &ComposeManager{stacksDir: t.TempDir(), composeBin: fakeDocker}
+	req := ComposeRequest{
+		StackName: "app",
+		StackDir:  "../escape",
+		Operation: "up",
+	}
+
+	resp, err := cm.Execute(t.Context(), req)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if resp.Success || !strings.Contains(resp.Error, "invalid stack path") {
+		t.Errorf("response = %+v, want an invalid-stack-path error", resp)
+	}
+
+	cm.stackLocksMu.Lock()
+	locks := len(cm.stackLocks)
+	cm.stackLocksMu.Unlock()
+	if locks != 0 {
+		t.Errorf("stack locks = %d, want 0 (an escaping StackDir must not have taken a lock)", locks)
 	}
 	if calls, err := os.ReadFile(callsPath); err == nil {
 		t.Errorf("Docker was invoked before rejection: %q", calls)
@@ -724,7 +771,7 @@ func TestValidateRequest_FilePathTraversal(t *testing.T) {
 			"../evil/compose.yml": "services: {}\n",
 		},
 	}
-	if err := cm.validateRequest(req); err == nil {
+	if _, err := cm.validateRequest(req); err == nil {
 		t.Fatal("expected error for file path traversal, got nil")
 	}
 }
@@ -739,7 +786,7 @@ func TestValidateRequest_StackPathTraversal(t *testing.T) {
 	req := ComposeRequest{
 		StackName: "../outside",
 	}
-	if err := cm.validateRequest(req); err == nil {
+	if _, err := cm.validateRequest(req); err == nil {
 		t.Fatal("expected error for stack path traversal, got nil")
 	}
 }
