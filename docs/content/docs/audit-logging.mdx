@@ -96,6 +96,11 @@ The `msg` field is always an empty string; all semantic content lives in the nam
 |-------|------|-------------|
 | `key_id` | string | The fingerprint or identifier of the enrolled Ed25519 public key |
 
+For Edge Docker response streams, `api_request` is written when the Docker body
+ends. A clean EOF records `allowed`; a truncated body or read failure records
+`error`, retaining the original HTTP status. `duration_ms` includes the time
+spent reading the stream. An active stream has no completion record yet.
+
 ## Sample events
 
 Authenticated API request (success):

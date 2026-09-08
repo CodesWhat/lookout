@@ -1281,7 +1281,6 @@ func (c *Client) handleRequestTo(ctx context.Context, req protocol.RequestMessag
 		return
 	}
 	defer resp.Body.Close()
-	c.auditor.APIRequest(c.cfg.DrydockURL, req.Method, req.Path, audit.OutcomeAllowed, resp.StatusCode, msEdge(start))
 
 	// Build response headers.
 	headers := make(map[string]string)
@@ -1329,19 +1328,23 @@ func (c *Client) handleRequestTo(ctx context.Context, req protocol.RequestMessag
 		// finished stream from a truncated one and would treat a half-written
 		// image or tar as the whole thing.
 		reason := "complete"
+		outcome := audit.OutcomeAllowed
 		if streamErr != nil {
 			reason = "error"
+			outcome = audit.OutcomeError
 			slog.Warn("docker response stream ended early",
 				"requestId", applog.Sanitize(req.RequestID),
 				"path", applog.Sanitize(req.Path),
 				"error", applog.Sanitize(streamErr.Error()))
 		}
 
+		c.auditor.APIRequest(c.cfg.DrydockURL, req.Method, req.Path, outcome, resp.StatusCode, msEdge(start))
 		_ = c.sendTypedMessageTo(target, protocol.TypeStreamEnd, protocol.StreamEndMessage{
 			RequestID: req.RequestID,
 			Reason:    reason,
 		})
 	} else {
+		c.auditor.APIRequest(c.cfg.DrydockURL, req.Method, req.Path, audit.OutcomeAllowed, resp.StatusCode, msEdge(start))
 		// Read body (capped).
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
 
