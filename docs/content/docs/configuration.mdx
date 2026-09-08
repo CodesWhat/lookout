@@ -100,7 +100,7 @@ bound also cannot exceed the platform's integer maximum (`2147483647` on
 | `MAX_STREAM_SESSIONS` | `100` | Standard mode only: maximum concurrent streaming Docker proxy responses. A non-positive value disables the bound. Edge mode enforces the same 100-session limit, but it is fixed and not configurable. |
 | `MAX_EXEC_SESSIONS` | `100` | Standard mode only: maximum concurrent hijacked exec/attach sessions. A non-positive value disables the bound. Edge mode enforces the same 100-session limit, but it is fixed and not configurable. |
 | `AUDIT_LOG` | — | Optional persistent audit destination: `stdout`, `stderr`, or an absolute file path. When unset, only the sink is disabled; `AUDIT_BUFFER_SIZE` still controls in-memory retention. |
-| `AUDIT_BUFFER_SIZE` | `256` | Number of audit records retained in the in-memory ring buffer for pull-based retrieval at `GET /_portwing/audit`. Set to `0` to disable the buffer. Independent of `AUDIT_LOG`. |
+| `AUDIT_BUFFER_SIZE` | `256` | Number of audit records retained in the in-memory ring buffer for pull-based retrieval at `GET /_portwing/audit`. Set to `0` to disable the buffer. Independent of `AUDIT_LOG`. Retained display fields are copied and capped at 4096 bytes for `path`, 64 bytes for `method`, and 256 bytes for `actor`. Oversized fields end with `[truncated]` within that cap, preserving UTF-8 character boundaries. These limits apply only to in-memory audit retention, not incoming requests or the persistent audit sink. |
 
 ---
 
