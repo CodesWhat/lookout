@@ -197,7 +197,9 @@ func TestStreamResponseSkipsWriteAndFlushOnZeroRead(t *testing.T) {
 
 	w := &flushTrackingResponseWriter{hdr: make(http.Header)}
 	s := &Server{}
-	s.streamResponse(w, zeroByteThenEOFReader{})
+	if err := s.streamResponse(w, zeroByteThenEOFReader{}); err != nil {
+		t.Fatal(err)
+	}
 
 	if w.flushed {
 		t.Fatal("streamResponse flushed on a zero-byte read, want no flush")

@@ -20,7 +20,7 @@ func TestIsStreamingPath(t *testing.T) {
 		{name: "events", path: "/v1.44/events", want: true},
 		{name: "build", path: "/v1.44/build", want: true},
 		{name: "images create", path: "/v1.44/images/create?fromImage=nginx", want: true},
-		{name: "images push", path: "/v1.44/images/push?name=nginx", want: true},
+		{name: "images push", path: "/v1.44/images/nginx/push", want: true},
 		{name: "exec start", path: "/v1.44/exec/abc/start", want: true},
 		{name: "non-stream endpoint", path: "/v1.44/containers/json", want: false},
 		{name: "exec inspect not stream", path: "/v1.44/exec/abc/json", want: false},
@@ -78,6 +78,42 @@ func TestIsStreamingRequestContainerArchiveMethod(t *testing.T) {
 			req := httptest.NewRequest(tc.method, tc.path, nil)
 			if got := IsStreamingRequest(req.Method, req.URL.RequestURI()); got != tc.want {
 				t.Fatalf("IsStreamingRequest(%q, %q) = %v, want %v", tc.method, tc.path, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestStreamingStatsAndPush(t *testing.T) {
+	for _, tc := range []struct {
+		method, path string
+		want         bool
+	}{
+		{"GET", "/containers/id/stats", true},
+		{"GET", "/v1.44/containers/id/stats?one-shot=true", true},
+		{"GET", "/containers/id/stats?stream=1", true},
+		{"GET", "/containers/id/stats?stream=true", true},
+		{"GET", "/containers/id/stats?stream=false&one-shot=true", false},
+		{"GET", "/containers/id/stats?stream=0", false},
+		{"GET", "/containers/id/stats?stream=%20FaLsE%20", false},
+		{"GET", "/containers/id/stats?stream=NO", false},
+		{"GET", "/containers/id/stats?stream=none", false},
+		{"GET", "/containers/id/stats?stream=", false},
+		{"GET", "/containers/id/stats?stream=false&stream=true", false},
+		{"GET", "/containers/id/stats?stream=true&stream=false", true},
+		{"POST", "/containers/id/stats", false},
+		{"GET", "/containers//stats", false},
+		{"GET", "/other/containers/id/stats", false},
+		{"POST", "/images/nginx/push", true},
+		{"POST", "/v1.44/images/library/nginx/push", true},
+		{"POST", "/images/library%2Fnginx/push", true},
+		{"GET", "/images/nginx/push", false},
+		{"POST", "/images/push", false},
+		{"POST", "/images//push", false},
+		{"POST", "/other/images/nginx/push", false},
+	} {
+		t.Run(tc.method+tc.path, func(t *testing.T) {
+			if got := IsStreamingRequest(tc.method, tc.path); got != tc.want {
+				t.Fatalf("got %v, want %v", got, tc.want)
 			}
 		})
 	}

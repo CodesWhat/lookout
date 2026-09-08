@@ -354,7 +354,7 @@ func (rl *RateLimiter) rateLimitOnly(next http.Handler, reg *metrics.Registry) h
 				reg.IncRequest(r.Method, http.StatusTooManyRequests)
 				reg.IncRateLimited()
 			}
-			http.Error(w, "too many requests", http.StatusTooManyRequests)
+			rejectUnadmitted(w, "too many requests", http.StatusTooManyRequests)
 			return
 		}
 		rw := &statusRecorder{ResponseWriter: w, code: http.StatusOK}
@@ -682,6 +682,9 @@ func RecoveryMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if err := recover(); err != nil {
+				if err == http.ErrAbortHandler { //nolint:errorlint // net/http recognizes only the exact abort sentinel.
+					panic(err)
+				}
 				stack := debug.Stack()
 				slog.Error("panic recovered",
 					"error", applog.Sanitize(fmt.Sprintf("%v", err)),

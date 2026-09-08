@@ -31,7 +31,7 @@ info:
     Docker daemon (Unix socket). This includes every endpoint in the
     [Docker Engine API](https://docs.docker.com/engine/api/) — streaming
     endpoints (`/logs`, `/attach`, `/exec/*/start`, `/events`, `/build`,
-    `/images/create`, `/images/push`), interactive exec hijacking
+    `/images/create`, `/images/{name}/push`, `/containers/{id}/stats` (unless `stream=false`)), interactive exec hijacking
     (`Upgrade: tcp`), and binary responses. Paths are forwarded verbatim; the
     agent negotiates the API version on startup (fallback: `v1.44`).
 
@@ -1687,7 +1687,7 @@ paths:
         agent prepends it automatically.
 
         Streaming endpoints (`/logs`, `/attach`, `/exec/*/start`, `/events`,
-        `/build`, `/images/create`, `/images/push`) are detected by path and
+        `/build`, `/images/create`, `/images/{name}/push`, `/containers/{id}/stats` (unless `stream=false`)) are detected by path and
         forwarded with flush-on-read streaming. Interactive exec sessions
         using `Upgrade: tcp` or `Upgrade: websocket` are handled via HTTP
         hijacking. Bearer auth is required for all proxy paths.
