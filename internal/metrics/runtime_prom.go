@@ -80,31 +80,119 @@ func writeHostDiskPrometheus(b *strings.Builder, host *HostMetrics) {
 	fmt.Fprintf(b, "portwing_host_disk_used_bytes %d\n", host.DiskUsed)
 }
 
-// WriteContainerPrometheus appends per-container Docker metrics. Collection is
-// bounded to eight concurrent stats requests, each with a ten-second timeout.
-func WriteContainerPrometheus(
-	ctx context.Context,
-	b *strings.Builder,
-	client DockerMetricsClient,
-	escapeLabel func(string) string,
-) {
-	if client == nil {
-		return
-	}
-	containers, err := client.ListContainers(ctx, false)
-	if err != nil || len(containers) == 0 {
-		return
+// ContainerCollector samples per-container Docker metrics for one Docker
+// client and shares a single in-flight collection between overlapping scrapes.
+//
+// Collection used to be per-call, so every scrape started its own eight-worker
+// stats pool: N scrapes landing together cost Docker N ListContainers calls
+// and N stats requests per container. Two Prometheus jobs, or a retry fired
+// while a slow scrape is still running, hit exactly that. Callers keep one
+// collector per client for the life of the process — building a fresh one per
+// scrape brings the per-scrape pool straight back.
+type ContainerCollector struct {
+	client DockerMetricsClient
+
+	mu     sync.Mutex
+	flight *containerFlight
+}
+
+// containerFlight is one collection in progress. done is closed once results
+// is set, and waiters counts the scrapes still interested in it.
+type containerFlight struct {
+	done    chan struct{}
+	results []containerResult
+	waiters int
+	cancel  context.CancelFunc
+}
+
+// containerResult is one container's sampled metrics.
+type containerResult struct {
+	id    string
+	name  string
+	image string
+	cpu   float64
+	memU  uint64
+	memL  uint64
+	rxB   uint64
+	txB   uint64
+}
+
+// NewContainerCollector returns a collector that samples client.
+func NewContainerCollector(client DockerMetricsClient) *ContainerCollector {
+	return &ContainerCollector{client: client}
+}
+
+// collect returns the sampled containers, joining the collection already in
+// flight when there is one rather than starting a second pool against the same
+// Docker daemon.
+func (c *ContainerCollector) collect(ctx context.Context) []containerResult {
+	c.mu.Lock()
+	flight := c.flight
+	if flight == nil {
+		// The collection runs on a context of its own, cancelled when the
+		// last waiter leaves rather than when the scrape that started it
+		// does: otherwise one scraper hanging up would abort a collection the
+		// others are still waiting on. A collection nobody waits on is still
+		// cancelled immediately, exactly as a per-scrape one was.
+		flightCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+		flight = &containerFlight{done: make(chan struct{}), waiters: 1, cancel: cancel}
+		c.flight = flight
+		c.mu.Unlock()
+		go c.run(flightCtx, flight)
+	} else {
+		flight.waiters++
+		c.mu.Unlock()
 	}
 
-	type containerResult struct {
-		id    string
-		name  string
-		image string
-		cpu   float64
-		memU  uint64
-		memL  uint64
-		rxB   uint64
-		txB   uint64
+	select {
+	case <-flight.done:
+		c.leave(flight)
+		return flight.results
+	case <-ctx.Done():
+		c.leave(flight)
+		return nil
+	}
+}
+
+// run samples every container and publishes the results to the waiters. It
+// clears the flight before publishing so the next scrape starts a fresh
+// collection instead of reading these results back as an untimed cache.
+func (c *ContainerCollector) run(ctx context.Context, flight *containerFlight) {
+	results := collectContainers(ctx, c.client)
+
+	c.mu.Lock()
+	flight.results = results
+	if c.flight == flight {
+		c.flight = nil
+	}
+	c.mu.Unlock()
+
+	close(flight.done)
+}
+
+// leave drops one waiter from flight and cancels the collection when it was
+// the last one still waiting.
+func (c *ContainerCollector) leave(flight *containerFlight) {
+	c.mu.Lock()
+	flight.waiters--
+	last := flight.waiters == 0
+	if last && c.flight == flight {
+		c.flight = nil
+	}
+	c.mu.Unlock()
+
+	if last {
+		flight.cancel()
+	}
+}
+
+// collectContainers samples every container with a worker pool bounded to
+// eight concurrent stats requests, each with a ten-second timeout, and returns
+// only the containers whose stats call succeeded.
+func collectContainers(ctx context.Context, client DockerMetricsClient) []containerResult {
+	containers, err := client.ListContainers(ctx, false)
+	if err != nil || len(containers) == 0 {
+		return nil
 	}
 
 	const maxWorkers = 8
@@ -159,6 +247,23 @@ func WriteContainerPrometheus(
 			valid = append(valid, result)
 		}
 	}
+	return valid
+}
+
+// WriteContainerPrometheus appends per-container Docker metrics sampled by
+// collector. Collection is bounded to eight concurrent stats requests, each
+// with a ten-second timeout, and concurrent scrapes share one collection
+// instead of each starting a pool of their own.
+func WriteContainerPrometheus(
+	ctx context.Context,
+	b *strings.Builder,
+	collector *ContainerCollector,
+	escapeLabel func(string) string,
+) {
+	if collector == nil || collector.client == nil {
+		return
+	}
+	valid := collector.collect(ctx)
 	if len(valid) == 0 {
 		return
 	}

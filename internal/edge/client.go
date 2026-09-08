@@ -204,6 +204,12 @@ type Client struct {
 	// streamSem bounds concurrent in-flight request handlers (maxStreams).
 	streamSem chan struct{}
 
+	// containerMetricsOnce guards containerCollector, the one collector every
+	// scrape of the health server's /metrics shares so overlapping scrapes
+	// cost Docker a single stats pool.
+	containerMetricsOnce sync.Once
+	containerCollector   *metrics.ContainerCollector
+
 	// welcomePollInterval is the poll interval (seconds) received from the
 	// controller's welcome frame. Zero means the controller did not supply one,
 	// so writePump falls back to DDPollInterval from config. Set once per
@@ -1844,6 +1850,19 @@ func closeWebSocket(conn *websocket.Conn, context string) {
 	}
 }
 
+// containerMetrics returns the collector every /metrics scrape shares, built
+// on first use because tests inject their Docker client after NewClient. It
+// stays nil for a client that cannot serve container stats, which leaves those
+// series out exactly as the failed type assertion did before.
+func (c *Client) containerMetrics() *metrics.ContainerCollector {
+	c.containerMetricsOnce.Do(func() {
+		if dockerMetrics, ok := c.dockerClient.(metrics.DockerMetricsClient); ok {
+			c.containerCollector = metrics.NewContainerCollector(dockerMetrics)
+		}
+	})
+	return c.containerCollector
+}
+
 // startHealthServer starts the local liveness, readiness, and operational
 // metrics server used by Docker, Kubernetes, and Prometheus.
 func (c *Client) startHealthServer() {
@@ -1912,9 +1931,7 @@ func (c *Client) startHealthServer() {
 		if hostCol, ok := c.collector.(*metrics.Collector); ok {
 			metrics.WriteHostPrometheus(&b, hostCol)
 		}
-		if dockerMetrics, ok := c.dockerClient.(metrics.DockerMetricsClient); ok {
-			metrics.WriteContainerPrometheus(r.Context(), &b, dockerMetrics, metrics.EscapeLabelValue)
-		}
+		metrics.WriteContainerPrometheus(r.Context(), &b, c.containerMetrics(), metrics.EscapeLabelValue)
 		c.metrics.WritePrometheus(&b, metrics.EscapeLabelValue)
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		_, _ = io.WriteString(w, b.String())
