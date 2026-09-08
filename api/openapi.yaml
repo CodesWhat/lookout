@@ -457,10 +457,6 @@ components:
       properties:
         message:
           type: string
-        timestamp:
-          type: string
-          format: date-time
-          description: When the error was recorded.
 
     RuntimeDetails:
       type: object

@@ -20,8 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   values at startup. Request timeouts and reconnect delays still accept zero;
   heartbeat, polling, welcome, and clock-skew settings require positive seconds.
 - Container renames now emit an update immediately, and reordering Docker's
-  listed names no longer invalidates the inspect cache. Drydock container
-  errors preserve their recorded timestamp on the wire.
+  listed names no longer invalidates the inspect cache. The OpenAPI container
+  error schema no longer declares an unused timestamp field.
 - **A truncated Docker response stream no longer reports itself as complete.**
   The edge agent's response relay ended every stream with `reason: "complete"`,
   including the ones that ended on `io.ErrUnexpectedEOF`, a dockerd that died
