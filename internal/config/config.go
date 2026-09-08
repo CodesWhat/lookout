@@ -3,11 +3,13 @@ package config
 import (
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -243,6 +245,24 @@ func Load() (*Config, error) {
 		PrivateKeyFile: getEnv("PRIVATE_KEY_FILE", ""),
 	}
 
+	// HEARTBEAT_INTERVAL and DD_POLL_INTERVAL are converted to a
+	// time.Duration and handed straight to time.NewTicker, which panics on a
+	// non-positive interval — so a zero or negative value crashed the agent at
+	// startup rather than being rejected. A value large enough to overflow the
+	// seconds-to-Duration multiply wraps negative and panics the same way, so
+	// both ends are checked here, once, instead of at each ticker.
+	for _, interval := range []struct {
+		name    string
+		seconds int
+	}{
+		{name: "HEARTBEAT_INTERVAL", seconds: cfg.HeartbeatInterval},
+		{name: "DD_POLL_INTERVAL", seconds: cfg.DDPollInterval},
+	} {
+		if err := ValidateIntervalSeconds(interval.name, interval.seconds); err != nil {
+			return nil, err
+		}
+	}
+
 	// Edge mode's operations listener (health, metrics, audit export) carries
 	// no authentication of its own — see the bindAddressDefault comment above.
 	// A non-loopback bind hands the full audit trail and metrics to anyone
@@ -256,6 +276,49 @@ func Load() (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// MaxIntervalSeconds is the largest seconds value that survives every
+// time.Duration conversion applied to an interval. The tightest is edge mode's
+// read deadline, which doubles the heartbeat before scaling it to nanoseconds
+// (readDeadline in internal/edge/client.go), so the bound is math.MaxInt64
+// divided by two seconds' worth of nanoseconds. That is roughly 146 years, far
+// past any real interval and short of the overflow.
+const MaxIntervalSeconds = int64(math.MaxInt64) / (2 * int64(time.Second))
+
+// ValidateIntervalSeconds rejects a seconds-valued interval that time.NewTicker
+// would panic on: non-positive, or large enough that the conversion to a
+// time.Duration overflows and wraps negative. Exported because the same bound
+// has to hold for intervals that arrive off the wire rather than from the
+// environment — edge mode's welcome frame carries one (internal/edge/client.go).
+// name is whatever the caller should tell the operator to fix: an environment
+// variable here, a wire field there.
+func ValidateIntervalSeconds(name string, seconds int) error {
+	if seconds <= 0 {
+		return fmt.Errorf("%s must be a positive number of seconds, got %d", name, seconds)
+	}
+	if int64(seconds) > MaxIntervalSeconds {
+		return fmt.Errorf("%s must be at most %d seconds (larger values overflow the conversion to a duration), got %d",
+			name, MaxIntervalSeconds, seconds)
+	}
+	return nil
+}
+
+// ListenAddress joins a configured BIND_ADDRESS and PORT into an address
+// net.Listen accepts. Concatenating them with a colon is wrong for IPv6: the
+// documented unbracketed form ("::1", "::") produces "::1:3000", which
+// net.SplitHostPort reads as host "::1:3000" with no port and the listen
+// fails. net.JoinHostPort adds the brackets, but it adds them to any host
+// containing a colon, so an already-bracketed "[::1]" would come back as
+// "[[::1]]:3000" — strip one layer first. Shared by standard mode's
+// Docker-proxy listener, edge mode's operations listener, and the startup log
+// line, so all three agree on the address that is actually bound.
+func ListenAddress(bindAddress, port string) string {
+	host := bindAddress
+	if len(host) >= 2 && strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = host[1 : len(host)-1]
+	}
+	return net.JoinHostPort(host, port)
 }
 
 // IsLoopbackBind reports whether address is a loopback bind (127.0.0.1,

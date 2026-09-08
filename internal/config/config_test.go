@@ -2,10 +2,14 @@ package config
 
 import (
 	"bytes"
+	"errors"
 	"log/slog"
+	"net"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // setEnv sets environment variables for the duration of a test.
@@ -387,6 +391,125 @@ func TestLoadEdgeModeSecureURLsUnaffected(t *testing.T) {
 			}
 			if cfg.DrydockURL != u {
 				t.Fatalf("DrydockURL: got %q, want %q", cfg.DrydockURL, u)
+			}
+		})
+	}
+}
+
+// TestListenAddressBracketsIPv6 covers the address form every listener is
+// built from. Concatenating host and port with a colon produced "::1:3000"
+// for the documented unbracketed IPv6 bind, which net.Listen rejects, and
+// naive JoinHostPort double-brackets an already-bracketed host.
+func TestListenAddressBracketsIPv6(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		bind string
+		port string
+		want string
+	}{
+		{name: "ipv6 loopback unbracketed", bind: "::1", port: "3000", want: "[::1]:3000"},
+		{name: "ipv6 loopback bracketed", bind: "[::1]", port: "3000", want: "[::1]:3000"},
+		{name: "ipv6 wildcard", bind: "::", port: "3000", want: "[::]:3000"},
+		{name: "ipv6 wildcard bracketed", bind: "[::]", port: "0", want: "[::]:0"},
+		{name: "ipv4 wildcard", bind: "0.0.0.0", port: "3000", want: "0.0.0.0:3000"},
+		{name: "ipv4 loopback", bind: "127.0.0.1", port: "3000", want: "127.0.0.1:3000"},
+		{name: "hostname", bind: "localhost", port: "3000", want: "localhost:3000"},
+		{name: "empty bind is wildcard", bind: "", port: "3000", want: ":3000"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := ListenAddress(tc.bind, tc.port); got != tc.want {
+				t.Fatalf("ListenAddress(%q, %q) = %q, want %q", tc.bind, tc.port, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestListenAddressIsListenable proves the joined form is one net.Listen
+// actually accepts, not just one that looks right.
+func TestListenAddressIsListenable(t *testing.T) {
+	for _, bind := range []string{"127.0.0.1", "::1", "::", "[::1]", "0.0.0.0"} {
+		t.Run(bind, func(t *testing.T) {
+			t.Parallel()
+			addr := ListenAddress(bind, "0")
+			ln, err := net.Listen("tcp", addr)
+			if err != nil {
+				// A malformed join ("::1:0") surfaces as net.AddrError
+				// ("too many colons in address"); a host without the
+				// address family surfaces as a syscall error, which is
+				// the environment's answer and not a regression.
+				var addrErr *net.AddrError
+				if errors.As(err, &addrErr) {
+					t.Fatalf("ListenAddress(%q, \"0\") = %q is not a valid listen address: %v", bind, addr, err)
+				}
+				t.Skipf("net.Listen(tcp, %q): %v (address family unavailable on this host)", addr, err)
+			}
+			if err := ln.Close(); err != nil {
+				t.Fatalf("close listener: %v", err)
+			}
+		})
+	}
+}
+
+// TestLoadRejectsNonPositiveOrOverflowingIntervals covers the values that used
+// to reach time.NewTicker and panic the agent at startup: NewTicker panics on a
+// non-positive interval, and a seconds value large enough to overflow the
+// conversion to a time.Duration wraps negative and panics the same way.
+func TestLoadRejectsNonPositiveOrOverflowingIntervals(t *testing.T) {
+	// A seconds count whose nanosecond conversion wraps past MaxInt64. Asserted
+	// rather than assumed, so the case still means something if the constant
+	// or the units ever move.
+	const overflowing = "9223372037"
+	overflowSeconds, err := strconv.Atoi(overflowing)
+	if err != nil {
+		t.Skipf("%s does not fit in an int on this platform: %v", overflowing, err)
+	}
+	if d := time.Duration(overflowSeconds) * time.Second; d > 0 {
+		t.Fatalf("%s seconds converts to %v, expected the multiply to overflow", overflowing, d)
+	}
+
+	for _, key := range []string{"HEARTBEAT_INTERVAL", "DD_POLL_INTERVAL"} {
+		for _, tc := range []struct {
+			name  string
+			value string
+			want  string
+		}{
+			{name: "zero", value: "0", want: "positive"},
+			{name: "negative", value: "-1", want: "positive"},
+			{name: "overflows a duration", value: overflowing, want: "at most"},
+		} {
+			t.Run(key+"/"+tc.name, func(t *testing.T) {
+				t.Setenv(key, tc.value)
+				_, err := Load()
+				if err == nil {
+					t.Fatalf("Load() accepted %s=%s; it reaches time.NewTicker and panics", key, tc.value)
+				}
+				if !strings.Contains(err.Error(), key) || !strings.Contains(err.Error(), tc.want) {
+					t.Fatalf("Load() error for %s=%s = %v, want it to name %s and say %q", key, tc.value, err, key, tc.want)
+				}
+			})
+		}
+	}
+}
+
+// TestLoadAcceptsIntervalBoundary pins the accepted side of the bound so the
+// validation cannot drift into rejecting ordinary configuration.
+func TestLoadAcceptsIntervalBoundary(t *testing.T) {
+	for _, value := range []string{"1", "300", strconv.FormatInt(MaxIntervalSeconds, 10)} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("HEARTBEAT_INTERVAL", value)
+			t.Setenv("DD_POLL_INTERVAL", value)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() rejected valid intervals of %s seconds: %v", value, err)
+			}
+			for name, seconds := range map[string]int{
+				"HEARTBEAT_INTERVAL": cfg.HeartbeatInterval,
+				"DD_POLL_INTERVAL":   cfg.DDPollInterval,
+			} {
+				if d := time.Duration(seconds) * time.Second; d <= 0 {
+					t.Fatalf("%s=%s survived Load but converts to %v, which panics time.NewTicker", name, value, d)
+				}
 			}
 		})
 	}

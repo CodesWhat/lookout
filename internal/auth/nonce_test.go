@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestNonceLRU_FreshNonceAccepted(t *testing.T) {
@@ -49,28 +50,76 @@ func TestNonceLRU_DifferentNoncesAccepted(t *testing.T) {
 	}
 }
 
-// TestNonceLRU_CapacityDropsFreshEntries verifies that when the LRU is full,
-// new entries are silently dropped but the function still returns true
-// (fail-open: we do not deny legitimate traffic when the map is full, the
-// timestamp window still limits replay to a short window).
-func TestNonceLRU_CapacityBehavior(t *testing.T) {
+// fillNonceLRU adds n nonces and fails the test if any is refused.
+func fillNonceLRU(t *testing.T, lru *NonceLRU, n int) []string {
+	t.Helper()
+	added := make([]string, n)
+	for i := 0; i < n; i++ {
+		added[i] = fmt.Sprintf("n%d", i)
+		if !lru.Add(added[i]) {
+			t.Fatalf("Add(%q) refused while filling to %d", added[i], n)
+		}
+	}
+	return added
+}
+
+// backdateNonces rewrites the recorded time of every tracked nonce so it is
+// older than the TTL, without waiting one out.
+func backdateNonces(t *testing.T, lru *NonceLRU) {
+	t.Helper()
+	lru.mu.Lock()
+	defer lru.mu.Unlock()
+	stale := time.Now().Add(-2 * lru.ttl)
+	for nonce := range lru.seen {
+		lru.seen[nonce] = stale
+	}
+}
+
+// TestNonceLRU_AtCapacityEvictsExpiredThenRecords covers the normal way a
+// full cache makes room: everything in it is past its TTL and can no longer
+// be replayed, so it is dropped and the new nonce is recorded like any other.
+// The point is that it IS recorded — the old code returned true here without
+// storing anything, which left that request replayable.
+func TestNonceLRU_AtCapacityEvictsExpiredThenRecords(t *testing.T) {
 	t.Parallel()
-	const cap = 5
-	lru := NewNonceLRU(cap, 60)
-	for i := 0; i < cap; i++ {
-		lru.Add(fmt.Sprintf("n%d", i))
+	const capacity = 5
+	lru := NewNonceLRU(capacity, 60)
+	t.Cleanup(lru.Close)
+
+	fillNonceLRU(t, lru, capacity)
+	backdateNonces(t, lru)
+
+	if !lru.Add("overflow") {
+		t.Fatal("Add at capacity refused a nonce with only expired entries to evict")
 	}
-	if lru.Len() != cap {
-		t.Fatalf("expected %d entries, got %d", cap, lru.Len())
+	if !lru.Seen("overflow") {
+		t.Fatal("Add returned true without recording the nonce: the request stays replayable")
 	}
-	// Adding one more: cap exceeded, returns true (fail-open).
-	result := lru.Add("overflow")
-	if !result {
-		t.Error("overflow Add should return true (fail-open)")
+	if lru.Add("overflow") {
+		t.Fatal("replay of the nonce accepted at capacity was not refused")
 	}
-	// The overflow entry is NOT stored (map is full).
-	if lru.Len() != cap {
-		t.Errorf("len should still be %d after overflow, got %d", cap, lru.Len())
+}
+
+// TestNonceLRU_AtCapacityRejectsWhenNothingExpired covers the other branch:
+// every tracked nonce is still inside its own replay window, so there is
+// nothing safe to evict. Rejecting is the only answer that does not open a
+// replay hole at one end or the other.
+func TestNonceLRU_AtCapacityRejectsWhenNothingExpired(t *testing.T) {
+	t.Parallel()
+	const capacity = 5
+	lru := NewNonceLRU(capacity, 60)
+	t.Cleanup(lru.Close)
+
+	fillNonceLRU(t, lru, capacity)
+
+	if lru.Add("overflow") {
+		t.Fatal("Add accepted a nonce it had no room to record")
+	}
+	if lru.Seen("overflow") {
+		t.Fatal("rejected nonce was recorded anyway")
+	}
+	if lru.Len() != capacity {
+		t.Fatalf("len = %d after a rejected Add, want %d", lru.Len(), capacity)
 	}
 }
 

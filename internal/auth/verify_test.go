@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -478,6 +479,53 @@ func TestVerifyRequest_NonceOutlivesTimestampWindow(t *testing.T) {
 	signRequest(t, req2, nil, priv, pub, tsUnix, nonce)
 	if _, err := VerifyRequest(req2, nil, reg, lru, maxSkew); !errors.Is(err, ErrNonceReplay) {
 		t.Fatalf("expected ErrNonceReplay for replay within timestamp-valid window, got: %v", err)
+	}
+}
+
+// TestVerifyRequest_NonceRecordedAtCapacity is a regression test for the
+// fail-open capacity path: a full nonce cache accepted a fresh nonce and then
+// did not record it, so the very request admitted at capacity could be
+// captured and replayed for the rest of its timestamp window. A nonce that is
+// accepted must be recorded, or it must not be accepted.
+func TestVerifyRequest_NonceRecordedAtCapacity(t *testing.T) {
+	t.Parallel()
+	reg, _, pub, priv := testSetup(t)
+
+	const capacity = 4
+	lru := NewNonceLRU(capacity, 60)
+	t.Cleanup(lru.Close)
+
+	// Fill to capacity with entries that are past their TTL, the state a
+	// busy agent sits in between cleanup ticks.
+	for i := 0; i < capacity; i++ {
+		if !lru.Add(fmt.Sprintf("filler%d", i)) {
+			t.Fatalf("filler %d refused while filling the cache", i)
+		}
+	}
+	lru.mu.Lock()
+	stale := time.Now().Add(-2 * lru.ttl)
+	for nonce := range lru.seen {
+		lru.seen[nonce] = stale
+	}
+	lru.mu.Unlock()
+	if lru.Len() != capacity {
+		t.Fatalf("cache holds %d entries, want %d before the request under test", lru.Len(), capacity)
+	}
+
+	nonce := randomNonce(t)
+	tsUnix := time.Now().Unix()
+	req := httptest.NewRequest(http.MethodGet, "/api/portwing/health", nil)
+	signRequest(t, req, nil, priv, pub, tsUnix, nonce)
+	if _, err := VerifyRequest(req, nil, reg, lru, 60); err != nil {
+		t.Fatalf("request admitted at capacity failed to verify: %v", err)
+	}
+
+	// Replay the identical, still timestamp-valid request. Accepting it is
+	// exactly the hole the unrecorded-accept left open.
+	replay := httptest.NewRequest(http.MethodGet, "/api/portwing/health", nil)
+	signRequest(t, replay, nil, priv, pub, tsUnix, nonce)
+	if _, err := VerifyRequest(replay, nil, reg, lru, 60); !errors.Is(err, ErrNonceReplay) {
+		t.Fatalf("replay of a request accepted at cache capacity returned %v, want ErrNonceReplay", err)
 	}
 }
 

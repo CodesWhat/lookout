@@ -2548,3 +2548,50 @@ func TestDockerReadyStatusCodeBoundary(t *testing.T) {
 		})
 	}
 }
+
+// TestHealthServerBindsIPv6BindAddress is the edge-mode half of the listener
+// address regression: the operations listener joined BIND_ADDRESS and PORT
+// with a bare colon, so the documented "::1" became "::1:3000" and net.Listen
+// rejected it with "too many colons in address" instead of binding.
+func TestHealthServerBindsIPv6BindAddress(t *testing.T) {
+	for _, bind := range []string{"127.0.0.1", "::1", "::"} {
+		t.Run(bind, func(t *testing.T) {
+			t.Parallel()
+
+			c := &Client{cfg: &config.Config{BindAddress: bind, Port: "0"}}
+			c.startHealthServer()
+			done := c.healthServerDone
+			t.Cleanup(func() {
+				if c.healthServer != nil {
+					_ = c.healthServer.Close()
+				}
+				<-done
+			})
+
+			deadline := time.Now().Add(3 * time.Second)
+			var addr net.Addr
+			for time.Now().Before(deadline) {
+				if addr = c.HealthAddr(); addr != nil {
+					break
+				}
+				select {
+				case <-done:
+					t.Fatalf("health server for BIND_ADDRESS %q exited instead of binding", bind)
+				default:
+				}
+				time.Sleep(2 * time.Millisecond)
+			}
+			if addr == nil {
+				t.Fatalf("health server for BIND_ADDRESS %q never bound a listener", bind)
+			}
+
+			tcpAddr, ok := addr.(*net.TCPAddr)
+			if !ok {
+				t.Fatalf("bound address %v is not a *net.TCPAddr", addr)
+			}
+			if want := net.ParseIP(bind); !tcpAddr.IP.Equal(want) {
+				t.Fatalf("bound IP = %v, want %v (from BIND_ADDRESS %q)", tcpAddr.IP, want, bind)
+			}
+		})
+	}
+}

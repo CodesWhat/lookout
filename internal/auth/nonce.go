@@ -10,9 +10,11 @@ import (
 // internal/server/middleware.go: a Mutex-protected map with a background
 // cleanup goroutine.
 //
-// Capacity is bounded to maxSize entries. When the cap is reached, new nonces
-// are silently dropped (fail-open for tracking, not for auth: the timestamp
-// window alone still limits replay to 60 s).
+// Capacity is bounded to maxSize entries. At the cap the cache first evicts
+// every nonce whose TTL has expired; if that frees nothing it rejects rather
+// than admitting a nonce it cannot record. Accepting an unrecorded nonce made
+// that one request replayable for the rest of the timestamp window, which is
+// the whole thing this cache exists to prevent.
 type NonceLRU struct {
 	mu      sync.Mutex
 	seen    map[string]time.Time // nonce → time first seen
@@ -60,9 +62,16 @@ func (l *NonceLRU) Close() {
 	}
 }
 
-// Add records the nonce if it has not been seen before and the cache is not
-// full. Returns true if the nonce was freshly added (not a replay), false if
-// it has been seen before.
+// Add records the nonce if it has not been seen before and there is room for
+// it. Returns true if the nonce was freshly added (not a replay), false if it
+// has been seen before or could not be recorded.
+//
+// A false return at capacity is a rejection, not a replay verdict, and the
+// caller must treat it as one: admitting a nonce without recording it leaves
+// that exact request replayable until its timestamp falls out of the window.
+// Only entries past their TTL are evicted to make room — every other tracked
+// nonce is still inside its own replay window, so evicting one would hand
+// back the same hole from the other end.
 func (l *NonceLRU) Add(nonce string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -72,9 +81,10 @@ func (l *NonceLRU) Add(nonce string) bool {
 	}
 
 	if len(l.seen) >= l.maxSize {
-		// Drop the new entry rather than evicting one. The timestamp check
-		// already limits replay; this path should be extremely rare.
-		return true // treat as fresh (fail-open for tracking)
+		l.evictExpiredLocked(time.Now())
+	}
+	if len(l.seen) >= l.maxSize {
+		return false
 	}
 
 	l.seen[nonce] = time.Now()
@@ -122,7 +132,14 @@ func (l *NonceLRU) cleanup() {
 func (l *NonceLRU) evictExpired() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	cutoff := time.Now().Add(-l.ttl)
+	l.evictExpiredLocked(time.Now())
+}
+
+// evictExpiredLocked drops every nonce recorded more than ttl before now. The
+// caller must hold l.mu. Add calls it to reclaim space at capacity rather than
+// waiting for the cleanup ticker.
+func (l *NonceLRU) evictExpiredLocked(now time.Time) {
+	cutoff := now.Add(-l.ttl)
 	for nonce, t := range l.seen {
 		if t.Before(cutoff) {
 			delete(l.seen, nonce)
