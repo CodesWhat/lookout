@@ -1,4 +1,4 @@
-package health
+package docker
 
 import (
 	"context"
@@ -7,11 +7,11 @@ import (
 	"time"
 )
 
-// Probe collapses concurrent readiness checks onto a single bounded
+// HealthProbe collapses concurrent readiness checks onto a single bounded
 // Docker ping and reuses its result for ttl. N simultaneous
 // readiness requests therefore cost one ping and one Docker connection, not N,
 // and a caller never waits longer than timeout for one.
-type Probe struct {
+type HealthProbe struct {
 	// Timeout and TTL must be set before the first Check. Zero uses 2s and 1s.
 	Timeout time.Duration
 	TTL     time.Duration
@@ -34,7 +34,7 @@ var errReadinessPingIncomplete = errors.New("readiness ping did not complete")
 // Check returns the Docker reachability result, pinging at most once per
 // ttl across all concurrent callers. ping is called with a
 // context bounded by timeout.
-func (p *Probe) Check(ctx context.Context, ping func(context.Context) error) (err error) {
+func (p *HealthProbe) Check(ctx context.Context, ping func(context.Context) error) (err error) {
 	timeout, ttl := p.Timeout, p.TTL
 	if timeout <= 0 {
 		timeout = 2 * time.Second

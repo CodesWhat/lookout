@@ -1,4 +1,4 @@
-package health
+package docker
 
 import (
 	"context"
@@ -9,20 +9,20 @@ import (
 )
 
 // probeInflight reports whether the probe still holds an unfinished flight.
-func probeInflight(p *Probe) bool {
+func probeInflight(p *HealthProbe) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.inflight != nil
 }
 
-// TestReadinessProbeReleasesFlightOnPanic is a regression test for a wedge:
+// TestReadinessHealthProbeReleasesFlightOnPanic is a regression test for a wedge:
 // the probe published its result and closed the in-flight channel on the
 // normal return path only, so a ping that panicked left inflight set forever
 // and every later readiness request blocked on a channel nothing would close.
 // One panicking request would have taken the readiness endpoint down for the
 // life of the process.
-func TestReadinessProbeReleasesFlightOnPanic(t *testing.T) {
-	probe := Probe{Timeout: 2 * time.Second, TTL: time.Millisecond}
+func TestReadinessHealthProbeReleasesFlightOnPanic(t *testing.T) {
+	probe := HealthProbe{Timeout: 2 * time.Second, TTL: time.Millisecond}
 
 	// A waiter that arrives while the panicking ping is running must be
 	// released by it, not left blocked. Its own context is deliberately not
@@ -84,16 +84,16 @@ func TestReadinessProbeReleasesFlightOnPanic(t *testing.T) {
 	}
 }
 
-// TestReadinessProbeWaiterHonoursCanceledContext covers the waiter's
+// TestReadinessHealthProbeWaiterHonoursCanceledContext covers the waiter's
 // cancellation branch: a readiness client queued behind an in-flight ping that
 // hangs up must be released by its own context rather than waiting out the
 // ping it never asked for. Cancelling before the call makes the select
 // deterministic — the leader's flight channel is still open, so only ctx.Done
 // is ready.
-func TestReadinessProbeWaiterHonoursCanceledContext(t *testing.T) {
+func TestReadinessHealthProbeWaiterHonoursCanceledContext(t *testing.T) {
 	t.Parallel()
 
-	var probe Probe
+	var probe HealthProbe
 
 	entered := make(chan struct{})
 	release := make(chan struct{})

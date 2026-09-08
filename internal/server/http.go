@@ -24,7 +24,6 @@ import (
 	"github.com/codeswhat/portwing/internal/auth"
 	"github.com/codeswhat/portwing/internal/config"
 	"github.com/codeswhat/portwing/internal/docker"
-	"github.com/codeswhat/portwing/internal/health"
 	"github.com/codeswhat/portwing/internal/mcp"
 	"github.com/codeswhat/portwing/internal/metrics"
 	"github.com/codeswhat/portwing/internal/protocol"
@@ -148,7 +147,7 @@ type Server struct {
 	// readiness bounds the Docker ping the unauthenticated readiness routes
 	// perform. Its zero value is a working, empty cache, so Servers built as
 	// struct literals rather than through NewServer get the bound too.
-	readiness health.Probe
+	readiness docker.HealthProbe
 
 	// listenAddr holds the net.Addr ListenAndServe bound, set once the
 	// listener is up and before Serve/ServeTLS starts blocking. It lets

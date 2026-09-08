@@ -30,7 +30,6 @@ import (
 	"github.com/codeswhat/portwing/internal/auth"
 	"github.com/codeswhat/portwing/internal/config"
 	"github.com/codeswhat/portwing/internal/docker"
-	"github.com/codeswhat/portwing/internal/health"
 	applog "github.com/codeswhat/portwing/internal/log"
 	"github.com/codeswhat/portwing/internal/metrics"
 	"github.com/codeswhat/portwing/internal/pool"
@@ -181,7 +180,7 @@ func (c *Client) currentMessageSender() *edgeMessageSender {
 type Client struct {
 	cfg          *config.Config
 	dockerClient dockerAPI
-	readiness    health.Probe
+	readiness    docker.HealthProbe
 	adapter      adapter.EdgeAdapter
 	compose      *docker.ComposeManager
 	collector    hostCollector

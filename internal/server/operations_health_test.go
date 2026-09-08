@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/codeswhat/portwing/internal/docker"
-	"github.com/codeswhat/portwing/internal/health"
 	"github.com/codeswhat/portwing/internal/protocol"
 )
 
@@ -128,7 +127,7 @@ func TestReadinessPingIsBoundedAndCollapsed(t *testing.T) {
 	client, pings, stop := newCountingPingDaemon(t, hold)
 	defer stop()
 
-	s := &Server{dockerClient: client, startTime: time.Now(), readiness: health.Probe{Timeout: 200 * time.Millisecond, TTL: 50 * time.Millisecond}}
+	s := &Server{dockerClient: client, startTime: time.Now(), readiness: docker.HealthProbe{Timeout: 200 * time.Millisecond, TTL: 50 * time.Millisecond}}
 
 	const callers = 8
 	codes := make([]int, callers)
@@ -170,7 +169,7 @@ func TestReadinessPingResultIsCachedBriefly(t *testing.T) {
 	client, pings, stop := newCountingPingDaemon(t, nil)
 	defer stop()
 
-	s := &Server{dockerClient: client, startTime: time.Now(), readiness: health.Probe{Timeout: 2 * time.Second, TTL: 60 * time.Millisecond}}
+	s := &Server{dockerClient: client, startTime: time.Now(), readiness: docker.HealthProbe{Timeout: 2 * time.Second, TTL: 60 * time.Millisecond}}
 	probe := func() int {
 		rr := httptest.NewRecorder()
 		s.handleHealth(rr, httptest.NewRequest(http.MethodGet, "/ready", nil))
