@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Container renames now emit an update immediately, and reordering Docker's
+  listed names no longer invalidates the inspect cache. Drydock container
+  errors preserve their recorded timestamp on the wire.
 - **A truncated Docker response stream no longer reports itself as complete.**
   The edge agent's response relay ended every stream with `reason: "complete"`,
   including the ones that ended on `io.ErrUnexpectedEOF`, a dockerd that died

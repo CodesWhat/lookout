@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 
@@ -159,7 +160,7 @@ func (m *ContainerManager) Refresh(ctx context.Context) (added, updated, removed
 
 	for id, c := range newMap {
 		if old, exists := oldMap[id]; exists {
-			if old.Status != c.Status || containerHealth(old) != containerHealth(c) {
+			if old.Name != c.Name || old.Status != c.Status || containerHealth(old) != containerHealth(c) {
 				updated = append(updated, c)
 			}
 		} else {
@@ -190,8 +191,10 @@ func (m *ContainerManager) Refresh(ctx context.Context) (added, updated, removed
 // unrelated happened to invalidate the entry. Container names cannot contain
 // "|" or ",", so joining them can't collide with a different name set.
 func containerChangeSignal(entry *docker.ContainerJSON) string {
+	names := slices.Clone(entry.Names)
+	slices.Sort(names)
 	return entry.State + "|" + entry.Status + "|" + entry.ImageID + "|" +
-		strings.Join(entry.Names, ",")
+		strings.Join(names, ",")
 }
 
 // lastKnownContainer returns the most recent successful build of a container:

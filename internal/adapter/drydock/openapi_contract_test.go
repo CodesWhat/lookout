@@ -283,4 +283,8 @@ func TestFullyPopulatedContainerMatchesOpenAPISchema(t *testing.T) {
 		}
 	}
 	assertMatchesOpenAPISchema(t, schemas, "Container", served, "container")
+	containerError, ok := served["error"].(map[string]any)
+	if !ok || containerError["timestamp"] != "2026-01-02T00:00:00Z" {
+		t.Fatalf("error timestamp not preserved: %v", served["error"])
+	}
 }

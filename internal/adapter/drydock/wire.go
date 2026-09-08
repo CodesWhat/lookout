@@ -65,7 +65,8 @@ type drydockContainerUpdateKind struct {
 }
 
 type drydockContainerError struct {
-	Message string `json:"message"`
+	Message   string `json:"message"`
+	Timestamp string `json:"timestamp,omitempty"`
 }
 
 type drydockRuntimeDetails struct {
@@ -133,7 +134,7 @@ func toDrydockContainer(container adapter.Container) drydockContainer {
 		Labels:          container.Labels,
 	}
 	if container.Error != nil {
-		wireContainer.Error = &drydockContainerError{Message: container.Error.Message}
+		wireContainer.Error = &drydockContainerError{Message: container.Error.Message, Timestamp: container.Error.Timestamp}
 	}
 	if container.Details != nil {
 		wireContainer.Details = toDrydockRuntimeDetails(container.Details)
