@@ -53,10 +53,10 @@ brew install gh            # macOS
 Every image pushed to `ghcr.io/codeswhat/portwing` is cosign keyless-signed by
 the release workflow. Replace `TAG` with the version tag you are deploying
 (the tag is the semver without the leading `v`, matching GoReleaser's output —
-e.g. `0.9.16`, not `v0.9.16`):
+e.g. `0.9.17`, not `v0.9.17`):
 
 ```bash
-TAG=0.9.16
+TAG=0.9.17
 
 cosign verify \
   --certificate-identity="https://github.com/CodesWhat/portwing/.github/workflows/release.yml@refs/tags/v${TAG}" \
@@ -75,7 +75,7 @@ to the container manifest. This uses the Sigstore Rekor ledger and is
 independently verifiable without cosign:
 
 ```bash
-TAG=0.9.16
+TAG=0.9.17
 
 gh attestation verify "oci://ghcr.io/codeswhat/portwing:${TAG}" \
   --repo CodesWhat/portwing
@@ -99,7 +99,7 @@ The `checksums.txt.bundle` file (also a release asset) contains the cosign
 keyless signature over `checksums.txt`:
 
 ```bash
-TAG=0.9.16
+TAG=0.9.17
 
 cosign verify-blob \
   --certificate-identity="https://github.com/CodesWhat/portwing/.github/workflows/release.yml@refs/tags/v${TAG}" \
@@ -123,7 +123,7 @@ On macOS, use `shasum -a 256 --check --ignore-missing checksums.txt`.
 
 ```bash
 # Verify a specific downloaded archive
-gh attestation verify portwing_0.9.16_linux_amd64.tar.gz \
+gh attestation verify portwing_0.9.17_linux_amd64.tar.gz \
   --repo CodesWhat/portwing
 ```
 
@@ -133,12 +133,12 @@ gh attestation verify portwing_0.9.16_linux_amd64.tar.gz \
 
 Each release archive has a corresponding [CycloneDX](https://cyclonedx.org/)
 SBOM named by appending `.cyclonedx.json` to the complete archive filename. For
-example, the Linux amd64 pair for v0.9.16 is
-`portwing_0.9.16_linux_amd64.tar.gz` and
-`portwing_0.9.16_linux_amd64.tar.gz.cyclonedx.json`.
+example, the Linux amd64 pair for v0.9.17 is
+`portwing_0.9.17_linux_amd64.tar.gz` and
+`portwing_0.9.17_linux_amd64.tar.gz.cyclonedx.json`.
 
 ```bash
-VERSION=0.9.16
+VERSION=0.9.17
 RELEASE_TAG="v${VERSION}"
 ARCHIVE="portwing_${VERSION}_linux_amd64.tar.gz"
 SBOM="${ARCHIVE}.cyclonedx.json"
@@ -181,7 +181,7 @@ Buildx OCI SBOM attestation because they also include OS packages.
 | Container image | GitHub attestation | `gh attestation verify oci://ghcr.io/codeswhat/portwing:TAG` |
 | `checksums.txt` | cosign blob | `cosign verify-blob ... --bundle checksums.txt.bundle checksums.txt` |
 | Binary archive | SHA-256 checksum | `sha256sum --check --ignore-missing checksums.txt` |
-| Binary archive | GitHub attestation | `gh attestation verify portwing_0.9.16_linux_amd64.tar.gz --repo CodesWhat/portwing` |
+| Binary archive | GitHub attestation | `gh attestation verify portwing_0.9.17_linux_amd64.tar.gz --repo CodesWhat/portwing` |
 | Per-archive SBOM | Signed checksum + GitHub attestation | `cosign verify-blob ... checksums.txt` and `gh attestation verify <archive>.cyclonedx.json ...` |
 | Container SBOM | OCI SBOM attestation | Inspect the attestation attached to `ghcr.io/codeswhat/portwing:TAG` with an OCI/SBOM-aware client |
 
