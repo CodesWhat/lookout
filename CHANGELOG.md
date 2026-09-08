@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Duration environment variables reject malformed, negative, and overflowing
+  values at startup. Request timeouts and reconnect delays still accept zero;
+  heartbeat, polling, welcome, and clock-skew settings require positive seconds.
 - Container renames now emit an update immediately, and reordering Docker's
   listed names no longer invalidates the inspect cache. Drydock container
   errors preserve their recorded timestamp on the wire.
