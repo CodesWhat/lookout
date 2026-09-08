@@ -131,6 +131,11 @@ one-minute window:
 
 - **Threshold:** 10 failures within 60 seconds triggers a block.
 - **Response:** HTTP 429 (`Too Many Requests`) until the window expires.
+- **Connection reuse:** auth admission rejections before body reads close the
+  HTTP/1 connection and expire its read deadline. This is the permanent
+  trade-off: a legitimate client reconnects after rejection, while a client
+  that declares a body and never sends it cannot hold the handler in
+  `net/http`'s post-response drain. Keep-alive is not preserved on this path.
 - **Memory cap:** At most 10,000 IP entries are tracked simultaneously;
   new entries beyond the cap are silently dropped to prevent memory
   exhaustion (fail-open for tracking, not for auth).
