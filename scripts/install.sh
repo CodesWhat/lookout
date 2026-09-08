@@ -73,9 +73,9 @@ main() {
 # Portwing Configuration
 # See: https://github.com/codeswhat/portwing
 
-# Connection mode: Set DRYDOCK_URL + TOKEN for Edge mode, or leave empty for Standard mode
+# Connection mode: Set DRYDOCK_URL + PRIVATE_KEY_FILE for Edge mode, or leave empty for Standard mode
 # DRYDOCK_URL=https://your-server:3001
-# TOKEN=your-secret-token
+# PRIVATE_KEY_FILE=/etc/portwing/private.pem
 
 # Standard mode settings
 PORT=3000
@@ -138,8 +138,19 @@ depend() {
 }
 
 start_pre() {
-    [ -f /etc/portwing/config ] && . /etc/portwing/config
-    export PORT BIND_ADDRESS DRYDOCK_URL TOKEN LOG_LEVEL
+    [ -f /etc/portwing/config ] || return 0
+    local portwing_allexport portwing_config_status=0
+    case "$-" in
+        *a*) portwing_allexport=on ;;
+        *) portwing_allexport=off ;;
+    esac
+    set -a
+    . /etc/portwing/config || portwing_config_status=$?
+    case "$portwing_allexport" in
+        on) set -a ;;
+        off) set +a ;;
+    esac
+    return "$portwing_config_status"
 }
 OPENRC
 		sudo chmod +x "/etc/init.d/${SERVICE_NAME}"
