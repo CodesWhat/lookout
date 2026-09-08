@@ -30,6 +30,7 @@ import (
 	"github.com/codeswhat/portwing/internal/auth"
 	"github.com/codeswhat/portwing/internal/config"
 	"github.com/codeswhat/portwing/internal/docker"
+	"github.com/codeswhat/portwing/internal/health"
 	applog "github.com/codeswhat/portwing/internal/log"
 	"github.com/codeswhat/portwing/internal/metrics"
 	"github.com/codeswhat/portwing/internal/pool"
@@ -180,6 +181,7 @@ func (c *Client) currentMessageSender() *edgeMessageSender {
 type Client struct {
 	cfg          *config.Config
 	dockerClient dockerAPI
+	readiness    health.Probe
 	adapter      adapter.EdgeAdapter
 	compose      *docker.ComposeManager
 	collector    hostCollector
@@ -2003,16 +2005,22 @@ func (c *Client) dockerReady(ctx context.Context) bool {
 	if c.dockerClient == nil {
 		return false
 	}
-	pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	response, err := c.dockerClient.Do(pingCtx, http.MethodGet, "/_ping", nil)
-	if err != nil || response == nil {
-		return false
-	}
-	if response.Body != nil {
-		_ = response.Body.Close()
-	}
-	return response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices
+	return c.readiness.Check(ctx, func(pingCtx context.Context) error {
+		response, err := c.dockerClient.Do(pingCtx, http.MethodGet, "/_ping", nil)
+		if err != nil {
+			return err
+		}
+		if response == nil {
+			return errors.New("Docker ping returned no response")
+		}
+		if response.Body != nil {
+			_ = response.Body.Close()
+		}
+		if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+			return fmt.Errorf("Docker ping returned status %d", response.StatusCode)
+		}
+		return nil
+	}) == nil
 }
 
 func currentDockerState(connected bool) string {
