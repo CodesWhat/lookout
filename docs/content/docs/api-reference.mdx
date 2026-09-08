@@ -481,8 +481,9 @@ Any path not matched by a named Portwing route is transparently proxied to the l
 Streaming endpoints include logs, attach, exec start, events, builds, image
 creation, named image pushes (`POST /images/{name}/push`) and container stats
 (`GET /containers/{id}/stats`). These responses use streaming transport and
-are flushed as data arrives. Explicit `stats?stream=false` requests use the
-normal request timeout. Interactive exec sessions using `Upgrade: tcp` or
+are flushed as data arrives. Stats requests use the normal request timeout when `stream` is explicitly
+empty, `0`, `no`, `false`, or `none` (case-insensitive, with surrounding
+whitespace ignored). An omitted `stream` defaults to streaming. Interactive exec sessions using `Upgrade: tcp` or
 `Upgrade: websocket` are handled via HTTP hijacking.
 
 The complete Docker Engine API is documented at [https://docs.docker.com/engine/api/v1.44/](https://docs.docker.com/engine/api/v1.44/).
